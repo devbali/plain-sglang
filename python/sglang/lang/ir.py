@@ -31,6 +31,7 @@ class SglSamplingParams:
     top_logprobs_num: Optional[int] = (None,)
     return_text_in_logprobs: Optional[bool] = (None,)
     json_schema: Optional[str] = None
+    uid: Optional[str] = None
 
     # for constrained generation, not included in to_xxx_kwargs
     dtype: Optional[str] = None
@@ -53,6 +54,7 @@ class SglSamplingParams:
             self.top_logprobs_num,
             self.return_text_in_logprobs,
             self.json_schema,
+            self.uid,
         )
 
     def to_openai_kwargs(self):
@@ -124,6 +126,7 @@ class SglSamplingParams:
             "ignore_eos": self.ignore_eos,
             "regex": self.regex,
             "json_schema": self.json_schema,
+            "uid": self.uid,
         }
 
 
@@ -429,6 +432,7 @@ class SglGen(SglExpr):
         dtype: Optional[type] = None,
         regex: Optional[str] = None,
         json_schema: Optional[str] = None,
+        uid: Optional[str] = None,
     ):
         """Call the model to generate. See the meaning of the arguments in docs/en/sampling_params.md"""
         super().__init__()
@@ -451,6 +455,7 @@ class SglGen(SglExpr):
             dtype=dtype,
             regex=regex,
             json_schema=json_schema,
+            uid=uid,
         )
 
     def __repr__(self):
@@ -563,7 +568,8 @@ class SglConcateAndAppend(SglExpr):
 
 
 class SglCommitLazy(SglExpr):
-    def __init__(self):
+    def __init__(self, uid: Optional[str] = None):
+        self.uid = uid
         super().__init__()
 
     def __repr__(self):

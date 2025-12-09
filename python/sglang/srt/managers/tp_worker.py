@@ -357,7 +357,7 @@ class ModelTpServer:
         self,
         recv_req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
-        req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
+        req = Req(recv_req.uid, recv_req.rid, recv_req.input_text, recv_req.input_ids)
         req.tokenizer = self.tokenizer
         req.sampling_params = recv_req.sampling_params
         if self.model_runner.is_generation:
@@ -755,6 +755,7 @@ class ModelTpServer:
     def handle_finished_requests(self, batch: ScheduleBatch):
         output_rids = []
         output_meta_info = []
+        out_uids = []
         output_finished_reason: List[BaseFinishReason] = []
         if self.model_runner.is_generation:
             output_vids = []
@@ -784,6 +785,7 @@ class ModelTpServer:
                 output_finished_reason.append(req.finished_reason)
                 if self.model_runner.is_generation:
                     output_vids.append(req.vid)
+                    out_uids.append(req.uid)
                     decoded_texts.append(req.decoded_text)
                     read_ids, read_offset = req.init_incremental_detokenize()
                     output_read_ids.append(read_ids)
@@ -830,6 +832,7 @@ class ModelTpServer:
                     BatchTokenIDOut(
                         output_rids,
                         output_vids,
+                        out_uids,
                         decoded_texts,
                         output_read_ids,
                         output_read_offsets,

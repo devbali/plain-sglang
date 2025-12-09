@@ -95,8 +95,9 @@ class FINISH_ABORT(BaseFinishReason):
 class Req:
     """Store all inforamtion of a request."""
 
-    def __init__(self, rid, origin_input_text, origin_input_ids):
+    def __init__(self, uid, rid, origin_input_text, origin_input_ids):
         # Input and output info
+        self.uid = uid
         self.rid = rid
         self.origin_input_text = origin_input_text
         self.origin_input_ids_unpadded = origin_input_ids  # Before image padding

@@ -468,6 +468,7 @@ async def v1_retrieve_file_content(file_id: str):
 def v1_generate_request(
     all_requests: List[CompletionRequest], request_ids: List[str] = None
 ):
+    users = []
     prompts = []
     sampling_params_list = []
     return_logprobs = []
@@ -491,6 +492,7 @@ def v1_generate_request(
             )
 
     for request in all_requests:
+        users.append(request.user)
         prompts.append(request.prompt)
         return_logprobs.append(request.logprobs is not None and request.logprobs > 0)
         logprob_start_lens.append(-1)
@@ -516,6 +518,7 @@ def v1_generate_request(
         )
 
     if len(all_requests) == 1:
+        users = users[0]
         prompt = prompts[0]
         sampling_params_list = sampling_params_list[0]
         logprob_start_lens = logprob_start_lens[0]
@@ -540,6 +543,7 @@ def v1_generate_request(
         return_text_in_logprobs=True,
         stream=all_requests[0].stream,
         rid=request_ids,
+        uid=users,
     )
 
     if len(all_requests) == 1:
@@ -826,6 +830,7 @@ def v1_chat_generate_request(
     tokenizer_manager,
     request_ids: List[str] = None,
 ):
+    users = []
     input_ids = []
     sampling_params_list = []
     image_data_list = []
@@ -880,6 +885,7 @@ def v1_chat_generate_request(
             prompt_ids = request.messages
             stop = request.stop
             image_data = None
+        users.append(request.user)
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
@@ -902,6 +908,7 @@ def v1_chat_generate_request(
         )
         image_data_list.append(image_data)
     if len(all_requests) == 1:
+        users = users[0]
         input_ids = input_ids[0]
         if isinstance(input_ids, str):
             prompt_kwargs = {"text": input_ids}
@@ -928,6 +935,7 @@ def v1_chat_generate_request(
         stream=all_requests[0].stream,
         return_text_in_logprobs=True,
         rid=request_ids,
+        uid=users,
     )
     if len(all_requests) == 1:
         return adapted_request, all_requests[0]

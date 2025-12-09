@@ -40,6 +40,8 @@ class GenerateReqInput:
     sampling_params: Union[List[Dict], Dict] = None
     # The request id.
     rid: Optional[Union[List[str], str]] = None
+    # The user id.
+    uid: Optional[Union[List[str], str]] = None
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
     # If return logprobs, the start location in the prompt for returning logprobs.
@@ -74,6 +76,8 @@ class GenerateReqInput:
                 self.sampling_params = {}
             if self.rid is None:
                 self.rid = uuid.uuid4().hex
+            if self.uid is None:
+                self.uid = self.rid
             if self.return_logprob is None:
                 self.return_logprob = False
             if self.logprob_start_len is None:
@@ -136,6 +140,12 @@ class GenerateReqInput:
             else:
                 if not isinstance(self.rid, list):
                     raise ValueError("The rid should be a list.")
+            
+            if self.uid is None:
+                self.uid = self.rid
+            elif not isinstance(self.uid, list):
+                self.uid = [self.uid] * num
+            print(f"Request uid: {self.uid}")
 
             if self.return_logprob is None:
                 self.return_logprob = [False] * num
@@ -155,6 +165,8 @@ class GenerateReqInput:
 
 @dataclass
 class TokenizedGenerateReqInput:
+    # The user id
+    uid: str
     # The request id
     rid: str
     # The input text
@@ -187,6 +199,8 @@ class EmbeddingReqInput:
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The request id.
     rid: Optional[Union[List[str], str]] = None
+    # The user id.
+    uid: Optional[Union[List[str], str]] = None
     # Dummy sampling params for compatibility
     sampling_params: Union[List[Dict], Dict] = None
 
@@ -205,6 +219,8 @@ class EmbeddingReqInput:
         if is_single:
             if self.rid is None:
                 self.rid = uuid.uuid4().hex
+            if self.uid is None:
+                self.uid = self.rid
             if self.sampling_params is None:
                 self.sampling_params = {}
             self.sampling_params["max_new_tokens"] = 1
@@ -218,6 +234,12 @@ class EmbeddingReqInput:
             else:
                 if not isinstance(self.rid, list):
                     raise ValueError("The rid should be a list.")
+
+            if self.uid is None:
+                self.uid = self.rid
+            elif not isinstance(self.uid, list):
+                self.uid = [self.uid] * self.batch_size
+
             if self.sampling_params is None:
                 self.sampling_params = [{}] * self.batch_size
             for i in range(self.batch_size):
@@ -226,6 +248,8 @@ class EmbeddingReqInput:
 
 @dataclass
 class TokenizedEmbeddingReqInput:
+    # The user id
+    uid: str
     # The request id
     rid: str
     # The input text
@@ -242,6 +266,7 @@ class BatchTokenIDOut:
     rids: List[str]
     # The version id to sync decode status with in detokenizer_manager
     vids: List[int]
+    uids: List[str]
     decoded_texts: List[str]
     decode_ids: List[int]
     read_offsets: List[int]

@@ -171,6 +171,7 @@ class TokenizerManager:
             not_use_index = index is None
 
             rid = obj.rid if not_use_index else obj.rid[index]
+            uid = obj.uid if not_use_index else obj.uid[index]
             input_text = obj.text if not_use_index else obj.text[index]
             if obj.input_ids is None:
                 assert self.tokenizer is not None
@@ -207,9 +208,11 @@ class TokenizerManager:
             assert self.is_generation
             if obj.text is not None:
                 if isinstance(obj.text, list):
+                    uid = obj.uid[index]
                     input_text = obj.text[index]
                     rid = obj.rid[index]
                 else:
+                    uid = obj.uid[0]
                     input_text = obj.text
                     rid = obj.rid[0]
                 if self.tokenizer is not None:
@@ -222,9 +225,11 @@ class TokenizerManager:
                     ):
                         # when obj["input_ids"] is List[List[int]]
                         input_ids = obj.input_ids[index]
+                        uid = obj.uid[index]
                         rid = obj.rid[index]
                     else:
                         input_ids = obj.input_ids
+                        uid = obj.uid[0]
                         rid = obj.rid[0]
             else:
                 input_text = None
@@ -233,9 +238,11 @@ class TokenizerManager:
                 ):
                     # when obj["input_ids"] is List[List[int]]
                     input_ids = obj.input_ids[index]
+                    uid = obj.uid[index]
                     rid = obj.rid[index]
                 else:
                     input_ids = obj.input_ids
+                    uid = obj.uid[0]
                     rid = obj.rid[0]
 
             sampling_params = SamplingParams(**obj.sampling_params[0])
@@ -252,6 +259,7 @@ class TokenizerManager:
             if return_logprob and logprob_start_len == -1:
                 logprob_start_len = len(input_ids) - 1
             tokenized_obj = TokenizedGenerateReqInput(
+                uid,
                 rid,
                 input_text,
                 input_ids,
@@ -266,6 +274,7 @@ class TokenizerManager:
             )
         else:  # is embedding
             tokenized_obj = TokenizedEmbeddingReqInput(
+                uid,
                 rid,
                 input_text,
                 input_ids,
@@ -322,6 +331,7 @@ class TokenizerManager:
                     # Here when using parallel sampling we should consider prefill stage so the index is :  j + i * (parallel_sample_num-1) + batch_size - 1
                     index += batch_size - 1 - i
                 rid = obj.rid[index]
+                uid = obj.uid[index]
                 if parallel_sample_num == 1:
                     ## select operation
                     if obj.input_ids is None:
@@ -348,6 +358,7 @@ class TokenizerManager:
                     )
 
                     tokenized_obj = TokenizedGenerateReqInput(
+                        uid,
                         rid,
                         input_text,
                         input_ids,
@@ -362,6 +373,7 @@ class TokenizerManager:
                     )
                 else:
                     tokenized_obj = TokenizedEmbeddingReqInput(
+                        uid,
                         rid,
                         input_text,
                         input_ids,

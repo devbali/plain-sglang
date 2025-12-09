@@ -266,10 +266,11 @@ class StreamExecutor:
     def fork(
         self,
         size: int = 1,
+        uid: Optional[str] = None,
         position_ids_offset: Optional[List[int]] = None,
     ):
         if size > 1:
-            self.submit(SglCommitLazy())
+            self.submit(SglCommitLazy(uid=uid))
 
         self.sync()
         size = int(size)
@@ -618,7 +619,7 @@ class StreamExecutor:
         self.variable_event[expr.name].set()
 
     def _execute_commit_lazy_operations(self, expr: SglCommitLazy):
-        self.backend.commit_lazy_operations(self)
+        self.backend.commit_lazy_operations(self, expr)
 
     def _execute_concatenate_and_append_text(self, expr: SglConcateAndAppend):
         new_text = ""
@@ -674,6 +675,7 @@ class StreamExecutor:
             "dtype",
             "regex",
             "json_schema",
+            "uid",
         ]:
             value = getattr(sampling_params, item, None)
             if value is not None:
@@ -736,8 +738,9 @@ class ProgramState:
         self,
         size: int = 1,
         position_ids_offset: Optional[List[int]] = None,
+        uid: Optional[str] = None,
     ):
-        stream_executors = self.stream_executor.fork(size, position_ids_offset)
+        stream_executors = self.stream_executor.fork(size, uid, position_ids_offset)
         states = [ProgramState(x) for x in stream_executors]
         state_group = ProgramStateGroup(states, self)
         return state_group

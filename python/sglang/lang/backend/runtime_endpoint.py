@@ -79,8 +79,12 @@ class RuntimeEndpoint(BaseBackend):
         )
         self._assert_success(res)
 
-    def commit_lazy_operations(self, s: StreamExecutor):
-        data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
+    def commit_lazy_operations(self, s: StreamExecutor, expr):
+        data = {
+            "text": s.text_,
+            "sampling_params": {"max_new_tokens": 0},
+            "uid": expr.uid if hasattr(expr, "uid") else None,
+        }
         self._add_images(s, data)
         res = http_request(
             self.base_url + "/generate",
@@ -153,6 +157,7 @@ class RuntimeEndpoint(BaseBackend):
             "logprob_start_len",
             "top_logprobs_num",
             "return_text_in_logprobs",
+            "uid",
         ]:
             value = getattr(sampling_params, item, None)
             if value is not None:
@@ -193,6 +198,7 @@ class RuntimeEndpoint(BaseBackend):
             "logprob_start_len",
             "top_logprobs_num",
             "return_text_in_logprobs",
+            "uid",
         ]:
             value = getattr(sampling_params, item, None)
             if value is not None:

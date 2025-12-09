@@ -21,17 +21,24 @@ The radix tree data structure for managing the KV cache.
 
 import heapq
 import time
+from dataclasses import dataclass
+
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
+from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
+@dataclass
+class EvictionData:
+    input_ids: list
+    evicted_ids: list
 
 class TreeNode:
     def __init__(self):
