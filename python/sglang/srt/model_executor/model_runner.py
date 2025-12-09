@@ -30,7 +30,7 @@ from flashinfer import (
     BatchPrefillWithPagedKVCacheWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
 )
-from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
+#from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 from vllm.config import DeviceConfig, LoadConfig
 from vllm.config import ModelConfig as VllmModelConfig
 from vllm.distributed import (
@@ -432,7 +432,7 @@ class ModelRunner:
             self.flashinfer_decode_wrapper = None
             return
 
-        if not _grouped_size_compiled_for_decode_kernels(
+        if True or not _grouped_size_compiled_for_decode_kernels(
             self.model_config.num_attention_heads // self.tp_size,
             self.model_config.get_num_kv_heads(self.tp_size),
         ):

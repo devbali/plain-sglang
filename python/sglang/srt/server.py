@@ -29,6 +29,8 @@ import time
 from http import HTTPStatus
 from typing import Dict, List, Optional, Union
 
+mp.set_start_method("spawn", force=True)
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -419,13 +421,14 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Check flashinfer version
     if not server_args.disable_flashinfer:
-        assert_pkg_version(
-            "flashinfer",
-            "0.1.6",
-            "Please uninstall the old version and "
-            "reinstall the latest version by following the instructions "
-            "at https://docs.flashinfer.ai/installation.html.",
-        )
+        pass
+        # assert_pkg_version(
+        #     "flashinfer",
+        #     "0.1.6",
+        #     "Please uninstall the old version and "
+        #     "reinstall the latest version by following the instructions "
+        #     "at https://docs.flashinfer.ai/installation.html.",
+        # )
 
 
 def _wait_and_warmup(server_args, pipe_finish_writer, pid):

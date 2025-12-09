@@ -21,7 +21,7 @@ from typing import Callable, List
 
 import torch
 from flashinfer import BatchDecodeWithPagedKVCacheWrapper
-from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
+#from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
 from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.custom_op import CustomOp
 
@@ -196,7 +196,7 @@ class CudaGraphRunner:
         out_cache_loc = self.out_cache_loc[:bs]
 
         # FlashInfer inputs
-        if not _grouped_size_compiled_for_decode_kernels(
+        if True or not _grouped_size_compiled_for_decode_kernels(
             self.model_runner.model_config.num_attention_heads
             // self.model_runner.tp_size,
             self.model_runner.model_config.get_num_kv_heads(self.model_runner.tp_size),

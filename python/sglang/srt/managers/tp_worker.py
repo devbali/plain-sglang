@@ -254,27 +254,39 @@ class ModelTpServer:
     @torch.inference_mode()
     def forward_step(self):
         new_batch = self.get_new_prefill_batch()
+        
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
 
         if new_batch is not None:
             # Run a new prefill batch
+            start.record()
             self.forward_prefill_batch(new_batch)
+            end.record()
+            torch.cuda.synchronize()
+            elapsed_time_ms = start.elapsed_time(end)
 
             if not new_batch.is_empty():
                 if self.running_batch is None:
                     self.running_batch = new_batch
                 else:
                     self.running_batch.merge(new_batch)
+            self.print_stats(decode=False, elapsed_time_ms=elapsed_time_ms)
+
         else:
             # Run a decode batch
             if self.running_batch is not None:
                 # Run a few decode batches continuously for reducing overhead
                 for _ in range(global_config.num_continue_decode_steps):
                     self.num_generated_tokens += len(self.running_batch.reqs)
+                    start.record()
                     self.forward_decode_batch(self.running_batch)
+                    end.record()
+                    torch.cuda.synchronize()
+                    elapsed_time_ms = start.elapsed_time(end)
 
                     # Print stats
-                    if self.tp_rank == 0 and self.decode_forward_ct % 40 == 0:
-                        self.print_decode_stats()
+                    self.print_stats(decode=True, elapsed_time_ms=elapsed_time_ms)
 
                     if self.running_batch.is_empty():
                         self.running_batch = None
@@ -286,21 +298,39 @@ class ModelTpServer:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
 
-    def print_decode_stats(self):
+    def print_stats(self, decode=True, elapsed_time_ms=0):
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
         throughput = self.num_generated_tokens / (time.time() - self.last_stats_tic)
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time()
+
+        current_time = time.time()
+        token_usage = num_used / self.max_total_num_tokens
+        running_reqs = len(self.running_batch.reqs)
+        queue_reqs = len(self.waiting_queue)
+        
+        # Log to console
         logger.info(
-            f"Decode batch. "
-            f"#running-req: {len(self.running_batch.reqs)}, "
+            f"{'Decode' if decode else 'Prefill'} batch. "
+            f"#running-req: {running_reqs}, "
             f"#token: {num_used}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+            f"token usage: {token_usage:.2f}, "
             f"gen throughput (token/s): {throughput:.2f}, "
-            f"#queue-req: {len(self.waiting_queue)}"
+            f"#queue-req: {queue_reqs}"
         )
+        
+        # Log to CSV
+        if self.tp_rank == 0:  # Only log from rank 0
+            csv_file = "sglang_log.csv"
+            write_header = not os.path.exists(csv_file)
+            
+            with open(csv_file, 'a') as f:
+                if write_header:
+                    f.write("timestamp,type,time_elapsed,running_reqs,num_tokens,token_usage,throughput,queue_reqs\n")
+                f.write(f"{current_time},{'Decode' if decode else 'Prefill'},{elapsed_time_ms},{running_reqs},{num_used},{token_usage:.4f},{throughput:.4f},{queue_reqs}\n")
+
 
     def check_memory(self):
         available_size = (
