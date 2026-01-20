@@ -508,22 +508,24 @@ class UcclKVManager(MooncakeKVManager):
         )
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
-        ret = 0
+        transfer_blocks = []
 
         for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
-            src_mr_id = self.ptr_to_mr_id[prefill_aux_ptrs[i]]
-            dst_meta = dst_aux_metas[i]
-            ret = self._transfer_data(
-                req.mooncake_session_id,
-                [(src_addr, dst_addr, length, src_mr_id, dst_aux_ptrs[i], dst_meta)],
+            transfer_blocks.append(
+                (
+                    src_addr,
+                    dst_addr,
+                    length,
+                    self.ptr_to_mr_id[prefill_aux_ptrs[i]],
+                    dst_aux_ptrs[i],
+                    dst_aux_metas[i],
+                )
             )
-            if ret != 0:
-                return ret
 
-        return ret
+        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
     def _send_mamba_state(
         self,
@@ -544,22 +546,24 @@ class UcclKVManager(MooncakeKVManager):
         )
         prefill_state_data_ptrs = self.kv_args.state_data_ptrs
         prefill_state_item_lens = self.kv_args.state_item_lens
-        ret = 0
+        transfer_blocks = []
 
         for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
             length = prefill_state_item_lens[i]
             src_addr = prefill_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
             dst_addr = dst_state_ptr + length * int(req.dst_state_indices[0])
-            src_mr_id = self.ptr_to_mr_id[prefill_state_data_ptrs[i]]
-            dst_meta = dst_state_metas[i]
-            ret = self._transfer_data(
-                req.mooncake_session_id,
-                [(src_addr, dst_addr, length, src_mr_id, dst_state_ptr, dst_meta)],
+            transfer_blocks.append(
+                (
+                    src_addr,
+                    dst_addr,
+                    length,
+                    self.ptr_to_mr_id[prefill_state_data_ptrs[i]],
+                    dst_state_ptr,
+                    dst_state_metas[i],
+                )
             )
-            if ret != 0:
-                return ret
 
-        return ret
+        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
     def _send_uccl_endpoint_info(
         self, remote: str, dst_port: int, session_id: str
