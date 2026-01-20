@@ -863,6 +863,16 @@ class MooncakeKVManager(CommonKVManager):
                     self.decode_kv_args_table[mooncake_session_id] = (
                         KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     )
+                    info = self.decode_kv_args_table[mooncake_session_id]
+                    logger.info(
+                        "Received Mooncake KVArgs register: session_id=%s endpoint=%s dst_port=%s tp_rank=%s attn_tp_size=%s kv_item_len=%s",
+                        info.mooncake_session_id,
+                        info.endpoint,
+                        info.dst_port,
+                        info.dst_tp_rank,
+                        info.dst_attn_tp_size,
+                        info.dst_kv_item_len,
+                    )
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
                             self.failed_sessions.remove(mooncake_session_id)
@@ -880,6 +890,17 @@ class MooncakeKVManager(CommonKVManager):
 
                     self.transfer_infos[room][mooncake_session_id] = (
                         TransferInfo.from_zmq(waiting_req_bytes)
+                    )
+                    info = self.transfer_infos[room][mooncake_session_id]
+                    logger.info(
+                        "Received Mooncake transfer info: room=%s session_id=%s endpoint=%s dst_port=%s required_dst_info_num=%s is_dummy=%s kv_indices_len=%s",
+                        room,
+                        info.mooncake_session_id,
+                        info.endpoint,
+                        info.dst_port,
+                        info.required_dst_info_num,
+                        info.is_dummy,
+                        len(info.dst_kv_indices),
                     )
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
@@ -1212,6 +1233,17 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_kv_item_len = str(kv_item_len).encode("ascii")
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            logger.info(
+                "Sending Mooncake KVArgs register to %s:%s session_id=%s local_ip=%s rank_port=%s tp_rank=%s attn_tp_size=%s kv_item_len=%s",
+                bootstrap_info["rank_ip"],
+                bootstrap_info["rank_port"],
+                self.session_id,
+                self.kv_mgr.local_ip,
+                self.kv_mgr.rank_port,
+                tp_rank,
+                self.kv_mgr.attn_tp_size,
+                kv_item_len,
+            )
             with lock:
                 sock.send_multipart(
                     [
@@ -1247,6 +1279,16 @@ class MooncakeKVReceiver(CommonKVReceiver):
             is_dummy = bootstrap_info["is_dummy"]
 
             with lock:
+                logger.info(
+                    "Sending Mooncake bootstrap info to %s:%s room=%s session_id=%s local_ip=%s rank_port=%s is_dummy=%s",
+                    bootstrap_info["rank_ip"],
+                    bootstrap_info["rank_port"],
+                    self.bootstrap_room,
+                    self.session_id,
+                    self.kv_mgr.local_ip,
+                    self.kv_mgr.rank_port,
+                    is_dummy,
+                )
                 sock.send_multipart(
                     [
                         str(self.bootstrap_room).encode("ascii"),

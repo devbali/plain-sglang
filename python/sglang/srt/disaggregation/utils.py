@@ -231,6 +231,7 @@ class MetadataBuffers:
 
 class TransferBackend(Enum):
     MOONCAKE = "mooncake"
+    UCCL = "uccl"
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
@@ -264,6 +265,23 @@ def get_kv_class(
             KVClassType.SENDER: MooncakeKVSender,
             KVClassType.RECEIVER: (MooncakeKVReceiver),
             KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
+    elif transfer_backend == TransferBackend.UCCL:
+        from sglang.srt.disaggregation.base import KVArgs
+        from sglang.srt.disaggregation.uccl import (
+            UcclKVBootstrapServer,
+            UcclKVManager,
+            UcclKVReceiver,
+            UcclKVSender,
+        )
+
+        class_mapping = {
+            KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: UcclKVManager,
+            KVClassType.SENDER: UcclKVSender,
+            KVClassType.RECEIVER: (UcclKVReceiver),
+            KVClassType.BOOTSTRAP_SERVER: UcclKVBootstrapServer,
         }
         return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.ASCEND:

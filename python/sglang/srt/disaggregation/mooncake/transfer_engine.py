@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import socket
 from typing import List, Optional
 
 from sglang.srt.environ import envs
@@ -101,14 +102,71 @@ class MooncakeTransferEngine:
         self.hostname = hostname
         self.gpu_id = gpu_id
         self.ib_device = get_ib_devices_for_gpu(ib_device, gpu_id)
+        resolved_ip = None
+        try:
+            resolved_ip = socket.gethostbyname(hostname)
+        except Exception:
+            resolved_ip = None
+        logger.info(
+            "MooncakeTransferEngine init: hostname=%s resolved_ip=%s gpu_id=%s ib_device=%s",
+            self.hostname,
+            resolved_ip,
+            self.gpu_id,
+            self.ib_device,
+        )
+        logger.info(
+            "Mooncake env: NCCL_SOCKET_IFNAME=%s NCCL_IB_HCA=%s NCCL_IB_GID_INDEX=%s",
+            os.getenv("NCCL_SOCKET_IFNAME"),
+            os.getenv("NCCL_IB_HCA"),
+            os.getenv("NCCL_IB_GID_INDEX"),
+        )
+        try:
+            topo_filtered = self.engine.get_local_topology(device_name=self.ib_device or "")
+            logger.info("Mooncake local topology (filtered=%s): %s", self.ib_device, topo_filtered)
+            topo_all = self.engine.get_local_topology(device_name="")
+            hca_names = self._extract_hcas_from_topology(topo_all)
+            protocol = os.getenv("MC_PROTOCOL", "tcp")
+            logger.info(
+                "Mooncake transport selection: protocol=%s hcas=%s",
+                protocol,
+                ",".join(hca_names) if hca_names else "none",
+            )
+        except Exception as e:
+            logger.warning("Mooncake local topology dump failed: %s", e)
 
         self.initialize(
             hostname=self.hostname,
             device_name=self.ib_device,
         )
+        logger.info(
+            "MooncakeTransferEngine initialized: hostname=%s gpu_id=%s device_name=%s rpc_port=%s",
+            self.hostname,
+            self.gpu_id,
+            self.ib_device,
+            self.engine.get_rpc_port(),
+        )
         self.session_id = (
             f"{maybe_wrap_ipv6_address(self.hostname)}:{self.engine.get_rpc_port()}"
         )
+        logger.info("MooncakeTransferEngine session_id=%s", self.session_id)
+
+    @staticmethod
+    def _extract_hcas_from_topology(topo_json: str) -> List[str]:
+        try:
+            topo = json.loads(topo_json)
+        except Exception:
+            return []
+        hcas = set()
+        for entry in topo.values():
+            if not isinstance(entry, list) or len(entry) != 2:
+                continue
+            for group in entry:
+                if not isinstance(group, list):
+                    continue
+                for hca in group:
+                    if isinstance(hca, str) and hca:
+                        hcas.add(hca)
+        return sorted(hcas)
 
     def register(self, ptr, length):
         try:
@@ -165,6 +223,11 @@ class MooncakeTransferEngine:
         device_name: Optional[str],
     ) -> None:
         """Initialize the mooncake instance."""
+        logger.info(
+            "MooncakeTransferEngine initialize: hostname=%s device_name=%s",
+            hostname,
+            device_name,
+        )
         if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
             npu_phy_id = envs.ASCEND_NPU_PHY_ID.get()
             if npu_phy_id == -1:
@@ -192,6 +255,13 @@ class MooncakeTransferEngine:
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
     ) -> int:
         """Synchronously transfer data to the specified address."""
+        logger.info(
+            "Mooncake transfer_sync: session_id=%s buffer=0x%x peer=0x%x len=%s",
+            session_id,
+            buffer,
+            peer_buffer_address,
+            length,
+        )
         try:
             # the first time: based on session_id (which contains remote_ip) to construct a queue pair, and cache the queue pair
             # later: based on the cached queue pair to send data
@@ -221,6 +291,12 @@ class MooncakeTransferEngine:
         lengths: List[int],
     ) -> int:
         """Synchronously transfer data to the specified addresses in batches."""
+        logger.info(
+            "Mooncake batch_transfer_sync: session_id=%s count buffers=%s, lengths of each buffer=%s",
+            session_id,
+            len(buffers),
+            str(lengths)
+        )
         try:
             ret = self.engine.batch_transfer_sync_write(
                 session_id, buffers, peer_buffer_addresses, lengths
