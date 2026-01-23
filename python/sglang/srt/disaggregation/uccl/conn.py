@@ -16,6 +16,7 @@ import requests
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
+    append_p2p_csv,
     group_concurrent_contiguous,
 )
 from sglang.srt.disaggregation.mooncake.conn import (
@@ -588,14 +589,19 @@ class UcclKVManager(MooncakeKVManager):
             self.local_ip,
             self.rank_port,
         )
-        socket.send_multipart(
-            [
-                UcclKVManager.UCCL_ENDPOINT_HEADER,
-                session_id.encode("ascii"),
-                self.local_ip.encode("ascii"),
-                str(self.rank_port).encode("ascii"),
-                endpoint_metadata,
-            ]
+        payload = [
+            UcclKVManager.UCCL_ENDPOINT_HEADER,
+            session_id.encode("ascii"),
+            self.local_ip.encode("ascii"),
+            str(self.rank_port).encode("ascii"),
+            endpoint_metadata,
+        ]
+        start = time.perf_counter()
+        socket.send_multipart(payload)
+        append_p2p_csv(
+            "p2p_conn.csv",
+            sum(len(part) for part in payload),
+            time.perf_counter() - start,
         )
 
     def _send_uccl_meta(
@@ -619,17 +625,22 @@ class UcclKVManager(MooncakeKVManager):
             len(aux_metas),
             len(state_metas),
         )
-        socket.send_multipart(
-            [
-                UcclKVManager.UCCL_META_HEADER,
-                session_id.encode("ascii"),
-                str(len(kv_metas)).encode("ascii"),
-                str(len(aux_metas)).encode("ascii"),
-                str(len(state_metas)).encode("ascii"),
-                b"".join(kv_metas),
-                b"".join(aux_metas),
-                b"".join(state_metas),
-            ]
+        payload = [
+            UcclKVManager.UCCL_META_HEADER,
+            session_id.encode("ascii"),
+            str(len(kv_metas)).encode("ascii"),
+            str(len(aux_metas)).encode("ascii"),
+            str(len(state_metas)).encode("ascii"),
+            b"".join(kv_metas),
+            b"".join(aux_metas),
+            b"".join(state_metas),
+        ]
+        start = time.perf_counter()
+        socket.send_multipart(payload)
+        append_p2p_csv(
+            "p2p_conn.csv",
+            sum(len(part) for part in payload),
+            time.perf_counter() - start,
         )
 
     def _handle_uccl_meta(self, msg: List[bytes]):

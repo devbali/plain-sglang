@@ -25,6 +25,7 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
+    append_p2p_csv,
     group_concurrent_contiguous,
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
@@ -1245,19 +1246,26 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 kv_item_len,
             )
             with lock:
+                payload = [
+                    "None".encode("ascii"),
+                    self.kv_mgr.local_ip.encode("ascii"),
+                    str(self.kv_mgr.rank_port).encode("ascii"),
+                    self.session_id.encode("ascii"),
+                    packed_kv_data_ptrs,
+                    packed_aux_data_ptrs,
+                    packed_state_data_ptrs,
+                    dst_tp_rank,
+                    dst_attn_tp_size,
+                    dst_kv_item_len,
+                ]
+                start = time.perf_counter()
                 sock.send_multipart(
-                    [
-                        "None".encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        packed_kv_data_ptrs,
-                        packed_aux_data_ptrs,
-                        packed_state_data_ptrs,
-                        dst_tp_rank,
-                        dst_attn_tp_size,
-                        dst_kv_item_len,
-                    ]
+                    payload
+                )
+                append_p2p_csv(
+                    "p2p_conn.csv",
+                    sum(len(part) for part in payload),
+                    time.perf_counter() - start,
                 )
 
     def init(
@@ -1289,24 +1297,29 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     self.kv_mgr.rank_port,
                     is_dummy,
                 )
-                sock.send_multipart(
-                    [
-                        str(self.bootstrap_room).encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        kv_indices.tobytes() if not is_dummy else b"",
-                        str(aux_index).encode("ascii") if not is_dummy else b"",
-                        (
-                            np.array(
-                                state_indices,
-                                dtype=np.int32,
-                            ).tobytes()
-                            if not is_dummy and state_indices is not None
-                            else b""
-                        ),
-                        str(self.required_dst_info_num).encode("ascii"),
-                    ]
+                payload = [
+                    str(self.bootstrap_room).encode("ascii"),
+                    self.kv_mgr.local_ip.encode("ascii"),
+                    str(self.kv_mgr.rank_port).encode("ascii"),
+                    self.session_id.encode("ascii"),
+                    kv_indices.tobytes() if not is_dummy else b"",
+                    str(aux_index).encode("ascii") if not is_dummy else b"",
+                    (
+                        np.array(
+                            state_indices,
+                            dtype=np.int32,
+                        ).tobytes()
+                        if not is_dummy and state_indices is not None
+                        else b""
+                    ),
+                    str(self.required_dst_info_num).encode("ascii"),
+                ]
+                start = time.perf_counter()
+                sock.send_multipart(payload)
+                append_p2p_csv(
+                    "p2p_conn.csv",
+                    sum(len(part) for part in payload),
+                    time.perf_counter() - start,
                 )
         self.init_time = time.time()
 

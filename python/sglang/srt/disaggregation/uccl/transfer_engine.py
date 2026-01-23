@@ -3,8 +3,10 @@ import os
 import socket
 import struct
 import threading
+import time
 from typing import List, Optional, Tuple
 
+from sglang.srt.disaggregation.common.utils import append_p2p_csv
 from sglang.srt.utils import maybe_wrap_ipv6_address
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,12 @@ class UcclTransferEngine:
 
         self._p2p = p2p
         if num_cpus is None:
+            try:
+                num_cpus = int(os.environ.get("UCCL_NUM_ENGINES"))
+            except ValueError:
+                num_cpus = None
+
+        if num_cpus is None:
             num_cpus = 1 # Default to 1 CPU if not specified
 
         logger.info(
@@ -49,6 +57,7 @@ class UcclTransferEngine:
             os.getenv("UCCL_IB_GID_INDEX"),
         )
         ifname = os.getenv("UCCL_SOCKET_IFNAME")
+        ifname_source = "env" if ifname else "auto"
         ifname_ip = None
         if ifname:
             ifname_ip = self._get_ipv4_for_ifname(ifname)
@@ -66,6 +75,12 @@ class UcclTransferEngine:
                     ifname_ip,
                 )
         self._ifname_ip = ifname_ip
+        logger.info(
+            "UCCL interface selection: ifname=%s source=%s ifname_ip=%s",
+            ifname,
+            ifname_source,
+            ifname_ip,
+        )
         logger.info("num cpus for UCCL: %s", num_cpus   )
         self.endpoint = p2p.Endpoint(gpu_id, num_cpus)
         self.hostname = hostname
@@ -372,6 +387,7 @@ class UcclTransferEngine:
             len(src_addrs),
             str(lengths),
         )
+        #start = time.perf_counter()
         if not (
             len(src_addrs)
             == len(dst_addrs)
@@ -403,7 +419,7 @@ class UcclTransferEngine:
             meta_list.append(
                 self._update_fifo_item(dst_meta, dst_base_ptr + offset, length)
             )
-
+        start = time.perf_counter()
         try:
             logger.info("UCCL batch_transfer_sync: starting writev")
             ok = self.endpoint.writev(
@@ -413,6 +429,7 @@ class UcclTransferEngine:
 
         except Exception:
             ok = False
+        append_p2p_csv("p2p_data.csv", sum(lengths), time.perf_counter() - start)
         return 0 if ok else -1
 
     def get_session_id(self) -> str:

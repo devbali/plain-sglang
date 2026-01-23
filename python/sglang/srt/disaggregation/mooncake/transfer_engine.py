@@ -2,9 +2,11 @@ import json
 import logging
 import os
 import socket
+import time
 from typing import List, Optional
 
 from sglang.srt.environ import envs
+from sglang.srt.disaggregation.common.utils import append_p2p_csv
 from sglang.srt.utils import get_free_port, maybe_wrap_ipv6_address
 
 logger = logging.getLogger(__name__)
@@ -102,6 +104,11 @@ class MooncakeTransferEngine:
         self.hostname = hostname
         self.gpu_id = gpu_id
         self.ib_device = get_ib_devices_for_gpu(ib_device, gpu_id)
+        logger.info(
+            "Mooncake interface selection: ib_device=%s (raw=%s)",
+            self.ib_device,
+            ib_device,
+        )
         resolved_ip = None
         try:
             resolved_ip = socket.gethostbyname(hostname)
@@ -262,6 +269,7 @@ class MooncakeTransferEngine:
             peer_buffer_address,
             length,
         )
+        start = time.perf_counter()
         try:
             # the first time: based on session_id (which contains remote_ip) to construct a queue pair, and cache the queue pair
             # later: based on the cached queue pair to send data
@@ -281,6 +289,7 @@ class MooncakeTransferEngine:
                 peer_buffer_address,
             )
 
+        append_p2p_csv("p2p_data.csv", length, time.perf_counter() - start)
         return ret
 
     def batch_transfer_sync(
@@ -297,6 +306,7 @@ class MooncakeTransferEngine:
             len(buffers),
             str(lengths)
         )
+        start = time.perf_counter()
         try:
             ret = self.engine.batch_transfer_sync_write(
                 session_id, buffers, peer_buffer_addresses, lengths
@@ -317,6 +327,7 @@ class MooncakeTransferEngine:
                 session_id,
                 peer_buffer_addresses,
             )
+        append_p2p_csv("p2p_data.csv", sum(lengths), time.perf_counter() - start)
         return ret
 
     def get_session_id(self):

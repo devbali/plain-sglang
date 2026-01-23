@@ -1,3 +1,4 @@
+import os
 import threading
 from collections import deque
 from typing import List, Tuple
@@ -40,3 +41,11 @@ def group_concurrent_contiguous(
     dst_groups = [g.tolist() for g in dst_groups]
 
     return src_groups, dst_groups
+
+
+def append_p2p_csv(path: str, data_bytes: int, latency_s: float) -> None:
+    write_header = not os.path.exists(path)
+    with open(path, "a", encoding="ascii") as f:
+        if write_header:
+            f.write("data,latency\n")
+        f.write(f"{data_bytes},{latency_s:.9f}\n")
