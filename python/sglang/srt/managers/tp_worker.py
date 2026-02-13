@@ -21,7 +21,8 @@ import os
 import pickle
 import time
 import warnings
-from typing import Any, List, Optional, Union
+import json
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.distributed
@@ -55,6 +56,9 @@ from sglang.srt.model_config import ModelConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.delta_fairness.no_fairness_policy import NoFairnessPolicy
+from sglang.srt.delta_fairness.static_fairness_policy import StaticFairnessPolicy
+from sglang.srt.delta_fairness.delta_fairness_policy import DeltaFairnessPolicy
 from sglang.srt.utils import (
     configure_logger,
     is_multimodal_model,
@@ -67,6 +71,8 @@ logger = logging.getLogger(__name__)
 
 
 crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
+CLIP_MAX_NEW_TOKENS = int(os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS", "4096"))
+PREFILL_TOKENS_PER_DECODE = 250
 
 
 class ModelTpServer:
@@ -152,6 +158,41 @@ class ModelTpServer:
             f"context_len={self.model_config.context_len}"
         )
 
+        self.max_kv_cache_tokens_per_user = None
+        if server_args.static_reservation_n > 0:
+            self.max_kv_cache_tokens_per_user = (
+                self.max_total_num_tokens // server_args.static_reservation_n
+            )
+
+        self.fair_share_tokens_per_user = None
+        self.delta_fairness_n = None
+        self.delta_fairness_deltas_microseconds = None
+
+        if server_args.delta_fairness_n > 0:
+            self.delta_fairness_n = server_args.delta_fairness_n
+            self.fair_share_tokens_per_user = (
+                self.max_total_num_tokens // server_args.delta_fairness_n
+            )
+            delta_fairness_json_path = server_args.delta_fairness_config_file
+            try:
+                with open(delta_fairness_json_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+            except json.JSONDecodeError as err:
+                logger.error(
+                    "Could not read delta fairness config %s: %s",
+                    delta_fairness_json_path,
+                    err,
+                )
+                raise
+
+            self.delta_fairness_deltas_microseconds = config.get(
+                "delta_fairness_deltas_microseconds",
+                {
+                    "prefill_running_batch": 0,
+                    "decode_running_batch": 150000,
+                },
+            )
+
         # Init cache
         if (
             server_args.chunked_prefill_size is not None
@@ -166,7 +207,18 @@ class ModelTpServer:
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 disable=server_args.disable_radix_cache,
+                static_max_per_user=self.max_kv_cache_tokens_per_user,
+                fairinf_max_per_user=self.fair_share_tokens_per_user,
+                fairinf_n=self.delta_fairness_n,
+                fairinf_deltas_microseconds=self.delta_fairness_deltas_microseconds,
             )
+
+        if self.delta_fairness_n:
+            self.fairness_policy = DeltaFairnessPolicy()
+        elif self.max_kv_cache_tokens_per_user:
+            self.fairness_policy = StaticFairnessPolicy()
+        else:
+            self.fairness_policy = NoFairnessPolicy()
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.scheduler = PolicyScheduler(self.schedule_policy, self.tree_cache)
         self.req_to_token_pool = self.model_runner.req_to_token_pool
@@ -253,13 +305,38 @@ class ModelTpServer:
 
     @torch.inference_mode()
     def forward_step(self):
-        new_batch = self.get_new_prefill_batch()
+        force_decode = False
+        max_prefill_size = None
+
+        force_prefill = self.fairness_policy.fairinf_force_prefill_any_waiting(
+            self.waiting_queue,
+            tree_cache=self.tree_cache,
+            delta_fairness_deltas_microseconds=self.delta_fairness_deltas_microseconds,
+            delta_fairness_n=self.delta_fairness_n,
+            running_batch=self.running_batch,
+            max_running_requests=self.max_running_requests,
+        )
+
+        if not force_prefill:
+            force_decode, max_prefill_size = self.fairness_policy.fairinf_force_decode(
+                self.running_batch,
+                delta_fairness_deltas_microseconds=self.delta_fairness_deltas_microseconds,
+                tree_cache=self.tree_cache,
+                delta_fairness_n=self.delta_fairness_n,
+                max_running_requests=self.max_running_requests,
+            )
+
+        new_batch = None if force_decode else self.get_new_prefill_batch(max_prefill_size)
         
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
         if new_batch is not None:
             # Run a new prefill batch
+            if self.running_batch is not None:
+                add_wait = new_batch.total_size() / PREFILL_TOKENS_PER_DECODE
+                for req in self.running_batch.reqs:
+                    req.waiting_time_in_decodes += add_wait
             start.record()
             self.forward_prefill_batch(new_batch)
             end.record()
@@ -276,6 +353,10 @@ class ModelTpServer:
         else:
             # Run a decode batch
             if self.running_batch is not None:
+                for req in self.running_batch.reqs:
+                    req.waiting_time_in_decodes = 0
+                for req in self.waiting_queue:
+                    req.waiting_time_in_decodes += 1
                 # Run a few decode batches continuously for reducing overhead
                 for _ in range(global_config.num_continue_decode_steps):
                     self.num_generated_tokens += len(self.running_batch.reqs)
@@ -425,7 +506,9 @@ class ModelTpServer:
 
         self.waiting_queue.append(req)
 
-    def get_new_prefill_batch(self) -> Optional[ScheduleBatch]:
+    def get_new_prefill_batch(
+        self, max_prefill_token_size: Optional[int] = None
+    ) -> Optional[ScheduleBatch]:
         running_bs = (
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
@@ -436,41 +519,76 @@ class ModelTpServer:
         prefix_computed = self.scheduler.calc_priority(self.waiting_queue)
 
         num_mixed_running = running_bs if self.is_mixed_chunk else 0
+        max_input_size = (
+            min(self.max_prefill_tokens, max_prefill_token_size)
+            if max_prefill_token_size is not None
+            else self.max_prefill_tokens
+        )
 
         adder = PrefillAdder(
             self.tree_cache,
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
-            self.max_prefill_tokens,
+            max_input_size,
             self.chunked_prefill_size,
             num_mixed_running,
+            fairness_policy=self.fairness_policy,
         )
 
         if self.running_batch is not None:
             adder.remove_running_tokens(self.running_batch, self.new_token_ratio)
 
         has_inflight = self.current_inflight_req is not None
+        token_counters_by_user: Dict[str, List[int]] = {}
         if self.current_inflight_req is not None:
-            self.current_inflight_req.init_next_round_input(
-                None if prefix_computed else self.tree_cache
+            inflight_result = self.current_inflight_req.init_next_round_input(
+                None if prefix_computed else self.tree_cache,
+                fairness_policy=self.fairness_policy,
             )
-            self.current_inflight_req = adder.add_inflight_req(
-                self.current_inflight_req
+            if inflight_result != "rejected":
+                token_counters_by_user.setdefault(
+                    self.current_inflight_req.uid, []
+                ).append(self.current_inflight_req.extend_input_len)
+                self.current_inflight_req = adder.add_inflight_req(
+                    self.current_inflight_req
+                )
+            else:
+                self.current_inflight_req = None
+                has_inflight = False
+
+        extra_space, evicted_reqs = self.fairness_policy.force_prefill_reservations(
+            self.waiting_queue,
+            token_counters_by_user=token_counters_by_user,
+            adder=adder,
+            tree_cache=self.tree_cache,
+            token_to_kv_pool=self.token_to_kv_pool,
+            running_batch=self.running_batch,
+            delta_fairness_deltas_microseconds=self.delta_fairness_deltas_microseconds,
+            delta_fairness_n=self.delta_fairness_n,
+            max_running_requests=self.max_running_requests,
+            prefix_computed=prefix_computed,
+        )
+        if extra_space > 0 and evicted_reqs:
+            logger.info(
+                "Fairness reserved %s tokens (available=%s, evictable=%s)",
+                extra_space,
+                self.token_to_kv_pool.available_size(),
+                self.tree_cache.evictable_size(),
             )
 
-        for req in self.waiting_queue:
-            req.init_next_round_input(None if prefix_computed else self.tree_cache)
-            res = adder.add_one_req(req)
-            if (
-                not res
-                or adder.no_remaining_tokens()
-                or running_bs + len(adder.can_run_list) >= self.max_running_requests
-            ):
-                break
+        self.fairness_policy.process_waiting_queue_prefills(
+            self.waiting_queue,
+            adder=adder,
+            token_counters_by_user=token_counters_by_user,
+            prefix_computed=prefix_computed,
+            tree_cache=self.tree_cache,
+            running_batch_size=running_bs,
+            max_running_requests=self.max_running_requests,
+            max_input_size=max_input_size,
+        )
 
         can_run_list = adder.can_run_list
 
         if adder.new_inflight_req is not None:
-            assert self.current_inflight_req is None
             self.current_inflight_req = adder.new_inflight_req
 
         if len(can_run_list) == 0:
@@ -500,8 +618,13 @@ class ModelTpServer:
                     f"#queue-req: {len(self.waiting_queue) - len(can_run_list) + has_inflight}"
                 )
             else:
+                fairness_msg = (
+                    f"Max tokens imposed by fair decode {max_prefill_token_size}. "
+                    if max_prefill_token_size is not None
+                    else ""
+                )
                 logger.info(
-                    f"Prefill batch. "
+                    f"Prefill batch. {fairness_msg}"
                     f"#new-seq: {len(can_run_list)}, "
                     f"#new-token: {adder.log_input_tokens}, "
                     f"#cached-token: {adder.log_hit_tokens}, "
@@ -516,13 +639,26 @@ class ModelTpServer:
             self.req_to_token_pool,
             self.token_to_kv_pool,
             self.tree_cache,
+            fairness_policy=self.fairness_policy,
         )
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
         return new_batch
 
     def forward_prefill_batch(self, batch: ScheduleBatch):
         # Build batch tensors
-        batch.prepare_for_extend(self.model_config.vocab_size)
+        requesting_users = {req.uid for req in batch.reqs}
+        removed_requests = batch.prepare_for_extend(
+            self.model_config.vocab_size,
+            running_batch=self.running_batch,
+            requesting_users=list(requesting_users),
+        )
+
+        if removed_requests:
+            logger.info(
+                "Prefill displaced %s decodes; pushing back to waiting queue",
+                len(removed_requests),
+            )
+            self.waiting_queue.extend(removed_requests)
 
         decoding_reqs = []
         if self.is_mixed_chunk and self.running_batch is not None:

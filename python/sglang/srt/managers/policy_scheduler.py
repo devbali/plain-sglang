@@ -21,6 +21,8 @@ from collections import defaultdict
 from contextlib import contextmanager
 from typing import Dict, List, Optional
 
+from sglang.srt.delta_fairness.no_fairness_policy import NoFairnessPolicy
+
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.radix_cache import TreeNode
@@ -112,6 +114,7 @@ class PrefillAdder:
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
+        fairness_policy: Optional[NoFairnessPolicy] = None,
     ):
         self.tree_cache = tree_cache
         self.rem_total_tokens = rem_total_tokens - mixed_with_decode_tokens
@@ -120,10 +123,17 @@ class PrefillAdder:
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= mixed_with_decode_tokens
 
+        self.fairness_policy = fairness_policy or NoFairnessPolicy()
         self.can_run_list = []
         self.new_inflight_req = None
         self.log_hit_tokens = 0
         self.log_input_tokens = 0
+    
+    def expand_capacity(self, new_capacity: int):
+        self.rem_total_tokens += new_capacity
+        self.rem_input_tokens += new_capacity
+        if self.rem_chunk_tokens is not None:
+            self.rem_chunk_tokens += new_capacity
 
     def no_remaining_tokens(self):
         return (
@@ -190,7 +200,7 @@ class PrefillAdder:
             delta = self.tree_cache.dec_lock_ref(last_node)
             self.rem_total_tokens += delta
 
-    def add_one_req(self, req: Req):
+    def add_one_req(self, req: Req, extra_tokens: int = 0):
         total_tokens = req.extend_input_len + min(
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
         )
@@ -206,6 +216,13 @@ class PrefillAdder:
         with self._lock_node(req.last_node):
             if total_tokens > self.rem_total_tokens:
                 return False
+            rejection = self.fairness_policy.add_prefill_request_control(
+                self.tree_cache,
+                req,
+                extra_tokens=extra_tokens,
+            )
+            if rejection == "rejected":
+                return "rejected"
 
             if (
                 self.rem_chunk_tokens is None

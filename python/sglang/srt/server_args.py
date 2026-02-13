@@ -55,6 +55,13 @@ class ServerArgs:
     max_prefill_tokens: int = 16384
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
+    
+    # Delta Fairness
+    
+    # If anything but zero, kv cache memory pool will have a static reservation of total kv cache / n
+    static_reservation_n : int = 0
+    delta_fairness_n : int = 0
+    delta_fairness_config_file : str = "delta_fairness_config.json"
 
     # Other runtime options
     tp_size: int = 1
@@ -453,6 +460,28 @@ class ServerArgs:
             "--efficient-weight-load",
             action="store_true",
             help="Turn on memory efficient weight loading with quantization (quantize per layer during loading).",
+        )
+        
+        # Delta Fairness
+        parser.add_argument(
+            "--static-reservation-n",
+            type=int,
+            default=ServerArgs.static_reservation_n,
+            help="If anything but zero, kv cache memory pool will have a static reservation of total kv cache / n",
+        )
+        
+        parser.add_argument(
+            "--delta-fairness-n",
+            type=int,
+            default=ServerArgs.delta_fairness_n,
+            help="If anything but zero, delta fairness will be on and this will be n",
+        )
+        
+        parser.add_argument(
+            "--delta-fairness-config-file",
+            type=str,
+            default=ServerArgs.delta_fairness_config_file,
+            help="Path to the delta fairness config file",
         )
 
     @classmethod

@@ -18,7 +18,7 @@ limitations under the License.
 """Meta data for requests and batches"""
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -30,9 +30,12 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.metrics.prefix_match import record_prefix_match_metric
+from sglang.srt.delta_fairness.no_fairness_policy import NoFairnessPolicy
 
 if TYPE_CHECKING:
     from sglang.srt.layers.sampler import SampleOutput
+    from sglang.srt.delta_fairness.no_fairness_policy import NoFairnessPolicy
 
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -163,18 +166,46 @@ class Req:
         self.regex_fsm: RegexGuide = None
         self.regex_fsm_state: int = 0
         self.jump_forward_map: JumpForwardMap = None
+        
+        # Delta Fairness / Fair inference tracking
+        self.waiting_time_in_decodes = 0
+        self.first_time_in_waiting_queue = True
 
     # whether request reached finished condition
     def finished(self) -> bool:
         return self.finished_reason is not None
 
-    def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
+    def get_estimated_prefill_impact(self) -> int:
+        return len(self.origin_input_ids) + self.extend_input_len + 2
+
+    def init_next_round_input(
+        self,
+        tree_cache: Optional[BasePrefixCache] = None,
+        *,
+        fairness_policy: Optional["NoFairnessPolicy"] = None,
+        fair: bool = False,
+        extra_tokens: int = 0,
+    ):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
             self.prefix_indices, self.last_node = tree_cache.match_prefix(
                 rid=self.rid, key=self.adjust_max_prefix_ids()
             )
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+        record_prefix_match_metric(
+            prompt_tokens=len(self.origin_input_ids),
+            prefix_tokens=len(self.prefix_indices),
+            rid=self.rid,
+            uid=self.uid,
+        )
+        self.first_time_in_waiting_queue = False
+
+        if fairness_policy is not None:
+            rejection = fairness_policy.init_next_round_input_control(
+                tree_cache, self, fair=fair, extra_tokens=extra_tokens
+            )
+            if rejection == "rejected":
+                return "rejected"
 
     def adjust_max_prefix_ids(self):
         self.fill_ids = self.origin_input_ids + self.output_ids
@@ -333,6 +364,7 @@ class ScheduleBatch:
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool: BaseTokenToKVPool
     tree_cache: BasePrefixCache
+    fairness_policy: NoFairnessPolicy = field(default_factory=NoFairnessPolicy)
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
@@ -350,8 +382,16 @@ class ScheduleBatch:
     top_logprobs_nums: List[int] = None
 
     @classmethod
-    def init_new(cls, reqs, req_to_token_pool, token_to_kv_pool, tree_cache):
+    def init_new(
+        cls,
+        reqs,
+        req_to_token_pool,
+        token_to_kv_pool,
+        tree_cache,
+        fairness_policy: Optional[NoFairnessPolicy] = None,
+    ):
         return_logprob = any(req.return_logprob for req in reqs)
+        fairness_policy = fairness_policy or NoFairnessPolicy()
 
         return cls(
             reqs=reqs,
@@ -359,10 +399,14 @@ class ScheduleBatch:
             token_to_kv_pool=token_to_kv_pool,
             tree_cache=tree_cache,
             return_logprob=return_logprob,
+            fairness_policy=fairness_policy,
         )
 
     def batch_size(self):
         return len(self.reqs) if self.reqs is not None else 0
+
+    def total_size(self):
+        return sum(getattr(req, "extend_input_len", 0) for req in self.reqs or [])
 
     def is_empty(self):
         return len(self.reqs) == 0
@@ -380,23 +424,29 @@ class ScheduleBatch:
             )
         return req_pool_indices
 
-    def alloc_token_slots(self, num_tokens: int):
-        out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
+    def alloc_token_slots(
+        self,
+        num_tokens: int,
+        *,
+        user_id: Optional[str] = None,
+        evict_only_force: bool = False,
+        requesting_users: Optional[List[str]] = None,
+    ):
+        return self.fairness_policy.alloc_token_slots(
+            self.tree_cache,
+            self.token_to_kv_pool,
+            num_tokens,
+            user_id=user_id,
+            evict_only_force=evict_only_force,
+            requesting_users=requesting_users,
+        )
 
-        if out_cache_loc is None:
-            if self.tree_cache is not None:
-                self.tree_cache.evict(num_tokens, self.token_to_kv_pool.free)
-                out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
-
-            if out_cache_loc is None:
-                logger.error("Prefill out of memory. Try to lower your batch size.")
-                if self.tree_cache is not None:
-                    self.tree_cache.pretty_print()
-                exit(1)
-
-        return out_cache_loc
-
-    def prepare_for_extend(self, vocab_size: int):
+    def prepare_for_extend(
+        self,
+        vocab_size: int,
+        running_batch: Optional["ScheduleBatch"] = None,
+        requesting_users: Optional[List[str]] = None,
+    ):
         bs = self.batch_size()
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
@@ -405,7 +455,12 @@ class ScheduleBatch:
 
         # Allocate memory
         req_pool_indices_cpu = self.alloc_req_slots(bs)
-        out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+        out_cache_loc, removed_requests = self.fairness_policy.prepare_for_extend_allocation(
+            self,
+            extend_num_tokens,
+            running_batch=running_batch,
+            requesting_users=requesting_users,
+        )
 
         pt = 0
         for i, req in enumerate(reqs):
@@ -437,6 +492,7 @@ class ScheduleBatch:
         self.prefix_lens_cpu = [len(r.prefix_indices) for r in reqs]
 
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
+        return removed_requests
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
@@ -462,34 +518,21 @@ class ScheduleBatch:
         self.prefix_lens_cpu = prefix_lens_cpu
 
     def check_decode_mem(self):
-        bs = self.batch_size()
-        if self.token_to_kv_pool.available_size() >= bs:
-            return True
+        return self.fairness_policy.check_decode_memory(self)
 
-        self.tree_cache.evict(bs, self.token_to_kv_pool.free)
-
-        if self.token_to_kv_pool.available_size() >= bs:
-            return True
-
-        return False
-
-    def retract_decode(self):
-        sorted_indices = [i for i in range(len(self.reqs))]
-
-        # TODO(lsyin): improve retraction policy for radix cache
-        sorted_indices.sort(
-            key=lambda i: (
-                len(self.reqs[i].output_ids),
-                -len(self.reqs[i].origin_input_ids),
-            ),
-            reverse=True,
-        )
+    def retract_decode(self, extra: int = 0):
+        sorted_indices = self.fairness_policy.get_retract_order(self)
 
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
+        logger.info(
+            "In retract decode before loop, available size %s < %s",
+            self.token_to_kv_pool.available_size(),
+            len(sorted_indices) * global_config.retract_decode_steps + extra,
+        )
         while (
             self.token_to_kv_pool.available_size()
-            < len(sorted_indices) * global_config.retract_decode_steps
+            < len(sorted_indices) * global_config.retract_decode_steps + extra
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
@@ -525,6 +568,7 @@ class ScheduleBatch:
                 # NOTE(lsyin): we should use the newly evictable memory instantly.
                 residual_size = (
                     len(sorted_indices) * global_config.retract_decode_steps
+                    + extra
                     - self.token_to_kv_pool.available_size()
                 )
                 residual_size = max(0, residual_size)
@@ -638,8 +682,7 @@ class ScheduleBatch:
         self.seq_lens.add_(1)
 
         # Alloc mem
-        bs = self.batch_size()
-        self.out_cache_loc = self.alloc_token_slots(bs)
+        self.out_cache_loc = self.fairness_policy.alloc_decode_output_slots(self)
 
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1
