@@ -21,6 +21,15 @@ if False:  # pragma: no cover - imported only for type checkers
 class StaticFairnessPolicy(NoFairnessPolicy):
     """Implements the control flow introduced for static per-user allocations."""
 
+    def __init__(
+        self,
+        tree_cache: Optional["BasePrefixCache"] = None,
+        *,
+        static_reservation_n: Optional[int] = None,
+    ):
+        super().__init__(tree_cache=tree_cache)
+        self.static_reservation_n = static_reservation_n
+
     def _has_static_limit(self) -> bool:
         tree_cache = self.tree_cache
         return tree_cache is not None and getattr(tree_cache, "static_max_per_user", None) is not None
@@ -60,6 +69,45 @@ class StaticFairnessPolicy(NoFairnessPolicy):
     # ---- Allocation helpers -----------------------------------------------
     def requires_per_user_allocation(self) -> bool:
         return self._has_static_limit()
+
+    def ignore_global_prefill_token_budget(self) -> bool:
+        return self._has_static_limit()
+
+    def continue_scanning_waiting_queue_on_prefill_block(self) -> bool:
+        return self._has_static_limit()
+
+    def deny_prefill_if_decode_retraction_needed(self) -> bool:
+        return self._has_static_limit()
+
+    def running_request_partition_size(
+        self,
+        *,
+        max_running_requests: int,
+    ) -> Optional[int]:
+        if not self._has_static_limit() or not self.static_reservation_n:
+            return None
+        return max(1, max_running_requests // self.static_reservation_n)
+
+    def can_admit_running_request(
+        self,
+        req: "Req",
+        *,
+        running_batch: Optional["ScheduleBatch"],
+        token_counters_by_user: Dict[str, List[int]],
+        max_running_requests: int,
+    ) -> bool:
+        partition_size = self.running_request_partition_size(
+            max_running_requests=max_running_requests
+        )
+        if partition_size is None:
+            return True
+
+        running_for_user = 0
+        if running_batch is not None:
+            running_for_user = sum(1 for running_req in running_batch.reqs if running_req.uid == req.uid)
+
+        pending_for_user = len(token_counters_by_user.get(req.uid, []))
+        return running_for_user + pending_for_user < partition_size
 
     def alloc_token_slots(
         self,
@@ -136,6 +184,11 @@ class StaticFairnessPolicy(NoFairnessPolicy):
 
             out_cache_loc = batch.token_to_kv_pool.alloc(extend_num_tokens)
             if out_cache_loc is None and running_batch is not None:
+                if self.deny_prefill_if_decode_retraction_needed():
+                    logger.info(
+                        "StaticFairnessPolicy: denying prefill admission because it would require decode retraction."
+                    )
+                    break
                 removed, _ = running_batch.retract_decode(extend_num_tokens)
                 removed_requests += removed
             else:
@@ -143,7 +196,7 @@ class StaticFairnessPolicy(NoFairnessPolicy):
 
         if out_cache_loc is None:
             raise RuntimeError(
-                "Allocation failed after evicting for each user in static fairness policy."
+                "Static prefill admission denied: insufficient user-local capacity without decode retraction."
             )
 
         return out_cache_loc, removed_requests

@@ -207,8 +207,9 @@ class PrefillAdder:
         total_tokens = req.extend_input_len + clipped_max_new_tokens
         input_tokens = req.extend_input_len
         prefix_len = len(req.prefix_indices)
+        ignore_global_budget = self.fairness_policy.ignore_global_prefill_token_budget()
 
-        if total_tokens >= self.rem_total_tokens:
+        if not ignore_global_budget and total_tokens >= self.rem_total_tokens:
             logger.info(
                 "Prefill admission blocked(rem_total_tokens): uid=%s rid=%s "
                 "extend_input_len=%s max_new_tokens=%s clipped_max_new_tokens=%s "
@@ -245,7 +246,7 @@ class PrefillAdder:
             return False
 
         with self._lock_node(req.last_node):
-            if total_tokens > self.rem_total_tokens:
+            if not ignore_global_budget and total_tokens > self.rem_total_tokens:
                 logger.info(
                     "Prefill admission blocked(rem_total_tokens_after_lock): uid=%s rid=%s "
                     "extend_input_len=%s max_new_tokens=%s clipped_max_new_tokens=%s "

@@ -560,8 +560,10 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         adder: "PrefillAdder",
         token_counters_by_user: Dict[str, List[int]],
         prefix_computed: bool,
+        running_batch: Optional["ScheduleBatch"],
         running_batch_size: int,
         max_running_requests: int,
+        available_req_slots: int,
         max_input_size: Optional[int],
     ) -> None:
         """
@@ -580,10 +582,19 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
                 adder=adder,
                 token_counters_by_user=token_counters_by_user,
                 prefix_computed=prefix_computed,
+                running_batch=running_batch,
                 running_batch_size=running_batch_size,
                 max_running_requests=effective_max_running_requests,
+                available_req_slots=available_req_slots,
                 max_input_size=max_input_size,
             )
+
+        effective_running_limit = min(
+            effective_max_running_requests,
+            running_batch_size + max(0, available_req_slots),
+        )
+        if running_batch_size >= effective_running_limit:
+            return
 
         tree_cache = self.tree_cache
         target_tree_cache = None if prefix_computed else tree_cache
@@ -635,6 +646,6 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             if (
                 not add_res
                 or adder.no_remaining_tokens()
-                or running_batch_size + len(adder.can_run_list) >= effective_max_running_requests
+                or running_batch_size + len(adder.can_run_list) >= effective_running_limit
             ):
                 break

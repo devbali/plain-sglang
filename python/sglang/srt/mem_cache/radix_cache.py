@@ -361,7 +361,6 @@ class RadixCache(BasePrefixCache):
                 break
 
             if evict_condition is not None and not evict_condition(x):
-                logger.debug(f"[Fairinf KV Cache] Skipping eviction of node {x} belonging to {x.owner} due to condition.")
                 continue
 
             if x.lock_ref > 0:

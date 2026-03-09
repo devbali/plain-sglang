@@ -227,7 +227,9 @@ class ModelTpServer:
                     max_running_requests=self.max_running_requests,
                 )
         elif self.max_kv_cache_tokens_per_user:
-            self.fairness_policy = StaticFairnessPolicy()
+            self.fairness_policy = StaticFairnessPolicy(
+                static_reservation_n=server_args.static_reservation_n,
+            )
         else:
             self.fairness_policy = NoFairnessPolicy()
         self.fairness_policy.set_tree_cache(self.tree_cache)
@@ -538,7 +540,8 @@ class ModelTpServer:
         running_bs = (
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
-        if running_bs >= self.max_running_requests:
+        available_req_slots = len(self.req_to_token_pool.free_slots)
+        if running_bs >= self.max_running_requests or available_req_slots <= 0:
             return None
 
         # Get priority queue
@@ -603,8 +606,10 @@ class ModelTpServer:
             adder=adder,
             token_counters_by_user=token_counters_by_user,
             prefix_computed=prefix_computed,
+            running_batch=self.running_batch,
             running_batch_size=running_bs,
             max_running_requests=self.max_running_requests,
+            available_req_slots=available_req_slots,
             max_input_size=max_input_size,
         )
 
@@ -671,11 +676,19 @@ class ModelTpServer:
     def forward_prefill_batch(self, batch: ScheduleBatch):
         # Build batch tensors
         requesting_users = {req.uid for req in batch.reqs}
-        removed_requests = batch.prepare_for_extend(
-            self.model_config.vocab_size,
-            running_batch=self.running_batch,
-            requesting_users=list(requesting_users),
-        )
+        try:
+            removed_requests = batch.prepare_for_extend(
+                self.model_config.vocab_size,
+                running_batch=self.running_batch,
+                requesting_users=list(requesting_users),
+            )
+        except RuntimeError as exc:
+            if "Static prefill admission denied" not in str(exc):
+                raise
+            logger.info("Skipping prefill batch: %s", exc)
+            self.waiting_queue.extend(batch.reqs)
+            batch.reqs = []
+            return
 
         if removed_requests:
             logger.info(

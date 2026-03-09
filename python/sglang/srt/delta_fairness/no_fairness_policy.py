@@ -76,6 +76,32 @@ class NoFairnessPolicy:
     def requires_per_user_allocation(self) -> bool:
         return False
 
+    def ignore_global_prefill_token_budget(self) -> bool:
+        return False
+
+    def continue_scanning_waiting_queue_on_prefill_block(self) -> bool:
+        return False
+
+    def deny_prefill_if_decode_retraction_needed(self) -> bool:
+        return False
+
+    def running_request_partition_size(
+        self,
+        *,
+        max_running_requests: int,
+    ) -> Optional[int]:
+        return None
+
+    def can_admit_running_request(
+        self,
+        req: "Req",
+        *,
+        running_batch: Optional["ScheduleBatch"],
+        token_counters_by_user: Dict[str, List[int]],
+        max_running_requests: int,
+    ) -> bool:
+        return True
+
     def handle_prefill_eviction(
         self,
         batch: "ScheduleBatch",
@@ -234,11 +260,20 @@ class NoFairnessPolicy:
         adder: "PrefillAdder",
         token_counters_by_user: Dict[str, List[int]],
         prefix_computed: bool,
+        running_batch: Optional["ScheduleBatch"],
         running_batch_size: int,
         max_running_requests: int,
+        available_req_slots: int,
         max_input_size: Optional[int],
     ) -> None:
         target_tree_cache = None if prefix_computed else self.tree_cache
+        effective_running_limit = min(
+            max_running_requests,
+            running_batch_size + max(0, available_req_slots),
+        )
+
+        if running_batch_size >= effective_running_limit:
+            return
 
         for req in waiting_queue:
             if max_input_size is not None and adder.log_input_tokens > max_input_size:
@@ -247,6 +282,14 @@ class NoFairnessPolicy:
                 adder.rem_input_tokens = max_input_size - adder.log_input_tokens
 
             if req in adder.can_run_list:
+                continue
+
+            if not self.can_admit_running_request(
+                req,
+                running_batch=running_batch,
+                token_counters_by_user=token_counters_by_user,
+                max_running_requests=max_running_requests,
+            ):
                 continue
 
             extra_tokens = sum(token_counters_by_user.get(req.uid, []))
@@ -266,8 +309,11 @@ class NoFairnessPolicy:
             token_counters_by_user.setdefault(req.uid, []).append(req.extend_input_len)
 
             if (
-                not add_result
+                (
+                    not add_result
+                    and not self.continue_scanning_waiting_queue_on_prefill_block()
+                )
                 or adder.no_remaining_tokens()
-                or running_batch_size + len(adder.can_run_list) >= max_running_requests
+                or running_batch_size + len(adder.can_run_list) >= effective_running_limit
             ):
                 break
