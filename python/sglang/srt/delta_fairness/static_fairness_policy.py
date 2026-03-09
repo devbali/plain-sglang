@@ -21,46 +21,48 @@ if False:  # pragma: no cover - imported only for type checkers
 class StaticFairnessPolicy(NoFairnessPolicy):
     """Implements the control flow introduced for static per-user allocations."""
 
-    def _has_static_limit(self, tree_cache: Optional["BasePrefixCache"]) -> bool:
+    def _has_static_limit(self) -> bool:
+        tree_cache = self.tree_cache
         return tree_cache is not None and getattr(tree_cache, "static_max_per_user", None) is not None
 
     # ---- Request admission -------------------------------------------------
     def init_next_round_input_control(
         self,
-        tree_cache: Optional["BasePrefixCache"],
         req: "Req",
         *,
         fair: bool = False,
         extra_tokens: int = 0,
     ) -> Optional[str]:
-        if not self._has_static_limit(tree_cache):
+        if not self._has_static_limit():
             return None
 
+        tree_cache = self.tree_cache
+        assert tree_cache is not None
         if tree_cache.reject_based_on_static_limit(req.uid, req.extend_input_len + extra_tokens):
             return "rejected"
         return None
 
     def add_prefill_request_control(
         self,
-        tree_cache: Optional["BasePrefixCache"],
         req: "Req",
         *,
         extra_tokens: int = 0,
     ) -> Optional[str]:
-        if not self._has_static_limit(tree_cache):
+        if not self._has_static_limit():
             return None
 
+        tree_cache = self.tree_cache
+        assert tree_cache is not None
         if tree_cache.reject_based_on_static_limit(req.uid, req.extend_input_len + extra_tokens):
             return "rejected"
         return None
 
     # ---- Allocation helpers -----------------------------------------------
-    def requires_per_user_allocation(self, tree_cache: Optional["BasePrefixCache"]) -> bool:
-        return self._has_static_limit(tree_cache)
+    def requires_per_user_allocation(self) -> bool:
+        return self._has_static_limit()
 
     def alloc_token_slots(
         self,
-        tree_cache: Optional["BasePrefixCache"],
         token_to_kv_pool: "BaseTokenToKVPool",
         num_tokens: int,
         *,
@@ -68,9 +70,8 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         evict_only_force: bool = False,
         requesting_users: Optional[Sequence[str]] = None,
     ) -> Optional[int]:
-        if not self._has_static_limit(tree_cache):
+        if not self._has_static_limit():
             return super().alloc_token_slots(
-                tree_cache,
                 token_to_kv_pool,
                 num_tokens,
                 user_id=user_id,
@@ -78,6 +79,8 @@ class StaticFairnessPolicy(NoFairnessPolicy):
                 requesting_users=requesting_users,
             )
 
+        tree_cache = self.tree_cache
+        assert tree_cache is not None
         out_cache_loc = None if evict_only_force else token_to_kv_pool.alloc(num_tokens)
         logger.debug(
             "StaticFairnessPolicy: alloc %s tokens for %s (force=%s, initial_loc=%s)",
@@ -108,7 +111,7 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         running_batch: Optional["ScheduleBatch"] = None,
         requesting_users: Optional[Sequence[str]] = None,
     ) -> Tuple[Optional[int], List["Req"]]:
-        if not self.requires_per_user_allocation(batch.tree_cache):
+        if not self.requires_per_user_allocation():
             return super().prepare_for_extend_allocation(
                 batch,
                 extend_num_tokens,
@@ -125,7 +128,6 @@ class StaticFairnessPolicy(NoFairnessPolicy):
                 for req in batch.reqs:
                     num_tokens = len(req.fill_ids[len(req.prefix_indices) :])
                     self.alloc_token_slots(
-                        batch.tree_cache,
                         batch.token_to_kv_pool,
                         num_tokens,
                         user_id=req.uid,
@@ -148,11 +150,11 @@ class StaticFairnessPolicy(NoFairnessPolicy):
 
     # ---- Decode helpers ----------------------------------------------------
     def check_decode_memory(self, batch: "ScheduleBatch") -> bool:
-        if not self.requires_per_user_allocation(batch.tree_cache):
+        if not self.requires_per_user_allocation():
             return super().check_decode_memory(batch)
 
         bs = batch.batch_size()
-        tree_cache = batch.tree_cache
+        tree_cache = self.tree_cache
         assert tree_cache is not None
 
         eviction_necessary = any(
@@ -180,10 +182,10 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         return False
 
     def get_retract_order(self, batch: "ScheduleBatch") -> List[int]:
-        if not self.requires_per_user_allocation(batch.tree_cache):
+        if not self.requires_per_user_allocation():
             return super().get_retract_order(batch)
 
-        tree_cache = batch.tree_cache
+        tree_cache = self.tree_cache
         assert tree_cache is not None
         prioritized: List[int] = []
         for i, req in enumerate(batch.reqs):
@@ -195,7 +197,7 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         return prioritized
 
     def alloc_decode_output_slots(self, batch: "ScheduleBatch"):
-        if not self.requires_per_user_allocation(batch.tree_cache):
+        if not self.requires_per_user_allocation():
             return super().alloc_decode_output_slots(batch)
 
         bs = batch.batch_size()
@@ -203,7 +205,6 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         if eviction_necessary:
             for req in batch.reqs:
                 self.alloc_token_slots(
-                    batch.tree_cache,
                     batch.token_to_kv_pool,
                     1,
                     user_id=req.uid,

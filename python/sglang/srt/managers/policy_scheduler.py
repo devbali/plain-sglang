@@ -15,6 +15,7 @@ limitations under the License.
 
 """Request policy scheduler"""
 
+import logging
 import os
 import random
 from collections import defaultdict
@@ -32,6 +33,7 @@ from sglang.srt.mem_cache.radix_cache import TreeNode
 # Note that this only clips the estimation in the scheduler but does not change the stop
 # condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
 CLIP_MAX_NEW_TOKENS = int(os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS", "4096"))
+logger = logging.getLogger(__name__)
 
 
 class PolicyScheduler:
@@ -201,23 +203,65 @@ class PrefillAdder:
             self.rem_total_tokens += delta
 
     def add_one_req(self, req: Req, extra_tokens: int = 0):
-        total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
-        )
+        clipped_max_new_tokens = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+        total_tokens = req.extend_input_len + clipped_max_new_tokens
         input_tokens = req.extend_input_len
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
+            logger.info(
+                "Prefill admission blocked(rem_total_tokens): uid=%s rid=%s "
+                "extend_input_len=%s max_new_tokens=%s clipped_max_new_tokens=%s "
+                "total_tokens=%s rem_total_tokens=%s rem_input_tokens=%s extra_tokens=%s",
+                req.uid,
+                req.rid,
+                req.extend_input_len,
+                req.sampling_params.max_new_tokens,
+                clipped_max_new_tokens,
+                total_tokens,
+                self.rem_total_tokens,
+                self.rem_input_tokens,
+                extra_tokens,
+            )
             return False
 
         if input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
+            logger.info(
+                "Prefill admission blocked(rem_input_tokens): uid=%s rid=%s "
+                "extend_input_len=%s max_new_tokens=%s clipped_max_new_tokens=%s "
+                "total_tokens=%s rem_total_tokens=%s rem_input_tokens=%s "
+                "can_run_list=%s extra_tokens=%s",
+                req.uid,
+                req.rid,
+                req.extend_input_len,
+                req.sampling_params.max_new_tokens,
+                clipped_max_new_tokens,
+                total_tokens,
+                self.rem_total_tokens,
+                self.rem_input_tokens,
+                len(self.can_run_list),
+                extra_tokens,
+            )
             return False
 
         with self._lock_node(req.last_node):
             if total_tokens > self.rem_total_tokens:
+                logger.info(
+                    "Prefill admission blocked(rem_total_tokens_after_lock): uid=%s rid=%s "
+                    "extend_input_len=%s max_new_tokens=%s clipped_max_new_tokens=%s "
+                    "total_tokens=%s rem_total_tokens=%s rem_input_tokens=%s extra_tokens=%s",
+                    req.uid,
+                    req.rid,
+                    req.extend_input_len,
+                    req.sampling_params.max_new_tokens,
+                    clipped_max_new_tokens,
+                    total_tokens,
+                    self.rem_total_tokens,
+                    self.rem_input_tokens,
+                    extra_tokens,
+                )
                 return False
             rejection = self.fairness_policy.add_prefill_request_control(
-                self.tree_cache,
                 req,
                 extra_tokens=extra_tokens,
             )

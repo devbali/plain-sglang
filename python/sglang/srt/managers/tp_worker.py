@@ -59,6 +59,8 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.delta_fairness.no_fairness_policy import NoFairnessPolicy
 from sglang.srt.delta_fairness.static_fairness_policy import StaticFairnessPolicy
 from sglang.srt.delta_fairness.delta_fairness_policy import DeltaFairnessPolicy
+from sglang.srt.delta_fairness.earliest_deadline_first import EarliestDeltaFirst
+
 from sglang.srt.utils import (
     configure_logger,
     is_multimodal_model,
@@ -214,11 +216,21 @@ class ModelTpServer:
             )
 
         if self.delta_fairness_n:
-            self.fairness_policy = DeltaFairnessPolicy()
+            if server_args.delta_fairness_policy == "earliest_deadline_first":
+                self.fairness_policy = EarliestDeltaFirst(
+                    delta_fairness_n=self.delta_fairness_n,
+                    max_running_requests=self.max_running_requests,
+                )
+            else:
+                self.fairness_policy = DeltaFairnessPolicy(
+                    delta_fairness_n=self.delta_fairness_n,
+                    max_running_requests=self.max_running_requests,
+                )
         elif self.max_kv_cache_tokens_per_user:
             self.fairness_policy = StaticFairnessPolicy()
         else:
             self.fairness_policy = NoFairnessPolicy()
+        self.fairness_policy.set_tree_cache(self.tree_cache)
         self.tree_cache_metrics = {"total": 0, "hit": 0}
         self.scheduler = PolicyScheduler(self.schedule_policy, self.tree_cache)
         self.req_to_token_pool = self.model_runner.req_to_token_pool
@@ -307,27 +319,36 @@ class ModelTpServer:
     def forward_step(self):
         force_decode = False
         max_prefill_size = None
+        new_batch = None
 
-        force_prefill = self.fairness_policy.fairinf_force_prefill_any_waiting(
-            self.waiting_queue,
-            tree_cache=self.tree_cache,
-            delta_fairness_deltas_microseconds=self.delta_fairness_deltas_microseconds,
-            delta_fairness_n=self.delta_fairness_n,
-            running_batch=self.running_batch,
-            max_running_requests=self.max_running_requests,
-        )
-
-        if not force_prefill:
-            force_decode, max_prefill_size = self.fairness_policy.fairinf_force_decode(
-                self.running_batch,
+        force_prefill_func = lambda: self.fairness_policy.fairinf_force_prefill_any_waiting(
+                self.waiting_queue,
                 delta_fairness_deltas_microseconds=self.delta_fairness_deltas_microseconds,
-                tree_cache=self.tree_cache,
-                delta_fairness_n=self.delta_fairness_n,
-                max_running_requests=self.max_running_requests,
+                running_batch=self.running_batch,
             )
-
-        new_batch = None if force_decode else self.get_new_prefill_batch(max_prefill_size)
         
+        force_decode_func = lambda: self.fairness_policy.fairinf_force_decode(
+                    self.running_batch,
+                    delta_fairness_deltas_microseconds=self.delta_fairness_deltas_microseconds,
+                )
+        
+        if self.fairness_policy.fairinf_prioritize_force_prefill():
+            # Force prefill is checked first
+            force_prefill = force_prefill_func()
+
+            if not force_prefill:
+                force_decode, max_prefill_size = force_decode_func()
+
+            new_batch = None if force_decode else self.get_new_prefill_batch(max_prefill_size)
+        
+        else:
+            # Force decode is checked first
+            force_decode, max_prefill_size = force_decode_func()
+            
+            if not force_decode:
+                force_prefill = force_prefill_func()
+                new_batch = None if force_prefill else self.get_new_prefill_batch(max_prefill_size)
+
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
@@ -342,6 +363,7 @@ class ModelTpServer:
             end.record()
             torch.cuda.synchronize()
             elapsed_time_ms = start.elapsed_time(end)
+            self.fairness_policy.finished_prefill(new_batch)
 
             if not new_batch.is_empty():
                 if self.running_batch is None:
@@ -353,6 +375,8 @@ class ModelTpServer:
         else:
             # Run a decode batch
             if self.running_batch is not None:
+                self.running_batch.max_running_requests = self.max_running_requests
+                self.running_batch.delta_fairness_n = self.delta_fairness_n
                 for req in self.running_batch.reqs:
                     req.waiting_time_in_decodes = 0
                 for req in self.waiting_queue:
@@ -365,6 +389,7 @@ class ModelTpServer:
                     end.record()
                     torch.cuda.synchronize()
                     elapsed_time_ms = start.elapsed_time(end)
+                    self.fairness_policy.finished_decode(self.running_batch)
 
                     # Print stats
                     self.print_stats(decode=True, elapsed_time_ms=elapsed_time_ms)
@@ -389,7 +414,7 @@ class ModelTpServer:
 
         current_time = time.time()
         token_usage = num_used / self.max_total_num_tokens
-        running_reqs = len(self.running_batch.reqs)
+        running_reqs = len(self.running_batch.reqs) if hasattr(self.running_batch, "reqs") else 0
         queue_reqs = len(self.waiting_queue)
         
         # Log to console
@@ -504,6 +529,7 @@ class ModelTpServer:
                 self.max_req_input_len - 1 - len(req.origin_input_ids),
             )
 
+        self.fairness_policy.process_new_request(req)
         self.waiting_queue.append(req)
 
     def get_new_prefill_batch(
@@ -559,12 +585,9 @@ class ModelTpServer:
             self.waiting_queue,
             token_counters_by_user=token_counters_by_user,
             adder=adder,
-            tree_cache=self.tree_cache,
             token_to_kv_pool=self.token_to_kv_pool,
             running_batch=self.running_batch,
             delta_fairness_deltas_microseconds=self.delta_fairness_deltas_microseconds,
-            delta_fairness_n=self.delta_fairness_n,
-            max_running_requests=self.max_running_requests,
             prefix_computed=prefix_computed,
         )
         if extra_space > 0 and evicted_reqs:
@@ -580,7 +603,6 @@ class ModelTpServer:
             adder=adder,
             token_counters_by_user=token_counters_by_user,
             prefix_computed=prefix_computed,
-            tree_cache=self.tree_cache,
             running_batch_size=running_bs,
             max_running_requests=self.max_running_requests,
             max_input_size=max_input_size,
@@ -641,6 +663,8 @@ class ModelTpServer:
             self.tree_cache,
             fairness_policy=self.fairness_policy,
         )
+        new_batch.max_running_requests = self.max_running_requests
+        new_batch.delta_fairness_n = self.delta_fairness_n
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
         return new_batch
 
@@ -919,6 +943,8 @@ class ModelTpServer:
             ):
                 output_rids.append(req.rid)
                 output_finished_reason.append(req.finished_reason)
+                if req.finished():
+                    self.fairness_policy.mark_request_finished(req)
                 if self.model_runner.is_generation:
                     output_vids.append(req.vid)
                     out_uids.append(req.uid)

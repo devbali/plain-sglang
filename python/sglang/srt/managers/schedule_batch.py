@@ -176,7 +176,7 @@ class Req:
         return self.finished_reason is not None
 
     def get_estimated_prefill_impact(self) -> int:
-        return len(self.origin_input_ids) + self.extend_input_len + 2
+        return len(self.origin_input_ids) + 2
 
     def init_next_round_input(
         self,
@@ -202,7 +202,7 @@ class Req:
 
         if fairness_policy is not None:
             rejection = fairness_policy.init_next_round_input_control(
-                tree_cache, self, fair=fair, extra_tokens=extra_tokens
+                self, fair=fair, extra_tokens=extra_tokens
             )
             if rejection == "rejected":
                 return "rejected"
@@ -392,6 +392,7 @@ class ScheduleBatch:
     ):
         return_logprob = any(req.return_logprob for req in reqs)
         fairness_policy = fairness_policy or NoFairnessPolicy()
+        fairness_policy.set_tree_cache(tree_cache)
 
         return cls(
             reqs=reqs,
@@ -433,7 +434,6 @@ class ScheduleBatch:
         requesting_users: Optional[List[str]] = None,
     ):
         return self.fairness_policy.alloc_token_slots(
-            self.tree_cache,
             self.token_to_kv_pool,
             num_tokens,
             user_id=user_id,
@@ -530,6 +530,14 @@ class ScheduleBatch:
             self.token_to_kv_pool.available_size(),
             len(sorted_indices) * global_config.retract_decode_steps + extra,
         )
+        if (
+            len(sorted_indices) == 0
+            and self.token_to_kv_pool.available_size() < max(0, extra)
+        ):
+            raise RuntimeError(
+                "Delta fairness retraction blocked: no retractable decode requests "
+                "without evicting fair clients."
+            )
         while (
             self.token_to_kv_pool.available_size()
             < len(sorted_indices) * global_config.retract_decode_steps + extra
@@ -587,6 +595,10 @@ class ScheduleBatch:
         # Reqs in batch are filtered
         total_decoded_tokens = sum(len(r.output_ids) for r in self.reqs)
         total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in self.reqs)
+
+        if total_max_new_tokens <= 0:
+            # Nothing left to decode after retraction.
+            return retracted_reqs, 1.0
 
         new_estimate_ratio = (
             total_decoded_tokens + global_config.retract_decode_steps * len(self.reqs)

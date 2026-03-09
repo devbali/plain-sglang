@@ -62,6 +62,7 @@ class ServerArgs:
     static_reservation_n : int = 0
     delta_fairness_n : int = 0
     delta_fairness_config_file : str = "delta_fairness_config.json"
+    delta_fairness_policy: str = "delta"
 
     # Other runtime options
     tp_size: int = 1
@@ -482,6 +483,13 @@ class ServerArgs:
             type=str,
             default=ServerArgs.delta_fairness_config_file,
             help="Path to the delta fairness config file",
+        )
+        parser.add_argument(
+            "--delta-fairness-policy",
+            type=str,
+            default=ServerArgs.delta_fairness_policy,
+            choices=["delta", "earliest_deadline_first"],
+            help="Policy to use when --delta-fairness-n is enabled.",
         )
 
     @classmethod

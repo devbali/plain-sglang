@@ -20,9 +20,14 @@ if False:  # pragma: no cover - imported only for type checkers
 class NoFairnessPolicy:
     """Encapsulates the original scheduling behaviour without fairness checks."""
 
+    def __init__(self, tree_cache: Optional["BasePrefixCache"] = None):
+        self.tree_cache = tree_cache
+
+    def set_tree_cache(self, tree_cache: Optional["BasePrefixCache"]) -> None:
+        self.tree_cache = tree_cache
+
     def init_next_round_input_control(
         self,
-        tree_cache: Optional["BasePrefixCache"],
         req: "Req",
         *,
         fair: bool = False,
@@ -34,7 +39,6 @@ class NoFairnessPolicy:
 
     def add_prefill_request_control(
         self,
-        tree_cache: Optional["BasePrefixCache"],
         req: "Req",
         *,
         extra_tokens: int = 0,
@@ -45,7 +49,6 @@ class NoFairnessPolicy:
 
     def alloc_token_slots(
         self,
-        tree_cache: Optional["BasePrefixCache"],
         token_to_kv_pool: "BaseTokenToKVPool",
         num_tokens: int,
         *,
@@ -58,8 +61,8 @@ class NoFairnessPolicy:
         out_cache_loc = None if evict_only_force else token_to_kv_pool.alloc(num_tokens)
 
         if evict_only_force or (out_cache_loc is None and not evict_only_force):
-            if tree_cache is not None:
-                tree_cache.evict(num_tokens, token_to_kv_pool.free)
+            if self.tree_cache is not None:
+                self.tree_cache.evict(num_tokens, token_to_kv_pool.free)
                 if not evict_only_force:
                     out_cache_loc = token_to_kv_pool.alloc(num_tokens)
 
@@ -70,7 +73,7 @@ class NoFairnessPolicy:
 
         return None if evict_only_force else out_cache_loc
 
-    def requires_per_user_allocation(self, tree_cache: Optional["BasePrefixCache"]) -> bool:
+    def requires_per_user_allocation(self) -> bool:
         return False
 
     def handle_prefill_eviction(
@@ -92,7 +95,7 @@ class NoFairnessPolicy:
         requesting_users: Optional[Sequence[str]] = None,
     ) -> tuple[int, List["Req"]]:
         out_cache_loc = self.alloc_token_slots(
-            batch.tree_cache, batch.token_to_kv_pool, extend_num_tokens
+            batch.token_to_kv_pool, extend_num_tokens
         )
         return out_cache_loc, []
 
@@ -118,15 +121,33 @@ class NoFairnessPolicy:
         return sorted_indices
 
     def alloc_decode_output_slots(self, batch: "ScheduleBatch"):
-        return self.alloc_token_slots(batch.tree_cache, batch.token_to_kv_pool, batch.batch_size())
+        return self.alloc_token_slots(batch.token_to_kv_pool, batch.batch_size())
+
+    def finished_decode (self, batch: "ScheduleBatch"):
+        pass
+
+    def finished_prefill (self, batch: "ScheduleBatch"):
+        pass
+    
+    def process_new_request (self, req: "Req"):
+        pass # to implement
+    
+    def start_of_pass (self, running_batch: Optional["ScheduleBatch"], waiting_queue: List["Req"]):
+        pass
+    
+    def mark_request_finished (self, req: "Req"):
+        pass
 
     # ---- Delta fairness hooks (no-op defaults) ----
+    
+    def fairinf_prioritize_force_prefill(self):
+        return True
+
     def fairinf_force_decode(
         self,
         running_batch: Optional["ScheduleBatch"],
         *,
         delta_fairness_deltas_microseconds: Optional[Dict[str, int]] = None,
-        tree_cache: Optional["BasePrefixCache"] = None,
         delta_fairness_n: Optional[int] = None,
         max_running_requests: Optional[int] = None,
         decode_time_us: int = 20000,
@@ -138,7 +159,6 @@ class NoFairnessPolicy:
         req: "Req",
         token_counters_by_user: Dict[str, List[int]],
         *,
-        tree_cache: Optional["BasePrefixCache"],
         delta_fairness_deltas_microseconds: Optional[Dict[str, int]] = None,
         delta_fairness_n: Optional[int] = None,
         running_batch: Optional["ScheduleBatch"] = None,
@@ -151,7 +171,6 @@ class NoFairnessPolicy:
         self,
         waiting_queue: List["Req"],
         *,
-        tree_cache: Optional["BasePrefixCache"],
         delta_fairness_deltas_microseconds: Optional[Dict[str, int]] = None,
         delta_fairness_n: Optional[int] = None,
         running_batch: Optional["ScheduleBatch"] = None,
@@ -163,7 +182,6 @@ class NoFairnessPolicy:
         self,
         user_id: str,
         *,
-        tree_cache: Optional["BasePrefixCache"],
         running_batch: Optional["ScheduleBatch"],
         delta_fairness_n: Optional[int],
         max_running_requests: Optional[int],
@@ -176,7 +194,6 @@ class NoFairnessPolicy:
         self,
         req: "Req",
         *,
-        tree_cache: Optional["BasePrefixCache"],
         running_batch: Optional["ScheduleBatch"],
         delta_fairness_n: Optional[int],
         max_running_requests: Optional[int],
@@ -189,7 +206,6 @@ class NoFairnessPolicy:
         self,
         req: "Req",
         *,
-        tree_cache: Optional["BasePrefixCache"],
         running_batch: Optional["ScheduleBatch"],
         delta_fairness_n: Optional[int],
         max_running_requests: Optional[int],
@@ -202,7 +218,6 @@ class NoFairnessPolicy:
         *,
         token_counters_by_user: Dict[str, List[int]],
         adder: "PrefillAdder",
-        tree_cache: Optional["BasePrefixCache"],
         token_to_kv_pool: Optional["BaseTokenToKVPool"],
         running_batch: Optional["ScheduleBatch"],
         delta_fairness_deltas_microseconds: Optional[Dict[str, int]] = None,
@@ -219,12 +234,11 @@ class NoFairnessPolicy:
         adder: "PrefillAdder",
         token_counters_by_user: Dict[str, List[int]],
         prefix_computed: bool,
-        tree_cache: Optional["BasePrefixCache"],
         running_batch_size: int,
         max_running_requests: int,
         max_input_size: Optional[int],
     ) -> None:
-        target_tree_cache = None if prefix_computed else tree_cache
+        target_tree_cache = None if prefix_computed else self.tree_cache
 
         for req in waiting_queue:
             if max_input_size is not None and adder.log_input_tokens > max_input_size:
