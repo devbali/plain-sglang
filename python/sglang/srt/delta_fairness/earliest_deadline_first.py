@@ -379,6 +379,7 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
     
     # todo implement more
     def __init__(self, *args, **kwargs):
+        self._edf_quanta_us = int(kwargs.pop("delta_fairness_quanta_us", 0) or 0)
         super().__init__(*args, **kwargs)
         self.event_queue = EventQueue()
         self._edf_deadline_queue = []
@@ -405,6 +406,14 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
         if not self._edf_deadline_queue:
             return ""
         return "|".join(self._format_deadline_event(row) for row in self._edf_deadline_queue)
+
+    def _earliest_within_quanta(self) -> bool:
+        if self._edf_earliest is None:
+            return False
+        if self._edf_quanta_us <= 0:
+            return True
+        deadline, _, _ = self._edf_earliest
+        return (deadline - time.time()) <= (self._edf_quanta_us / 1_000_000.0)
 
     def _write_fairinf_log(self, phase: str, action: str, note: str):
         if not self._fairinf_log_this_pass:
@@ -617,6 +626,14 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             "built_deadlines",
             f"waiting={len(waiting_queue)},running={len(running_batch.reqs) if running_batch else 0},candidates={len(self._edf_deadline_queue)}",
         )
+        if not self._earliest_within_quanta():
+            self._write_fairinf_log(
+                "force_decision",
+                "no_force_prefill",
+                f"nearest deadline not within quanta_us={self._edf_quanta_us}",
+            )
+            return False
+
         force_prefill = self._edf_earliest is not None and self._edf_earliest[1] == "prefill"
         self._write_fairinf_log(
             "force_decision",
@@ -637,6 +654,13 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
                 "force_decision",
                 "no_force_decode",
                 "fairness disabled or no running batch",
+            )
+            return False, None
+        if not self._earliest_within_quanta():
+            self._write_fairinf_log(
+                "force_decision",
+                "no_force_decode",
+                f"nearest deadline not within quanta_us={self._edf_quanta_us}",
             )
             return False, None
         if self._edf_earliest is not None and self._edf_earliest[1] == "decode":

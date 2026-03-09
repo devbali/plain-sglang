@@ -451,6 +451,7 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         token_to_kv_pool: Optional["BaseTokenToKVPool"],
         running_batch: Optional["ScheduleBatch"],
         delta_fairness_deltas_microseconds: Optional[Dict[str, int]] = None,
+        max_input_size: Optional[int] = None,
         prefix_computed: bool = False,
     ) -> Tuple[int, Optional[List["Req"]]]:
         """ 
@@ -515,6 +516,11 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
                 waiting_queue.extend(last_evicted)
                 new_sz = token_to_kv_pool.available_size() + tree_cache.evictable_size()
                 adder.expand_capacity(new_sz - sz)
+                if max_input_size is not None:
+                    adder.rem_input_tokens = min(
+                        adder.rem_input_tokens,
+                        max(0, max_input_size - adder.log_input_tokens),
+                    )
                 sz = new_sz
                 logger.info(
                     "Evicting tokens for fair reservation. Available=%s Needed=%s",
@@ -535,6 +541,20 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             )
             if res == "rejected":
                 raise RuntimeError("Fair reservation request rejected unexpectedly.")
+
+            if max_input_size is not None:
+                remaining_input_budget = max(0, max_input_size - adder.log_input_tokens)
+                if req.extend_input_len > remaining_input_budget:
+                    logger.info(
+                        "Forced prefill skipped for uid=%s rid=%s: "
+                        "extend_input_len=%s exceeds remaining input budget=%s",
+                        req.uid,
+                        req.rid,
+                        req.extend_input_len,
+                        remaining_input_budget,
+                    )
+                    continue
+
             user_tokens.append(req.extend_input_len)
             add_res = adder.add_one_req(req, sum(user_tokens))
             if add_res == "rejected":

@@ -169,6 +169,7 @@ class ModelTpServer:
         self.fair_share_tokens_per_user = None
         self.delta_fairness_n = None
         self.delta_fairness_deltas_microseconds = None
+        self.delta_fairness_quanta_us = 0
 
         if server_args.delta_fairness_n > 0:
             self.delta_fairness_n = server_args.delta_fairness_n
@@ -193,6 +194,9 @@ class ModelTpServer:
                     "prefill_running_batch": 0,
                     "decode_running_batch": 150000,
                 },
+            )
+            self.delta_fairness_quanta_us = int(
+                config.get("delta_fairness_quanta_us", 0) or 0
             )
 
         # Init cache
@@ -220,6 +224,7 @@ class ModelTpServer:
                 self.fairness_policy = EarliestDeltaFirst(
                     delta_fairness_n=self.delta_fairness_n,
                     max_running_requests=self.max_running_requests,
+                    delta_fairness_quanta_us=self.delta_fairness_quanta_us,
                 )
             else:
                 self.fairness_policy = DeltaFairnessPolicy(
@@ -591,6 +596,7 @@ class ModelTpServer:
             token_to_kv_pool=self.token_to_kv_pool,
             running_batch=self.running_batch,
             delta_fairness_deltas_microseconds=self.delta_fairness_deltas_microseconds,
+            max_input_size=max_input_size,
             prefix_computed=prefix_computed,
         )
         if extra_space > 0 and evicted_reqs:

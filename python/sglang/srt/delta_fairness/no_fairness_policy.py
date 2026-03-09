@@ -249,6 +249,7 @@ class NoFairnessPolicy:
         delta_fairness_deltas_microseconds: Optional[Dict[str, int]] = None,
         delta_fairness_n: Optional[int] = None,
         max_running_requests: Optional[int] = None,
+        max_input_size: Optional[int] = None,
         prefix_computed: bool = False,
     ) -> Tuple[int, Optional[List["Req"]]]:
         return 0, None
