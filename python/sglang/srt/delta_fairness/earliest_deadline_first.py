@@ -5,6 +5,12 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .delta_fairness_policy import DeltaFairnessPolicy
+from .time_estimation import (
+    isolated_decode_time_estimation,
+    isolated_prefill_time_estimation,
+    pooled_decode_time_estimation,
+    pooled_prefill_time_estimation,
+)
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
@@ -64,22 +70,10 @@ class RequestStartEvent (RequestEvent):
     def is_logically_after (self, e: RequestEvent):
         return False
 
-# for isolated decode time estimation, use the underestimate for latency
-ISOLATED_DECODE_TIME_ESTIMATION = lambda total_batch_sum, max_token_size, batch_length: min(5e-3,
-    1.03882419e-02 + 6.81862494e-08*total_batch_sum + 2.62872519e-07*max_token_size + 5.65921863e-05*batch_length
-)
-
-ISOLATED_PREFILL_TIME_ESTIMATION = lambda total_batch_sum, max_token_size, batch_length: min(5e-3,
-    -9.50861833e-02 + 6.60140608e-05*total_batch_sum + 8.86754786e-06*max_token_size + -1.97662090e-04*batch_length
-)
-
-POOLED_DECODE_TIME_ESTIMATION = lambda total_batch_sum, max_token_size, batch_length: min(5e-3,
-    8.20769189e-03 + 3.68620965e-08*total_batch_sum + 2.47297800e-07*max_token_size + 2.39200099e-05*batch_length
-)
-
-POOLED_PREFILL_TIME_ESTIMATION = lambda total_batch_sum, max_token_size, batch_length: min(5e-3,
-    2.26878890e-02 + 2.58293523e-05*total_batch_sum + 5.72380928e-06*max_token_size + -6.10541804e-05*batch_length
-)
+ISOLATED_DECODE_TIME_ESTIMATION = isolated_decode_time_estimation
+ISOLATED_PREFILL_TIME_ESTIMATION = isolated_prefill_time_estimation
+POOLED_DECODE_TIME_ESTIMATION = pooled_decode_time_estimation
+POOLED_PREFILL_TIME_ESTIMATION = pooled_prefill_time_estimation
 
 class RequestTimeline ():
     def __init__ (self):
@@ -380,6 +374,8 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
     # todo implement more
     def __init__(self, *args, **kwargs):
         self._edf_quanta_us = int(kwargs.pop("delta_fairness_quanta_us", 0) or 0)
+        runtime_max_prefill_tokens = kwargs.pop("max_prefill_tokens", None)
+        runtime_max_running_batch = kwargs.get("max_running_requests", None)
         super().__init__(*args, **kwargs)
         self.event_queue = EventQueue()
         self._edf_deadline_queue = []
@@ -390,6 +386,10 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
         self._fairinf_pass_id = 0
         self._fairinf_log_sample_rate = 0.01
         self._fairinf_log_this_pass = False
+        if runtime_max_prefill_tokens is not None:
+            USER_CONFIG["max_prefill_tokens"] = int(runtime_max_prefill_tokens)
+        if runtime_max_running_batch is not None:
+            USER_CONFIG["max_running_batch"] = int(runtime_max_running_batch)
         self._patch_timeline_helpers()
 
     def fairinf_prioritize_force_prefill(self):
@@ -490,9 +490,111 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             self_tl.history = history[target_i:]
             return self_tl.history
 
+        def _schedule_prefill(self_ut: "UserTimeline", start_time=None):
+            reqs = sorted(
+                self_ut.waiting_request_timelines.values(),
+                key=lambda tracked_req: tracked_req.most_recent_event().end_timestamp,
+            )
+            if start_time is None and reqs:
+                start_time = reqs[0].most_recent_event().end_timestamp
+            if start_time is None:
+                return None
+
+            batch, batch_size, next_start_time = [], 0, None
+            for tracked_req in reqs:
+                tracked_start_time = tracked_req.most_recent_event().end_timestamp
+                if tracked_start_time > start_time:
+                    next_start_time = tracked_start_time
+                    break
+                prompt_tokens = len(tracked_req.req.origin_input_ids)
+                assert (
+                    prompt_tokens <= USER_CONFIG["max_prefill_tokens"]
+                ), "Request has more prompt tokens than the user max prefill tokens, cannot schedule"
+                if batch_size + prompt_tokens > USER_CONFIG["max_prefill_tokens"]:
+                    continue
+                batch.append(tracked_req)
+                batch_size += prompt_tokens
+
+            if not batch:
+                return next_start_time
+
+            batch_duration = ISOLATED_PREFILL_TIME_ESTIMATION(
+                batch_size,
+                max(len(tracked_req.req.origin_input_ids) for tracked_req in batch),
+                len(batch),
+            )
+            batch_end_time = start_time + batch_duration
+            for tracked_req in batch:
+                tracked_req.alternate_history_timeline.history.append(
+                    RequestPrefillEvent(tracked_req.req.rid, batch_duration, batch_end_time)
+                )
+                self_ut.active_request_timelines[tracked_req.req.rid] = tracked_req
+                del self_ut.waiting_request_timelines[tracked_req.req.rid]
+            self_ut.history.append(UserPrefillEvent(batch_duration, batch_end_time))
+            return batch_end_time
+
+        def _schedule_decode(
+            self_ut: "UserTimeline", start_time, req_id_real_statuses, anticipated=False
+        ):
+            req_id_decodes = {
+                rid: (event.completion_number if isinstance(event, RequestDecodeEvent) else 0)
+                for rid, event in req_id_real_statuses.items()
+            }
+            assert (
+                len(self_ut.active_request_timelines) <= USER_CONFIG["max_running_batch"]
+            ), "Active running request more than max running batch for isolated setting, unfair user but still doing alternate history"
+
+            batch = []
+            for rid, tracked_req in self_ut.active_request_timelines.items():
+                most_recent = tracked_req.most_recent_event()
+                real_decode = req_id_decodes.get(rid, 0)
+                if real_decode == 0:
+                    batch.append((rid, 1, len(tracked_req.req.fill_ids)))
+                    continue
+                assert isinstance(most_recent, RequestDecodeEvent)
+                anticipated = anticipated or most_recent.completion_number > real_decode
+                batch.append((rid, most_recent.completion_number + 1, len(tracked_req.req.fill_ids)))
+
+            if not batch:
+                return None
+
+            batch_duration = ISOLATED_DECODE_TIME_ESTIMATION(
+                sum(num_tokens for _, _, num_tokens in batch),
+                max(num_tokens for _, _, num_tokens in batch),
+                len(batch),
+            )
+            batch_end_time = start_time + batch_duration
+            target_attr = "anticipated_future_events" if anticipated else "history"
+            for rid, completion_number, _ in batch:
+                tracked_req = self_ut.active_request_timelines[rid]
+                getattr(tracked_req.alternate_history_timeline, target_attr).append(
+                    RequestDecodeEvent(
+                        completion_number,
+                        rid,
+                        duration=batch_duration,
+                        end_timestamp=batch_end_time,
+                    )
+                )
+
+            if anticipated:
+                if not self_ut.anticipated_future_events:
+                    self_ut.anticipated_future_events.append(
+                        UserDecodeEvent(duration=batch_duration, end_timestamp=batch_end_time)
+                    )
+                return None
+
+            self_ut.history.append(
+                UserDecodeEvent(duration=batch_duration, end_timestamp=batch_end_time)
+            )
+            self_ut.nullify_anticipated_events()
+            self_ut.schedule_decode(batch_end_time, req_id_real_statuses, anticipated=True)
+            return batch_end_time
+
         RequestPrefillEvent.is_logically_after = _prefill_after
         RequestDecodeEvent.is_logically_after = _decode_after
         RequestTimeline.prune_till_after_event = _prune_after
+        UserTimeline.schedule_prefill = _schedule_prefill
+        UserTimeline.schedule_decode = _schedule_decode
         RequestTimeline._edf_patch_applied = True
 
     def _read_deltas(self, delta_fairness_deltas_microseconds: Optional[Dict[str, int]]):
@@ -526,17 +628,33 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
         delta_fairness_deltas_microseconds: Optional[Dict[str, int]],
         *,
         log_calc: bool = True,
+        sync_live_state: bool = False,
     ):
         self._read_deltas(delta_fairness_deltas_microseconds)
+        if sync_live_state:
+            self._sync_fair_user_tracking(running_batch, waiting_queue)
         waiting_by_rid = {r.rid: r for r in waiting_queue}
         running_by_rid = {r.rid: r for r in (running_batch.reqs if running_batch else [])}
 
         queue = []
         waiting_prefill_deadline_by_rid: Dict[str, float] = {}
+        stats = {
+            "tracked": 0,
+            "missing_real": 0,
+            "timeline_exc": 0,
+            "upcoming_empty": 0,
+            "prefill_filtered_not_waiting": 0,
+            "prefill_filtered_unfair": 0,
+            "decode_filtered_not_running": 0,
+            "decode_filtered_unfair": 0,
+            "fallback_decode_added": 0,
+        }
 
         for rid, tracked_req in self.event_queue.requests.items():
+            stats["tracked"] += 1
             real_e = self.event_queue.most_recent_event_real.get(rid)
             if real_e is None:
+                stats["missing_real"] += 1
                 continue
 
             if not isinstance(tracked_req.alternate_history_timeline.history, list):
@@ -548,14 +666,21 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
                 upcoming_events = tracked_req.earliest_events_after_real_time(real_e) or []
             except Exception:
                 # Keep EDF robust even if alternate timeline logic throws.
+                stats["timeline_exc"] += 1
                 continue
 
+            if len(upcoming_events) == 0:
+                stats["upcoming_empty"] += 1
+
             req = tracked_req.req
+            added_decode_for_req = False
             for e in upcoming_events:
                 if isinstance(e, RequestPrefillEvent):
                     if rid not in waiting_by_rid:
+                        stats["prefill_filtered_not_waiting"] += 1
                         continue
                     if not self.req_is_fair_prefill(req, running_batch=running_batch):
+                        stats["prefill_filtered_unfair"] += 1
                         continue
                     deadline = e.end_timestamp + self._event_delta_seconds(tracked_req, e)
                     queue.append((deadline, "prefill", req))
@@ -564,11 +689,42 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
                         waiting_prefill_deadline_by_rid[rid] = deadline
                 elif isinstance(e, RequestDecodeEvent):
                     if rid not in running_by_rid:
+                        stats["decode_filtered_not_running"] += 1
                         continue
                     if not self.req_is_fair_decode(req, running_batch=running_batch):
+                        stats["decode_filtered_unfair"] += 1
                         continue
                     deadline = e.end_timestamp + self._event_delta_seconds(tracked_req, e)
                     queue.append((deadline, "decode", req))
+                    added_decode_for_req = True
+
+            # Fallback: if a fair running request somehow has no timeline-produced upcoming
+            # decode, synthesize the anticipated next decode so EDF always sees a candidate.
+            if (
+                rid in running_by_rid
+                and not added_decode_for_req
+                and self.req_is_fair_decode(req, running_batch=running_batch)
+            ):
+                if isinstance(real_e, RequestDecodeEvent):
+                    completion_number = getattr(real_e, "completion_number", len(req.output_ids))
+                    synth_event = RequestDecodeEvent(
+                        completion_number + 1,
+                        req.rid,
+                        0,
+                        max(time.time(), getattr(real_e, "end_timestamp", time.time())),
+                    )
+                else:
+                    synth_event = RequestDecodeEvent(
+                        1,
+                        req.rid,
+                        0,
+                        max(time.time(), getattr(real_e, "end_timestamp", time.time())),
+                    )
+                deadline = synth_event.end_timestamp + self._event_delta_seconds(
+                    tracked_req, synth_event
+                )
+                queue.append((deadline, "decode", req))
+                stats["fallback_decode_added"] += 1
 
         queue.sort(key=lambda x: (x[0], 0 if x[1] == "decode" else 1))
         self._edf_deadline_queue = queue
@@ -578,7 +734,15 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             self._write_fairinf_log(
                 "deadline_calc",
                 "built_deadlines",
-                f"waiting={len(waiting_queue)},running={len(running_by_rid)},candidates={len(queue)}",
+                (
+                    f"waiting={len(waiting_queue)},running={len(running_by_rid)},"
+                    f"candidates={len(queue)},tracked={stats['tracked']},"
+                    f"missing_real={stats['missing_real']},timeline_exc={stats['timeline_exc']},"
+                    f"upcoming_empty={stats['upcoming_empty']},"
+                    f"decode_not_running={stats['decode_filtered_not_running']},"
+                    f"decode_unfair={stats['decode_filtered_unfair']},"
+                    f"fallback_decode_added={stats['fallback_decode_added']}"
+                ),
             )
 
     def fairinf_force_prefill_any_waiting(
@@ -615,6 +779,7 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             running_batch,
             delta_fairness_deltas_microseconds,
             log_calc=False,
+            sync_live_state=True,
         )
         self._write_fairinf_log(
             "start_of_pass",
@@ -690,16 +855,170 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
         )
         return [x[1] for x in indexed]
 
+    def _ensure_tracked_request(self, req: "Req") -> "TrackedRequest":
+        tracked = self.event_queue.requests.get(req.rid)
+        if tracked is None:
+            tracked = TrackedRequest(req, None, self._edf_deltas_us.copy())
+            self.event_queue.requests[req.rid] = tracked
+        else:
+            tracked.req = req
+            if tracked.deltas_in_microseconds is None:
+                tracked.deltas_in_microseconds = self._edf_deltas_us.copy()
+        if not isinstance(tracked.alternate_history_timeline.history, list):
+            tracked.alternate_history_timeline.history = (
+                [tracked.alternate_history_timeline.history]
+                if tracked.alternate_history_timeline.history is not None
+                else []
+            )
+        return tracked
+
+    def _seed_request_tracking(
+        self,
+        tracked: "TrackedRequest",
+        user_timeline: "UserTimeline",
+        now: float,
+        *,
+        waiting: bool,
+    ):
+        tracked.user_timeline = user_timeline
+        real_e = self.event_queue.most_recent_event_real.get(tracked.req.rid)
+        event_ts = getattr(real_e, "end_timestamp", now)
+        if waiting:
+            tracked.alternate_history_timeline.history = [
+                RequestStartEvent(tracked.req.rid, 0, event_ts)
+            ]
+            tracked.alternate_history_timeline.anticipated_future_events = [
+                RequestPrefillEvent(tracked.req.rid, 0, event_ts)
+            ]
+            return
+        completion_number = len(tracked.req.output_ids)
+        if completion_number > 0:
+            tracked.alternate_history_timeline.history = [
+                RequestDecodeEvent(completion_number, tracked.req.rid, 0, event_ts)
+            ]
+            tracked.alternate_history_timeline.anticipated_future_events = [
+                RequestDecodeEvent(completion_number + 1, tracked.req.rid, 0, event_ts)
+            ]
+        else:
+            tracked.alternate_history_timeline.history = [
+                RequestPrefillEvent(tracked.req.rid, 0, event_ts)
+            ]
+            tracked.alternate_history_timeline.anticipated_future_events = [
+                RequestDecodeEvent(1, tracked.req.rid, 0, event_ts)
+            ]
+
+    def _set_live_request_state(
+        self,
+        req: "Req",
+        tracked: "TrackedRequest",
+        user_timeline: "UserTimeline",
+        now: float,
+        *,
+        waiting: bool,
+    ):
+        target = (
+            user_timeline.waiting_request_timelines
+            if waiting
+            else user_timeline.active_request_timelines
+        )
+        other = (
+            user_timeline.active_request_timelines
+            if waiting
+            else user_timeline.waiting_request_timelines
+        )
+        should_seed = tracked.user_timeline is not user_timeline or req.rid not in target
+        if should_seed:
+            self._seed_request_tracking(tracked, user_timeline, now, waiting=waiting)
+        other.pop(req.rid, None)
+        target[req.rid] = tracked
+        if waiting:
+            self.event_queue.most_recent_event_real[req.rid] = RequestStartEvent(req.rid, 0, now)
+        elif len(req.output_ids) > 0:
+            self.event_queue.most_recent_event_real[req.rid] = RequestDecodeEvent(
+                len(req.output_ids), req.rid, 0, now
+            )
+        else:
+            self.event_queue.most_recent_event_real[req.rid] = RequestPrefillEvent(
+                req.rid, 0, now
+            )
+
+    def _sync_fair_user_tracking(self, running_batch, waiting_queue):
+        now = time.time()
+        running_reqs = list(running_batch.reqs) if running_batch is not None else []
+        waiting_by_user: Dict[str, List["Req"]] = {}
+        running_by_user: Dict[str, List["Req"]] = {}
+        for req in waiting_queue:
+            waiting_by_user.setdefault(req.uid, []).append(req)
+        for req in running_reqs:
+            running_by_user.setdefault(req.uid, []).append(req)
+
+        fair_users = {
+            uid
+            for uid in set(waiting_by_user) | set(running_by_user)
+            if self.user_is_fair_prefill(uid, running_batch=running_batch)
+        }
+
+        for uid in fair_users:
+            user_timeline = self.event_queue.users.get(uid)
+            if user_timeline is None:
+                user_timeline = UserTimeline(uid)
+                self.event_queue.users[uid] = user_timeline
+
+            live_waiting = {req.rid: req for req in waiting_by_user.get(uid, [])}
+            live_running = {req.rid: req for req in running_by_user.get(uid, [])}
+            live_rids = set(live_waiting) | set(live_running)
+
+            for rid in list(user_timeline.waiting_request_timelines.keys()):
+                if rid not in live_rids:
+                    user_timeline.waiting_request_timelines.pop(rid, None)
+            for rid in list(user_timeline.active_request_timelines.keys()):
+                if rid not in live_rids:
+                    user_timeline.active_request_timelines.pop(rid, None)
+            for rid, tracked in list(self.event_queue.requests.items()):
+                if tracked.req.uid == uid and rid not in live_rids:
+                    self.event_queue.requests.pop(rid, None)
+                    self.event_queue.most_recent_event_real.pop(rid, None)
+
+            for req in live_waiting.values():
+                tracked = self._ensure_tracked_request(req)
+                self._set_live_request_state(
+                    req,
+                    tracked,
+                    user_timeline,
+                    now,
+                    waiting=True,
+                )
+
+            for req in live_running.values():
+                tracked = self._ensure_tracked_request(req)
+                self._set_live_request_state(
+                    req,
+                    tracked,
+                    user_timeline,
+                    now,
+                    waiting=False,
+                )
+
+        return fair_users
+
     def start_of_pass(self, running_batch, waiting_queue):
         # Keep event queue internals updated without relying on the buggy pre-TODO version.
         self._fairinf_pass_id += 1
-        reqs = list(waiting_queue)
-        if running_batch is not None:
-            reqs.extend(running_batch.reqs)
-        fair_users = {
-            r.uid for r in reqs if self.user_is_fair_prefill(r.uid, running_batch=running_batch)
-        }
-        self.event_queue.start_of_pass(fair_users)
+        fair_users = self._sync_fair_user_tracking(running_batch, waiting_queue)
+        for uid in list(self.event_queue.users.keys()):
+            if uid in fair_users:
+                continue
+            self.event_queue.users.pop(uid, None)
+            for rid, tracked_req in list(self.event_queue.requests.items()):
+                if tracked_req.req.uid == uid:
+                    self.event_queue.requests.pop(rid, None)
+                    self.event_queue.most_recent_event_real.pop(rid, None)
+
+        current_time = time.time()
+        for uid in fair_users:
+            user_timeline = self.event_queue.users.get(uid)
+            if user_timeline is not None:
+                user_timeline.complete_upto_time(current_time, self.event_queue.most_recent_event_real)
         self._build_deadline_queue(waiting_queue, running_batch, None)
         self._write_fairinf_log(
             "start_of_pass",

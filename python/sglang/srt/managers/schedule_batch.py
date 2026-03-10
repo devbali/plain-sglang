@@ -18,6 +18,7 @@ limitations under the License.
 """Meta data for requests and batches"""
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Union
 
@@ -447,6 +448,7 @@ class ScheduleBatch:
         running_batch: Optional["ScheduleBatch"] = None,
         requesting_users: Optional[List[str]] = None,
     ):
+        prep_start = time.perf_counter()
         bs = self.batch_size()
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
@@ -461,6 +463,7 @@ class ScheduleBatch:
             running_batch=running_batch,
             requesting_users=requesting_users,
         )
+        alloc_done = time.perf_counter()
 
         pt = 0
         for i, req in enumerate(reqs):
@@ -485,6 +488,7 @@ class ScheduleBatch:
             self.req_pool_indices = torch.tensor(req_pool_indices_cpu)
             self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
             self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int64)
+        tensor_done = time.perf_counter()
 
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
@@ -492,6 +496,17 @@ class ScheduleBatch:
         self.prefix_lens_cpu = [len(r.prefix_indices) for r in reqs]
 
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(self, vocab_size)
+        sampling_done = time.perf_counter()
+        logger.info(
+            "Prepare-for-extend timing alloc_ms=%.3f tensor_ms=%.3f sampling_ms=%.3f total_ms=%.3f batch_size=%s extend_tokens=%s removed_requests=%s",
+            (alloc_done - prep_start) * 1000.0,
+            (tensor_done - alloc_done) * 1000.0,
+            (sampling_done - tensor_done) * 1000.0,
+            (sampling_done - prep_start) * 1000.0,
+            bs,
+            extend_num_tokens,
+            len(removed_requests),
+        )
         return removed_requests
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):

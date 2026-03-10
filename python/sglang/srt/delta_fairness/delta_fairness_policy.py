@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .static_fairness_policy import StaticFairnessPolicy
@@ -166,8 +167,11 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         out_cache_loc = None
         removed_requests: List["Req"] = []
         requesting_users = list(requesting_users or [])
+        alloc_start = time.perf_counter()
+        retract_count = 0
 
         while out_cache_loc is None:
+            loop_start = time.perf_counter()
             eviction_necessary = batch.token_to_kv_pool.available_size() < extend_num_tokens
             if eviction_necessary:
                 self.alloc_token_slots(
@@ -179,8 +183,19 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
 
             out_cache_loc = batch.token_to_kv_pool.alloc(extend_num_tokens)
             if out_cache_loc is None and running_batch is not None:
+                retract_start = time.perf_counter()
                 removed, _ = running_batch.retract_decode(extend_num_tokens)
+                retract_count += 1
                 removed_requests += removed
+                logger.info(
+                    "DeltaFairness prepare_for_extend_allocation retract_iter=%s removed=%s loop_ms=%.3f retract_ms=%.3f available_after=%s need=%s",
+                    retract_count,
+                    len(removed),
+                    (time.perf_counter() - loop_start) * 1000.0,
+                    (time.perf_counter() - retract_start) * 1000.0,
+                    batch.token_to_kv_pool.available_size(),
+                    extend_num_tokens,
+                )
             else:
                 break
 
@@ -188,6 +203,15 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             raise RuntimeError(
                 "Allocation failed after evicting for delta fairness reservations."
             )
+
+        logger.info(
+            "DeltaFairness prepare_for_extend_allocation total_ms=%.3f retract_iters=%s removed_total=%s extend_tokens=%s available_final=%s",
+            (time.perf_counter() - alloc_start) * 1000.0,
+            retract_count,
+            len(removed_requests),
+            extend_num_tokens,
+            batch.token_to_kv_pool.available_size(),
+        )
 
         return out_cache_loc, removed_requests
 

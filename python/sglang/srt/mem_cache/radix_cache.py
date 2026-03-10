@@ -36,6 +36,7 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.metrics.prefix_match import flush_prefix_match_metrics
+from sglang.srt.delta_fairness.time_estimation import pooled_prefill_time_estimation
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -238,8 +239,13 @@ class RadixCache(BasePrefixCache):
             return False
         current_tokens = self.total_user_counters.get_tokens(user_id)
         evictable_tokens = self.evictable_total_user_counters.get_tokens(user_id)
-        if DO_CACHE_DEBUG_LOGS: logger.debug(f"[FairInf Cache] User {user_id} has {current_tokens} current tokens, {evictable_tokens} evictable tokens, static max {self.static_max_per_user}, requesting {num_tokens} new tokens.")
-        if current_tokens - evictable_tokens + num_tokens > self.static_max_per_user:
+        if DO_CACHE_DEBUG_LOGS:
+            logger.debug(
+                f"[FairInf Cache] User {user_id} has {current_tokens} current tokens, "
+                f"{evictable_tokens} evictable tokens, static max {self.static_max_per_user}, "
+                f"requesting {num_tokens} new tokens."
+            )
+        if current_tokens + num_tokens > self.static_max_per_user:
             return True
         return False
     
@@ -257,10 +263,42 @@ class RadixCache(BasePrefixCache):
         logger.info(f"IN REJECT BASED ON COMPUTED FAIR LIMIT UNFAIR: num_tokens: {num_tokens}, user_id: {user_id}, real expandable size: {REAL_EXPANDABLE_SIZE}")
         return REAL_EXPANDABLE_SIZE  < num_tokens
     
+    def _estimate_pooled_prefill_worst_case_seconds(self, kv_tokens: int) -> float:
+        kv_tokens = max(0, int(kv_tokens))
+        if kv_tokens <= 0:
+            return 0.0
+        return float(
+            pooled_prefill_time_estimation(
+                total_batch_sum=kv_tokens,
+                max_token_size=kv_tokens,
+                batch_length=1,
+            )
+        )
+
     def calculate_delta_fair_reservation_size (self, time_microseconds):
-        TOKENS_PER_MICROSECOND = 1 / 60
-        RESERVED_SIZE = min(int(self.fairinf_max_per_user * 0.9), int(self.fairinf_max_per_user - time_microseconds * TOKENS_PER_MICROSECOND))
-        return max(0, RESERVED_SIZE)
+        if self.fairinf_max_per_user is None:
+            return 0
+
+        target_seconds = max(0.0, float(time_microseconds) / 1_000_000.0)
+        upper_bound = min(int(self.fairinf_max_per_user * 0.9), int(self.fairinf_max_per_user))
+        if upper_bound <= 0:
+            return 0
+        if target_seconds <= 0.0:
+            return upper_bound
+
+        lo = 0
+        hi = upper_bound
+        best = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            estimated_seconds = self._estimate_pooled_prefill_worst_case_seconds(mid)
+            if estimated_seconds <= target_seconds:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        return max(0, best)
 
     def calculate_real_expandable_size_for_user_fairinf (self, user_id, fair_users, self_unfair=False):
         # Exclude reservations for others
@@ -412,9 +450,9 @@ class RadixCache(BasePrefixCache):
         if self.fairinf_n is None:
             return False
         if fair_share_override is not None:
-            MAX = self.fairinf_max_per_user
-        else:
             MAX = fair_share_override
+        else:
+            MAX = self.fairinf_max_per_user
         return self.total_user_counters.get_tokens(user_id) + extra_tokens < MAX
 
     def fairinf_evictable_size_pooled (self):

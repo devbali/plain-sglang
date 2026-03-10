@@ -225,6 +225,7 @@ class ModelTpServer:
                     delta_fairness_n=self.delta_fairness_n,
                     max_running_requests=self.max_running_requests,
                     delta_fairness_quanta_us=self.delta_fairness_quanta_us,
+                    max_prefill_tokens=self.max_prefill_tokens,
                 )
             else:
                 self.fairness_policy = DeltaFairnessPolicy(
@@ -680,6 +681,21 @@ class ModelTpServer:
         return new_batch
 
     def forward_prefill_batch(self, batch: ScheduleBatch):
+        prefill_wall_start = time.perf_counter()
+        last_step_start = prefill_wall_start
+
+        def _log_prefill_step(step_name: str) -> None:
+            nonlocal last_step_start
+            now = time.perf_counter()
+            logger.info(
+                "Prefill timing step=%s wall_ms=%.3f batch_size=%s extend_tokens=%s",
+                step_name,
+                (now - last_step_start) * 1000.0,
+                batch.batch_size(),
+                getattr(batch, "extend_num_tokens", "unset"),
+            )
+            last_step_start = now
+
         # Build batch tensors
         requesting_users = {req.uid for req in batch.reqs}
         try:
@@ -695,6 +711,7 @@ class ModelTpServer:
             self.waiting_queue.extend(batch.reqs)
             batch.reqs = []
             return
+        _log_prefill_step("prepare_for_extend")
 
         if removed_requests:
             logger.info(
@@ -702,6 +719,7 @@ class ModelTpServer:
                 len(removed_requests),
             )
             self.waiting_queue.extend(removed_requests)
+        _log_prefill_step("requeue_removed_requests")
 
         decoding_reqs = []
         if self.is_mixed_chunk and self.running_batch is not None:
@@ -709,6 +727,7 @@ class ModelTpServer:
             batch.mix_with_running(self.running_batch)
             decoding_reqs = self.running_batch.reqs
             self.running_batch = None
+        _log_prefill_step("mix_with_running")
 
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
@@ -716,10 +735,13 @@ class ModelTpServer:
                 sample_output, logits_output = self.model_runner.forward(
                     batch, ForwardMode.EXTEND
                 )
+                _log_prefill_step("model_forward_extend")
                 next_token_ids = batch.check_sample_results(sample_output)
+                _log_prefill_step("check_sample_results")
                 batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                     next_token_ids
                 )
+                _log_prefill_step("cumulate_output_tokens")
 
                 # Move logprobs to cpu
                 if logits_output.next_token_logprobs is not None:
@@ -737,8 +759,10 @@ class ModelTpServer:
                     logits_output.normalized_prompt_logprobs = (
                         logits_output.normalized_prompt_logprobs.tolist()
                     )
+                    _log_prefill_step("logprobs_to_cpu")
 
                 next_token_ids = next_token_ids.tolist()
+                _log_prefill_step("next_token_ids_to_list")
             else:
                 if self.tokenizer is None:
                     next_token_ids = []
@@ -748,6 +772,7 @@ class ModelTpServer:
                         )
                 else:
                     next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
+                _log_prefill_step("zero_extend_token_fallback")
 
             # Check finish conditions
             pt = 0
@@ -778,10 +803,13 @@ class ModelTpServer:
                         i, req, pt, next_token_ids, logits_output
                     )
                     pt += req.extend_input_len
+            _log_prefill_step("postprocess_generation")
         else:
             assert batch.extend_num_tokens != 0
             logits_output = self.model_runner.forward(batch, ForwardMode.EXTEND)
+            _log_prefill_step("model_forward_extend_embedding")
             embeddings = logits_output.embeddings.tolist()
+            _log_prefill_step("embeddings_to_cpu")
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
@@ -800,8 +828,16 @@ class ModelTpServer:
                 if req is self.current_inflight_req:
                     # Inflight request would get a new req idx
                     self.req_to_token_pool.free(req.req_pool_idx)
+            _log_prefill_step("postprocess_embedding")
 
         self.handle_finished_requests(batch)
+        _log_prefill_step("handle_finished_requests")
+        logger.info(
+            "Prefill timing total wall_ms=%.3f batch_size=%s extend_tokens=%s",
+            (time.perf_counter() - prefill_wall_start) * 1000.0,
+            batch.batch_size(),
+            getattr(batch, "extend_num_tokens", "unset"),
+        )
 
     def add_logprob_return_values(
         self,
