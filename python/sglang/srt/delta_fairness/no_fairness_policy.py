@@ -10,6 +10,8 @@ diffs.
 
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from sglang.srt.request_timeline import TIMELINE_WRITER
+
 if False:  # pragma: no cover - imported only for type checkers
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -74,6 +76,9 @@ class NoFairnessPolicy:
         return None if evict_only_force else out_cache_loc
 
     def requires_per_user_allocation(self) -> bool:
+        return False
+
+    def uses_static_isolated_memory(self) -> bool:
         return False
 
     def ignore_global_prefill_token_budget(self) -> bool:
@@ -153,16 +158,17 @@ class NoFairnessPolicy:
         pass
 
     def finished_prefill (self, batch: "ScheduleBatch"):
-        pass
+        for req in batch.reqs:
+            TIMELINE_WRITER.mark_prefill_done(req.rid, req.uid)
     
     def process_new_request (self, req: "Req"):
-        pass # to implement
+        TIMELINE_WRITER.mark_queue_enter(req.rid, req.uid)
     
     def start_of_pass (self, running_batch: Optional["ScheduleBatch"], waiting_queue: List["Req"]):
         pass
     
     def mark_request_finished (self, req: "Req"):
-        pass
+        TIMELINE_WRITER.mark_completed(req.rid, req.uid)
 
     # ---- Delta fairness hooks (no-op defaults) ----
     

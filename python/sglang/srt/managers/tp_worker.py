@@ -50,6 +50,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.request_timeline import TIMELINE_WRITER
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_config import ModelConfig
@@ -721,6 +722,9 @@ class ModelTpServer:
             self.waiting_queue.extend(removed_requests)
         _log_prefill_step("requeue_removed_requests")
 
+        for req in batch.reqs:
+            TIMELINE_WRITER.mark_prefill_start(req.rid, req.uid)
+
         decoding_reqs = []
         if self.is_mixed_chunk and self.running_batch is not None:
             self.running_batch.prepare_for_decode()
@@ -925,6 +929,8 @@ class ModelTpServer:
         # Update batch tensors
         self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
         batch.prepare_for_decode()
+        for req in batch.reqs:
+            TIMELINE_WRITER.mark_first_decode_start(req.rid, req.uid)
 
         # Forward and sample the next tokens
         sample_output, logits_output = self.model_runner.forward(

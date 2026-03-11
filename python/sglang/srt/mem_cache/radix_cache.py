@@ -239,13 +239,17 @@ class RadixCache(BasePrefixCache):
             return False
         current_tokens = self.total_user_counters.get_tokens(user_id)
         evictable_tokens = self.evictable_total_user_counters.get_tokens(user_id)
+        unevictable_tokens = current_tokens - evictable_tokens
         if DO_CACHE_DEBUG_LOGS:
             logger.debug(
                 f"[FairInf Cache] User {user_id} has {current_tokens} current tokens, "
-                f"{evictable_tokens} evictable tokens, static max {self.static_max_per_user}, "
+                f"{evictable_tokens} evictable tokens, {unevictable_tokens} unevictable tokens, "
+                f"static max {self.static_max_per_user}, "
                 f"requesting {num_tokens} new tokens."
             )
-        if current_tokens + num_tokens > self.static_max_per_user:
+        # Static fairness should mirror normal SGLang semantics within each user's
+        # partition: the user's own evictable cache can be reclaimed for new prefills.
+        if unevictable_tokens + num_tokens > self.static_max_per_user:
             return True
         return False
     

@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.metrics.prefix_match import record_prefix_match_metric
 from sglang.srt.delta_fairness.no_fairness_policy import NoFairnessPolicy
+from sglang.srt.request_timeline import TIMELINE_WRITER
 
 if TYPE_CHECKING:
     from sglang.srt.layers.sampler import SampleOutput
@@ -537,6 +538,7 @@ class ScheduleBatch:
 
     def retract_decode(self, extra: int = 0):
         sorted_indices = self.fairness_policy.get_retract_order(self)
+        use_static_isolation = self.fairness_policy.uses_static_isolated_memory()
 
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
@@ -545,6 +547,11 @@ class ScheduleBatch:
             self.token_to_kv_pool.available_size(),
             len(sorted_indices) * global_config.retract_decode_steps + extra,
         )
+        if len(sorted_indices) == 0 and use_static_isolation:
+            raise RuntimeError(
+                "Static fairness decode retraction found no retractable requests. "
+                "This indicates decode memory pressure escaped the static-isolation checks."
+            )
         if (
             len(sorted_indices) == 0
             and self.token_to_kv_pool.available_size() < max(0, extra)
@@ -553,10 +560,16 @@ class ScheduleBatch:
                 "Delta fairness retraction blocked: no retractable decode requests "
                 "without evicting fair clients."
             )
-        while (
-            self.token_to_kv_pool.available_size()
-            < len(sorted_indices) * global_config.retract_decode_steps + extra
-        ):
+        while True:
+            if use_static_isolation:
+                if self.fairness_policy.check_decode_memory(self):
+                    break
+            elif (
+                self.token_to_kv_pool.available_size()
+                >= len(sorted_indices) * global_config.retract_decode_steps + extra
+            ):
+                break
+
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
                 assert (
@@ -567,6 +580,7 @@ class ScheduleBatch:
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
+            TIMELINE_WRITER.mark_running_batch_removed(req.rid, req.uid)
 
             if isinstance(self.tree_cache, ChunkCache):
                 # ChunkCache does not have eviction
@@ -595,7 +609,16 @@ class ScheduleBatch:
                     - self.token_to_kv_pool.available_size()
                 )
                 residual_size = max(0, residual_size)
-                self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
+                if (
+                    residual_size > 0
+                    and self.fairness_policy.uses_static_isolated_memory()
+                    and hasattr(self.tree_cache, "evict_from_user")
+                ):
+                    self.tree_cache.evict_from_user(
+                        residual_size, self.token_to_kv_pool.free, req.uid
+                    )
+                else:
+                    self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
 
             req.prefix_indices = []
             req.last_node = None

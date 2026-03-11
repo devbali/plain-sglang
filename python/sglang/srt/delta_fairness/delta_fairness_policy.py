@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 CLIP_MAX_NEW_TOKENS = int(os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS", "4096"))
 DECODE_TIME_US = 20000
 PREFILL_TOKEN_PER_DECODE = 250
+DELTA_UNFAIR_PREFILL_PROTECTED_HEADROOM_FRACTION = 0.9
 
 # pragma: no cover - imported only for type checkers
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -40,6 +41,45 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         tree_cache = self.tree_cache
         return tree_cache is not None and getattr(tree_cache, "fairinf_max_per_user", None) is not None
 
+    def _global_protected_tokens(self) -> int:
+        tree_cache = self.tree_cache
+        assert tree_cache is not None
+
+        total = 0
+        for user_id, token_count in tree_cache.total_user_counters:
+            total += token_count - tree_cache.evictable_total_user_counters.get_tokens(user_id)
+        return total
+
+    def _reject_unfair_prefill_due_to_global_headroom(
+        self,
+        req: Req,
+        *,
+        extra_tokens: int = 0,
+    ) -> bool:
+        tree_cache = self.tree_cache
+        if tree_cache is None or tree_cache.fairinf_max_per_user is None:
+            return False
+
+        total_capacity = getattr(tree_cache.token_to_kv_pool, "can_use_mem_size", None)
+        if total_capacity is None:
+            return False
+
+        global_limit = max(
+            1, int(total_capacity * DELTA_UNFAIR_PREFILL_PROTECTED_HEADROOM_FRACTION)
+        )
+        global_protected_tokens = self._global_protected_tokens()
+        if global_protected_tokens < global_limit:
+            return False
+
+        user_protected_tokens = (
+            tree_cache.total_user_counters.get_tokens(req.uid)
+            - tree_cache.evictable_total_user_counters.get_tokens(req.uid)
+        )
+        return user_protected_tokens + req.extend_input_len + extra_tokens > tree_cache.fairinf_max_per_user
+
+    def uses_static_isolated_memory(self) -> bool:
+        return False
+
     # ---- Request admission -------------------------------------------------
     def init_next_round_input_control(
         self,
@@ -65,6 +105,10 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             if tree_cache.reject_based_on_computed_fair_limit(req.uid, req.extend_input_len + extra_tokens):
                 return "rejected"
         else:
+            if self._reject_unfair_prefill_due_to_global_headroom(
+                req, extra_tokens=extra_tokens
+            ):
+                return "rejected"
             if tree_cache.reject_based_on_computed_fair_limit_unfair(
                 req.uid, req.extend_input_len + extra_tokens
             ):
@@ -90,6 +134,10 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
 
         tree_cache = self.tree_cache
         assert tree_cache is not None
+        if self._reject_unfair_prefill_due_to_global_headroom(
+            req, extra_tokens=extra_tokens
+        ):
+            return "rejected"
         if tree_cache.reject_based_on_computed_fair_limit(req.uid, req.extend_input_len + extra_tokens):
             return "rejected"
         return None
@@ -251,18 +299,28 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
 
         tree_cache = self.tree_cache
         assert tree_cache is not None
-        retractable: List[int] = []
+        unfair_retractable: List[int] = []
+        fair_retractable: List[int] = []
         for i, req in enumerate(batch.reqs):
             if not self.req_is_fair_decode(
                 req,
                 running_batch=batch,
             ):
-                retractable.append(i)
+                unfair_retractable.append(i)
+            else:
+                fair_retractable.append(i)
 
-        for i, req in enumerate(batch.reqs):
-            if i not in retractable:
-                retractable.append(i)
-        return retractable
+        # Within each fairness tier, prefer retracting the least-decoded requests first
+        # so repeatedly retracted requests stay localized instead of disturbing older ones.
+        unfair_retractable.sort(
+            key=lambda i: (-len(batch.reqs[i].origin_input_ids), -len(batch.reqs[i].output_ids)),
+            reverse=True,
+        )
+        fair_retractable.sort(
+            key=lambda i: (-len(batch.reqs[i].origin_input_ids), -len(batch.reqs[i].output_ids)),
+            reverse=True,
+        )
+        return unfair_retractable + fair_retractable
 
     def alloc_decode_output_slots(self, batch: "ScheduleBatch"):
         """
