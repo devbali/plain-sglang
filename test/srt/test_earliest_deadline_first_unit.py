@@ -117,6 +117,60 @@ class TestEarliestDeadlineFirstUnit(unittest.TestCase):
             ]
             self.assertEqual(len(user_prefills), 3)
 
+    def test_alternate_history_chooses_earliest_event_not_prefill_by_default(self):
+        """
+        EDF alternate history should compare the next isolated prefill and
+        decode events and schedule whichever completes earlier. It should not
+        prioritize prefill just because there is waiting work and spare active
+        capacity.
+        """
+
+        now = {"t": 100.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(edf_mod.time, "time", side_effect=fake_time):
+            policy = EarliestDeltaFirst(
+                delta_fairness_n=1,
+                max_running_requests=4,
+                max_prefill_tokens=5000,
+            )
+            policy._write_fairinf_log = lambda *args, **kwargs: None
+
+            running_req = _mk_req("u", "rid_running", 8)
+            waiting_req = _mk_req("u", "rid_waiting", 5000)
+
+            policy.process_new_request(running_req)
+            now["t"] = 101.0
+            policy.finished_prefill(SimpleNamespace(reqs=[running_req]))
+            running_req.output_ids = [42]
+            now["t"] = 102.0
+            policy.finished_decode(SimpleNamespace(reqs=[running_req]))
+
+            now["t"] = 103.0
+            policy.process_new_request(waiting_req)
+
+            # Rehydrate the fair user timelines from live state and advance the
+            # alternate history up to "now".
+            now["t"] = 104.0
+            policy.start_of_pass(SimpleNamespace(reqs=[running_req]), [waiting_req])
+
+            user_timeline = policy.event_queue.users["u"]
+            self.assertGreaterEqual(len(user_timeline.history), 1)
+            self.assertIsInstance(user_timeline.history[0], edf_mod.UserDecodeEvent)
+
+            # The running request should preserve decode progress in the
+            # alternate history while the waiting request remains pending.
+            running_timeline = policy.event_queue.requests[running_req.rid]
+            decode_events = [
+                event
+                for event in running_timeline.alternate_history_timeline.history
+                if isinstance(event, edf_mod.RequestDecodeEvent)
+            ]
+            self.assertGreaterEqual(len(decode_events), 1)
+            self.assertIn(waiting_req.rid, user_timeline.waiting_request_timelines)
+
 
 if __name__ == "__main__":
     unittest.main()

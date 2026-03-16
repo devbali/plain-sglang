@@ -50,17 +50,19 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.request_timeline import TIMELINE_WRITER
+from sglang.srt.request_timeline import RUNNING_BATCH_WRITER, TIMELINE_WRITER
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.delta_fairness.time_estimation import pooled_prefill_time_estimation
 from sglang.srt.delta_fairness.no_fairness_policy import NoFairnessPolicy
 from sglang.srt.delta_fairness.static_fairness_policy import StaticFairnessPolicy
 from sglang.srt.delta_fairness.delta_fairness_policy import DeltaFairnessPolicy
 from sglang.srt.delta_fairness.earliest_deadline_first import EarliestDeltaFirst
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 from sglang.srt.utils import (
     configure_logger,
@@ -71,6 +73,51 @@ from sglang.srt.utils import (
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_single_delta_config(
+    raw_deltas: Optional[Dict[str, int]], max_prefill_tokens: int
+) -> Dict[str, int]:
+    raw_deltas = raw_deltas or {}
+    candidate_keys = (
+        "delta",
+        "decode",
+        "first_decode",
+        "prefill",
+        "decode_running_batch",
+        "first_decode_running_batch",
+        "prefill_running_batch",
+        "prefix_cache",
+        "kv_cache",
+    )
+    effective_delta_us = 0
+    for key in candidate_keys:
+        value = raw_deltas.get(key)
+        if value is None:
+            continue
+        effective_delta_us = max(effective_delta_us, int(value))
+
+    max_prefill_delta_us = int(
+        round(
+            pooled_prefill_time_estimation(
+                total_batch_sum=max_prefill_tokens,
+                max_token_size=max_prefill_tokens,
+                batch_length=1,
+            )
+            * 1_000_000
+        )
+    )
+    cache_reservation_delta_us = min(effective_delta_us, max_prefill_delta_us)
+    prefill_delta_us = max(0, effective_delta_us - cache_reservation_delta_us)
+
+    return {
+        "delta": effective_delta_us,
+        "prefix_cache": cache_reservation_delta_us,
+        "kv_cache": cache_reservation_delta_us,
+        "prefill": prefill_delta_us,
+        "first_decode": effective_delta_us,
+        "decode": effective_delta_us,
+    }
 
 
 crash_on_warning = os.getenv("SGLANG_IS_IN_CI", "false") == "true"
@@ -171,6 +218,8 @@ class ModelTpServer:
         self.delta_fairness_n = None
         self.delta_fairness_deltas_microseconds = None
         self.delta_fairness_quanta_us = 0
+        self.delta_fairness_pooled_quanta_us = 0
+        self.delta_fairness_exclusive_quanta_us = 0
 
         if server_args.delta_fairness_n > 0:
             self.delta_fairness_n = server_args.delta_fairness_n
@@ -196,8 +245,33 @@ class ModelTpServer:
                     "decode_running_batch": 150000,
                 },
             )
+            self.delta_fairness_deltas_microseconds = _normalize_single_delta_config(
+                self.delta_fairness_deltas_microseconds,
+                self.max_prefill_tokens,
+            )
+            logger.info(
+                "Normalized delta fairness single-delta config: "
+                "delta=%dus prefix_cache=%dus kv_cache=%dus prefill=%dus "
+                "first_decode=%dus decode=%dus",
+                self.delta_fairness_deltas_microseconds["delta"],
+                self.delta_fairness_deltas_microseconds["prefix_cache"],
+                self.delta_fairness_deltas_microseconds["kv_cache"],
+                self.delta_fairness_deltas_microseconds["prefill"],
+                self.delta_fairness_deltas_microseconds["first_decode"],
+                self.delta_fairness_deltas_microseconds["decode"],
+            )
             self.delta_fairness_quanta_us = int(
                 config.get("delta_fairness_quanta_us", 0) or 0
+            )
+            self.delta_fairness_pooled_quanta_us = int(
+                config.get(
+                    "delta_fairness_pooled_quanta_us",
+                    self.delta_fairness_quanta_us,
+                )
+                or 0
+            )
+            self.delta_fairness_exclusive_quanta_us = int(
+                config.get("delta_fairness_exclusive_quanta_us", 0) or 0
             )
 
         # Init cache
@@ -226,6 +300,8 @@ class ModelTpServer:
                     delta_fairness_n=self.delta_fairness_n,
                     max_running_requests=self.max_running_requests,
                     delta_fairness_quanta_us=self.delta_fairness_quanta_us,
+                    delta_fairness_pooled_quanta_us=self.delta_fairness_pooled_quanta_us,
+                    delta_fairness_exclusive_quanta_us=self.delta_fairness_exclusive_quanta_us,
                     max_prefill_tokens=self.max_prefill_tokens,
                 )
             else:
@@ -253,6 +329,9 @@ class ModelTpServer:
         self.stream_interval = server_args.stream_interval
         self.num_generated_tokens = 0
         self.last_stats_tic = time.time()
+        self.last_running_batch_snapshot_tic = 0.0
+        self.last_model_forward_elapsed_ms = None
+        self.last_decode_step_breakdown = None
 
         # Chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
@@ -367,11 +446,13 @@ class ModelTpServer:
                 add_wait = new_batch.total_size() / PREFILL_TOKENS_PER_DECODE
                 for req in self.running_batch.reqs:
                     req.waiting_time_in_decodes += add_wait
+            wall_start = time.perf_counter()
             start.record()
             self.forward_prefill_batch(new_batch)
             end.record()
             torch.cuda.synchronize()
             elapsed_time_ms = start.elapsed_time(end)
+            wall_time_ms = (time.perf_counter() - wall_start) * 1000.0
             self.fairness_policy.finished_prefill(new_batch)
 
             if not new_batch.is_empty():
@@ -379,29 +460,50 @@ class ModelTpServer:
                     self.running_batch = new_batch
                 else:
                     self.running_batch.merge(new_batch)
-            self.print_stats(decode=False, elapsed_time_ms=elapsed_time_ms)
+            self.print_stats(
+                decode=False,
+                elapsed_time_ms=elapsed_time_ms,
+                wall_time_ms=wall_time_ms,
+            )
 
         else:
             # Run a decode batch
             if self.running_batch is not None:
                 self.running_batch.max_running_requests = self.max_running_requests
                 self.running_batch.delta_fairness_n = self.delta_fairness_n
-                for req in self.running_batch.reqs:
-                    req.waiting_time_in_decodes = 0
-                for req in self.waiting_queue:
-                    req.waiting_time_in_decodes += 1
                 # Run a few decode batches continuously for reducing overhead
                 for _ in range(global_config.num_continue_decode_steps):
-                    self.num_generated_tokens += len(self.running_batch.reqs)
+                    selected_rids = self.fairness_policy.fairinf_overdue_decode_subset_rids(
+                        self.running_batch
+                    )
+                    for req in self.running_batch.reqs:
+                        if selected_rids is None or req.rid in selected_rids:
+                            req.waiting_time_in_decodes = 0
+                        else:
+                            req.waiting_time_in_decodes += 1
+                    for req in self.waiting_queue:
+                        req.waiting_time_in_decodes += 1
+                    generated_count = (
+                        len(self.running_batch.reqs)
+                        if selected_rids is None
+                        else sum(1 for req in self.running_batch.reqs if req.rid in selected_rids)
+                    )
+                    self.num_generated_tokens += generated_count
+                    wall_start = time.perf_counter()
                     start.record()
-                    self.forward_decode_batch(self.running_batch)
+                    self.forward_decode_batch(self.running_batch, selected_rids=selected_rids)
                     end.record()
                     torch.cuda.synchronize()
                     elapsed_time_ms = start.elapsed_time(end)
+                    wall_time_ms = (time.perf_counter() - wall_start) * 1000.0
                     self.fairness_policy.finished_decode(self.running_batch)
 
                     # Print stats
-                    self.print_stats(decode=True, elapsed_time_ms=elapsed_time_ms)
+                    self.print_stats(
+                        decode=True,
+                        elapsed_time_ms=elapsed_time_ms,
+                        wall_time_ms=wall_time_ms,
+                    )
 
                     if self.running_batch.is_empty():
                         self.running_batch = None
@@ -413,7 +515,7 @@ class ModelTpServer:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
 
-    def print_stats(self, decode=True, elapsed_time_ms=0):
+    def print_stats(self, decode=True, elapsed_time_ms=0, wall_time_ms=None):
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
@@ -425,6 +527,17 @@ class ModelTpServer:
         token_usage = num_used / self.max_total_num_tokens
         running_reqs = len(self.running_batch.reqs) if hasattr(self.running_batch, "reqs") else 0
         queue_reqs = len(self.waiting_queue)
+        if (
+            self.tp_rank == 0
+            and self.running_batch is not None
+            and hasattr(self.running_batch, "reqs")
+            and current_time - self.last_running_batch_snapshot_tic >= 1.0
+        ):
+            RUNNING_BATCH_WRITER.write_snapshot(
+                batch_type="decode" if decode else "prefill",
+                running_reqs=self.running_batch.reqs,
+            )
+            self.last_running_batch_snapshot_tic = current_time
         
         # Log to console
         logger.info(
@@ -443,8 +556,36 @@ class ModelTpServer:
             
             with open(csv_file, 'a') as f:
                 if write_header:
-                    f.write("timestamp,type,time_elapsed,running_reqs,num_tokens,token_usage,throughput,queue_reqs\n")
-                f.write(f"{current_time},{'Decode' if decode else 'Prefill'},{elapsed_time_ms},{running_reqs},{num_used},{token_usage:.4f},{throughput:.4f},{queue_reqs}\n")
+                    f.write(
+                        "timestamp,type,time_elapsed,gpu_time_elapsed_ms,wall_time_elapsed_ms,"
+                        "model_forward_elapsed_ms,"
+                        "decode_check_mem_ms,decode_jump_forward_ms,decode_prepare_ms,"
+                        "decode_build_input_ids_ms,decode_input_tensor_and_seq_lens_ms,"
+                        "decode_alloc_decode_output_slots_ms,decode_write_req_to_token_ms,"
+                        "decode_update_regex_vocab_mask_ms,"
+                        "decode_sample_postprocess_ms,decode_handle_finished_ms,"
+                        "running_reqs,num_tokens,token_usage,throughput,queue_reqs\n"
+                    )
+                wall_time_ms = elapsed_time_ms if wall_time_ms is None else wall_time_ms
+                model_forward_ms = (
+                    "" if self.last_model_forward_elapsed_ms is None else self.last_model_forward_elapsed_ms
+                )
+                breakdown = self.last_decode_step_breakdown or {}
+                prepare_breakdown = breakdown.get("prepare_breakdown", {}) if breakdown else {}
+                f.write(
+                    f"{current_time},{'Decode' if decode else 'Prefill'},{wall_time_ms},"
+                    f"{elapsed_time_ms},{wall_time_ms},{model_forward_ms},"
+                    f"{breakdown.get('check_mem_ms', '')},{breakdown.get('jump_forward_ms', '')},"
+                    f"{breakdown.get('prepare_ms', '')},"
+                    f"{prepare_breakdown.get('build_input_ids_ms', '')},"
+                    f"{prepare_breakdown.get('input_tensor_and_seq_lens_ms', '')},"
+                    f"{prepare_breakdown.get('alloc_decode_output_slots_ms', '')},"
+                    f"{prepare_breakdown.get('write_req_to_token_ms', '')},"
+                    f"{prepare_breakdown.get('update_regex_vocab_mask_ms', '')},"
+                    f"{breakdown.get('sample_postprocess_ms', '')},"
+                    f"{breakdown.get('handle_finished_ms', '')},{running_reqs},{num_used},"
+                    f"{token_usage:.4f},{throughput:.4f},{queue_reqs}\n"
+                )
 
 
     def check_memory(self):
@@ -548,7 +689,7 @@ class ModelTpServer:
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
         available_req_slots = len(self.req_to_token_pool.free_slots)
-        if running_bs >= self.max_running_requests or available_req_slots <= 0:
+        if not self.waiting_queue and self.current_inflight_req is None:
             return None
 
         # Get priority queue
@@ -572,6 +713,13 @@ class ModelTpServer:
 
         if self.running_batch is not None:
             adder.remove_running_tokens(self.running_batch, self.new_token_ratio)
+
+        self.fairness_policy.start_of_pass(
+            self.running_batch,
+            self.waiting_queue,
+            new_token_ratio=self.new_token_ratio,
+            max_running_requests=self.max_running_requests,
+        )
 
         has_inflight = self.current_inflight_req is not None
         token_counters_by_user: Dict[str, List[int]] = {}
@@ -600,7 +748,12 @@ class ModelTpServer:
             delta_fairness_deltas_microseconds=self.delta_fairness_deltas_microseconds,
             max_input_size=max_input_size,
             prefix_computed=prefix_computed,
+            max_running_requests=self.max_running_requests,
         )
+        running_bs = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        available_req_slots = len(self.req_to_token_pool.free_slots)
+        if running_bs >= self.max_running_requests or available_req_slots <= 0:
+            return None
         if extra_space > 0 and evicted_reqs:
             logger.info(
                 "Fairness reserved %s tokens (available=%s, evictable=%s)",
@@ -684,6 +837,7 @@ class ModelTpServer:
     def forward_prefill_batch(self, batch: ScheduleBatch):
         prefill_wall_start = time.perf_counter()
         last_step_start = prefill_wall_start
+        self.last_model_forward_elapsed_ms = None
 
         def _log_prefill_step(step_name: str) -> None:
             nonlocal last_step_start
@@ -736,8 +890,16 @@ class ModelTpServer:
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
+                model_forward_start = torch.cuda.Event(enable_timing=True)
+                model_forward_end = torch.cuda.Event(enable_timing=True)
+                model_forward_start.record()
                 sample_output, logits_output = self.model_runner.forward(
                     batch, ForwardMode.EXTEND
+                )
+                model_forward_end.record()
+                torch.cuda.synchronize()
+                self.last_model_forward_elapsed_ms = model_forward_start.elapsed_time(
+                    model_forward_end
                 )
                 _log_prefill_step("model_forward_extend")
                 next_token_ids = batch.check_sample_results(sample_output)
@@ -810,7 +972,15 @@ class ModelTpServer:
             _log_prefill_step("postprocess_generation")
         else:
             assert batch.extend_num_tokens != 0
+            model_forward_start = torch.cuda.Event(enable_timing=True)
+            model_forward_end = torch.cuda.Event(enable_timing=True)
+            model_forward_start.record()
             logits_output = self.model_runner.forward(batch, ForwardMode.EXTEND)
+            model_forward_end.record()
+            torch.cuda.synchronize()
+            self.last_model_forward_elapsed_ms = model_forward_start.elapsed_time(
+                model_forward_end
+            )
             _log_prefill_step("model_forward_extend_embedding")
             embeddings = logits_output.embeddings.tolist()
             _log_prefill_step("embeddings_to_cpu")
@@ -899,79 +1069,235 @@ class ModelTpServer:
                 )
             req.output_top_logprobs.append(output.output_top_logprobs[i])
 
-    def forward_decode_batch(self, batch: ScheduleBatch):
+    def forward_decode_batch(
+        self,
+        batch: ScheduleBatch,
+        *,
+        selected_rids: Optional[set[str]] = None,
+    ):
+        self.last_model_forward_elapsed_ms = None
+        self.last_decode_step_breakdown = None
+        decode_step_start = time.perf_counter()
+        restore_state = None
+        if selected_rids:
+            selected_indices = [i for i, req in enumerate(batch.reqs) if req.rid in selected_rids]
+            if selected_indices and len(selected_indices) < len(batch.reqs):
+                deferred_indices = [i for i, req in enumerate(batch.reqs) if req.rid not in selected_rids]
+                batch.reorder_batch(selected_indices + deferred_indices)
+                selected_count = len(selected_indices)
+                restore_state = {
+                    "selected_count": selected_count,
+                    "deferred_reqs": list(batch.reqs[selected_count:]),
+                    "deferred_req_pool_indices": batch.req_pool_indices[selected_count:],
+                    "deferred_seq_lens": batch.seq_lens[selected_count:],
+                    "deferred_position_ids_offsets": batch.position_ids_offsets[selected_count:],
+                    "deferred_top_logprobs_nums": list(batch.top_logprobs_nums[selected_count:]),
+                    "full_sampling_attrs": {},
+                    "full_penalizer_attrs": {},
+                }
+                sampling_info = batch.sampling_info
+                for attr in [
+                    "temperatures",
+                    "top_ps",
+                    "top_ks",
+                    "min_ps",
+                    "logit_bias",
+                    "vocab_mask",
+                    "linear_penalties",
+                    "scaling_penalties",
+                ]:
+                    value = getattr(sampling_info, attr, None)
+                    restore_state["full_sampling_attrs"][attr] = value
+                    if value is not None and hasattr(value, "shape") and value.shape[0] == len(batch.reqs):
+                        setattr(sampling_info, attr, value[:selected_count])
+                for penalizer in sampling_info.penalizer_orchestrator.penalizers.values():
+                    attrs = {}
+                    for attr, value in list(vars(penalizer).items()):
+                        attrs[attr] = value
+                        if (
+                            isinstance(value, torch.Tensor)
+                            and value.ndim >= 1
+                            and value.shape[0] == len(batch.reqs)
+                        ):
+                            setattr(penalizer, attr, value[:selected_count])
+                    restore_state["full_penalizer_attrs"][id(penalizer)] = attrs
+                logger.info(
+                    "EDF restricted decode batch to overdue-user requests only. selected=%s deferred=%s",
+                    selected_count,
+                    len(deferred_indices),
+                )
+                batch.reqs = list(batch.reqs[:selected_count])
+                batch.req_pool_indices = batch.req_pool_indices[:selected_count]
+                batch.seq_lens = batch.seq_lens[:selected_count]
+                batch.position_ids_offsets = batch.position_ids_offsets[:selected_count]
+                batch.top_logprobs_nums = list(batch.top_logprobs_nums[:selected_count])
+                batch.return_logprob = any(req.return_logprob for req in batch.reqs)
+                batch.input_ids = None
+                batch.out_cache_loc = None
         # Check if decode out of memory
-        if not batch.check_decode_mem():
-            old_ratio = self.new_token_ratio
+        try:
+            if not batch.check_decode_mem():
+                old_ratio = self.new_token_ratio
 
-            retracted_reqs, new_token_ratio = batch.retract_decode()
-            self.new_token_ratio = new_token_ratio
+                retracted_reqs, new_token_ratio = batch.retract_decode()
+                self.new_token_ratio = new_token_ratio
 
-            logger.info(
-                "Decode out of memory happened. "
-                f"#retracted_reqs: {len(retracted_reqs)}, "
-                f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
-            )
-            self.waiting_queue.extend(retracted_reqs)
-        else:
-            self.new_token_ratio = max(
-                self.new_token_ratio - self.new_token_ratio_decay,
-                self.min_new_token_ratio,
-            )
-
-        if not self.disable_regex_jump_forward:
-            # Check for jump-forward
-            jump_forward_reqs = batch.check_for_jump_forward(self.model_runner)
-            self.waiting_queue.extend(jump_forward_reqs)
-            if batch.is_empty():
-                return
-
-        # Update batch tensors
-        self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
-        batch.prepare_for_decode()
-        for req in batch.reqs:
-            TIMELINE_WRITER.mark_first_decode_start(req.rid, req.uid)
-
-        # Forward and sample the next tokens
-        sample_output, logits_output = self.model_runner.forward(
-            batch, ForwardMode.DECODE
-        )
-        next_token_ids = batch.check_sample_results(sample_output)
-        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            next_token_ids
-        )
-
-        # Move logprobs to cpu
-        if logits_output.next_token_logprobs is not None:
-            next_token_logprobs = logits_output.next_token_logprobs[
-                torch.arange(len(next_token_ids), device=next_token_ids.device),
-                next_token_ids,
-            ].tolist()
-
-        next_token_ids = next_token_ids.tolist()
-
-        # Check finish condition
-        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-            req.completion_tokens_wo_jump_forward += 1
-            req.output_ids.append(next_token_id)
-            req.check_finished()
-
-            if req.regex_fsm is not None:
-                req.regex_fsm_state = req.regex_fsm.get_next_state(
-                    req.regex_fsm_state, next_token_id
+                logger.info(
+                    "Decode out of memory happened. "
+                    f"#retracted_reqs: {len(retracted_reqs)}, "
+                    f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
                 )
-
-            if req.finished():
-                self.tree_cache.cache_finished_req(req)
-
-            if req.return_logprob:
-                req.output_token_logprobs.append(
-                    (next_token_logprobs[i], next_token_id)
+                self.waiting_queue.extend(retracted_reqs)
+            else:
+                self.new_token_ratio = max(
+                    self.new_token_ratio - self.new_token_ratio_decay,
+                    self.min_new_token_ratio,
                 )
-                if req.top_logprobs_num > 0:
-                    req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
+            after_check_mem = time.perf_counter()
 
-        self.handle_finished_requests(batch)
+            if not self.disable_regex_jump_forward:
+                # Check for jump-forward
+                jump_forward_reqs = batch.check_for_jump_forward(self.model_runner)
+                self.waiting_queue.extend(jump_forward_reqs)
+                if batch.is_empty():
+                    self.last_decode_step_breakdown = {
+                        "check_mem_ms": (after_check_mem - decode_step_start) * 1000.0,
+                        "jump_forward_ms": (time.perf_counter() - after_check_mem) * 1000.0,
+                        "prepare_ms": 0.0,
+                        "prepare_breakdown": {},
+                        "sample_postprocess_ms": 0.0,
+                        "handle_finished_ms": 0.0,
+                    }
+                    return
+            after_jump_forward = time.perf_counter()
+
+            # Update batch tensors
+            self.decode_forward_ct = (self.decode_forward_ct + 1) % (1 << 30)
+            batch.prepare_for_decode()
+            prepare_breakdown = getattr(batch, "decode_prepare_breakdown", {})
+            for req in batch.reqs:
+                TIMELINE_WRITER.mark_first_decode_start(req.rid, req.uid)
+            after_prepare = time.perf_counter()
+
+            # Forward and sample the next tokens
+            model_forward_start = torch.cuda.Event(enable_timing=True)
+            model_forward_end = torch.cuda.Event(enable_timing=True)
+            model_forward_start.record()
+            sample_output, logits_output = self.model_runner.forward(
+                batch, ForwardMode.DECODE
+            )
+            model_forward_end.record()
+            torch.cuda.synchronize()
+            self.last_model_forward_elapsed_ms = model_forward_start.elapsed_time(
+                model_forward_end
+            )
+            next_token_ids = batch.check_sample_results(sample_output)
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                next_token_ids
+            )
+
+            # Move logprobs to cpu
+            if logits_output.next_token_logprobs is not None:
+                next_token_logprobs = logits_output.next_token_logprobs[
+                    torch.arange(len(next_token_ids), device=next_token_ids.device),
+                    next_token_ids,
+                ].tolist()
+
+            next_token_ids = next_token_ids.tolist()
+            after_sample_postprocess = time.perf_counter()
+
+            # Check finish condition
+            for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                req.completion_tokens_wo_jump_forward += 1
+                req.output_ids.append(next_token_id)
+                req.check_finished()
+
+                if req.regex_fsm is not None:
+                    req.regex_fsm_state = req.regex_fsm.get_next_state(
+                        req.regex_fsm_state, next_token_id
+                    )
+
+                if req.finished():
+                    self.tree_cache.cache_finished_req(req)
+
+                if req.return_logprob:
+                    req.output_token_logprobs.append(
+                        (next_token_logprobs[i], next_token_id)
+                    )
+                    if req.top_logprobs_num > 0:
+                        req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
+
+            self.handle_finished_requests(batch)
+            after_handle_finished = time.perf_counter()
+            self.last_decode_step_breakdown = {
+                "check_mem_ms": (after_check_mem - decode_step_start) * 1000.0,
+                "jump_forward_ms": (after_jump_forward - after_check_mem) * 1000.0,
+                "prepare_ms": (after_prepare - after_jump_forward) * 1000.0,
+                "prepare_breakdown": prepare_breakdown,
+                "sample_postprocess_ms": (after_sample_postprocess - after_prepare) * 1000.0,
+                "handle_finished_ms": (after_handle_finished - after_sample_postprocess) * 1000.0,
+            }
+        finally:
+            if restore_state is not None:
+                selected_survivors = len(batch.reqs)
+                batch.reqs.extend(restore_state["deferred_reqs"])
+                batch.req_pool_indices = torch.concat(
+                    [batch.req_pool_indices[:selected_survivors], restore_state["deferred_req_pool_indices"]]
+                )
+                batch.seq_lens = torch.concat(
+                    [batch.seq_lens[:selected_survivors], restore_state["deferred_seq_lens"]]
+                )
+                batch.position_ids_offsets = torch.concat(
+                    [batch.position_ids_offsets[:selected_survivors], restore_state["deferred_position_ids_offsets"]]
+                )
+                batch.top_logprobs_nums = (
+                    list(batch.top_logprobs_nums[:selected_survivors])
+                    + restore_state["deferred_top_logprobs_nums"]
+                )
+                batch.return_logprob = any(req.return_logprob for req in batch.reqs)
+
+                sampling_info = batch.sampling_info
+                for attr, full_value in restore_state["full_sampling_attrs"].items():
+                    cur_value = getattr(sampling_info, attr, None)
+                    if (
+                        isinstance(full_value, torch.Tensor)
+                        and full_value.ndim >= 1
+                        and full_value.shape[0] == restore_state["selected_count"] + len(restore_state["deferred_reqs"])
+                        and isinstance(cur_value, torch.Tensor)
+                    ):
+                        setattr(
+                            sampling_info,
+                            attr,
+                            torch.concat(
+                                [cur_value[:selected_survivors], full_value[restore_state["selected_count"] :]],
+                                dim=0,
+                            ),
+                        )
+                    else:
+                        setattr(sampling_info, attr, full_value)
+
+                for penalizer in sampling_info.penalizer_orchestrator.penalizers.values():
+                    full_attrs = restore_state["full_penalizer_attrs"][id(penalizer)]
+                    for attr, full_value in full_attrs.items():
+                        cur_value = getattr(penalizer, attr, None)
+                        if (
+                            isinstance(full_value, torch.Tensor)
+                            and full_value.ndim >= 1
+                            and full_value.shape[0] == restore_state["selected_count"] + len(restore_state["deferred_reqs"])
+                            and isinstance(cur_value, torch.Tensor)
+                        ):
+                            setattr(
+                                penalizer,
+                                attr,
+                                torch.concat(
+                                    [cur_value[:selected_survivors], full_value[restore_state["selected_count"] :]],
+                                    dim=0,
+                                ),
+                            )
+                        else:
+                            setattr(penalizer, attr, full_value)
+                batch.input_ids = None
+                batch.out_cache_loc = None
 
     def handle_finished_requests(self, batch: ScheduleBatch):
         output_rids = []

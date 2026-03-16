@@ -24,6 +24,9 @@ class NoFairnessPolicy:
 
     def __init__(self, tree_cache: Optional["BasePrefixCache"] = None):
         self.tree_cache = tree_cache
+        self._pass_running_batch: Optional["ScheduleBatch"] = None
+        self._pass_new_token_ratio: float = 0.0
+        self._pass_max_running_requests: Optional[int] = None
 
     def set_tree_cache(self, tree_cache: Optional["BasePrefixCache"]) -> None:
         self.tree_cache = tree_cache
@@ -155,17 +158,28 @@ class NoFairnessPolicy:
         return self.alloc_token_slots(batch.token_to_kv_pool, batch.batch_size())
 
     def finished_decode (self, batch: "ScheduleBatch"):
-        pass
+        for req in batch.reqs:
+            TIMELINE_WRITER.mark_request_event(req.rid, req.uid, event_type="decode")
 
     def finished_prefill (self, batch: "ScheduleBatch"):
         for req in batch.reqs:
+            TIMELINE_WRITER.mark_request_event(req.rid, req.uid, event_type="prefill")
             TIMELINE_WRITER.mark_prefill_done(req.rid, req.uid)
     
     def process_new_request (self, req: "Req"):
         TIMELINE_WRITER.mark_queue_enter(req.rid, req.uid)
     
-    def start_of_pass (self, running_batch: Optional["ScheduleBatch"], waiting_queue: List["Req"]):
-        pass
+    def start_of_pass(
+        self,
+        running_batch: Optional["ScheduleBatch"],
+        waiting_queue: List["Req"],
+        *,
+        new_token_ratio: float = 0.0,
+        max_running_requests: Optional[int] = None,
+    ):
+        self._pass_running_batch = running_batch
+        self._pass_new_token_ratio = new_token_ratio
+        self._pass_max_running_requests = max_running_requests
     
     def mark_request_finished (self, req: "Req"):
         TIMELINE_WRITER.mark_completed(req.rid, req.uid)
@@ -185,6 +199,12 @@ class NoFairnessPolicy:
         decode_time_us: int = 20000,
     ) -> Tuple[bool, Optional[int]]:
         return False, None
+
+    def fairinf_overdue_decode_subset_rids(
+        self,
+        running_batch: Optional["ScheduleBatch"],
+    ) -> Optional[set[str]]:
+        return None
 
     def fairinf_force_prefill(
         self,

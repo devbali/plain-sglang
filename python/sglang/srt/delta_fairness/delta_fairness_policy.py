@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 CLIP_MAX_NEW_TOKENS = int(os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS", "4096"))
 DECODE_TIME_US = 20000
 PREFILL_TOKEN_PER_DECODE = 250
-DELTA_UNFAIR_PREFILL_PROTECTED_HEADROOM_FRACTION = 0.9
 
 # pragma: no cover - imported only for type checkers
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -50,6 +49,129 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             total += token_count - tree_cache.evictable_total_user_counters.get_tokens(user_id)
         return total
 
+    def _delta_reservation_size(self) -> int:
+        tree_cache = self.tree_cache
+        if tree_cache is None:
+            return 0
+        return int(
+            tree_cache.calculate_delta_fair_reservation_size(tree_cache.fairinf_delta_evictable)
+        )
+
+    def _estimated_decode_headroom_for_user(
+        self,
+        user_id: str,
+        *,
+        running_batch: Optional["ScheduleBatch"],
+    ) -> int:
+        if running_batch is None:
+            return 0
+        ratio = max(0.0, float(getattr(self, "_pass_new_token_ratio", 0.0)))
+        total = 0.0
+        for req in running_batch.reqs:
+            if req.uid != user_id:
+                continue
+            remaining = max(0, req.sampling_params.max_new_tokens - len(req.output_ids))
+            total += min(remaining, CLIP_MAX_NEW_TOKENS) * ratio
+        return int(total)
+
+    def _estimated_global_decode_headroom(
+        self,
+        *,
+        running_batch: Optional["ScheduleBatch"],
+    ) -> int:
+        if running_batch is None:
+            return 0
+        ratio = max(0.0, float(getattr(self, "_pass_new_token_ratio", 0.0)))
+        total = 0.0
+        for req in running_batch.reqs:
+            remaining = max(0, req.sampling_params.max_new_tokens - len(req.output_ids))
+            total += min(remaining, CLIP_MAX_NEW_TOKENS) * ratio
+        return int(total)
+
+    def _user_prefill_protected_tokens(
+        self,
+        user_id: str,
+        *,
+        running_batch: Optional["ScheduleBatch"],
+        pending_prefill_tokens: int = 0,
+    ) -> int:
+        tree_cache = self.tree_cache
+        assert tree_cache is not None
+
+        cached_total_tokens = tree_cache.total_user_counters.get_tokens(user_id)
+        cached_evictable_tokens = tree_cache.evictable_total_user_counters.get_tokens(user_id)
+        cached_unevictable_tokens = cached_total_tokens - cached_evictable_tokens
+
+        uncached_running_tokens = 0
+        if running_batch is not None and getattr(running_batch, "seq_lens", None) is not None:
+            seq_lens_cpu = running_batch.seq_lens.cpu().tolist()
+            for i, req in enumerate(running_batch.reqs):
+                if req.uid != user_id:
+                    continue
+                uncached_running_tokens += max(
+                    0, int(seq_lens_cpu[i]) - len(req.prefix_indices)
+                )
+
+        return cached_unevictable_tokens + uncached_running_tokens + pending_prefill_tokens
+
+    def _force_prefill_within_user_headroom(
+        self,
+        req: "Req",
+        *,
+        running_batch: Optional["ScheduleBatch"],
+        pending_prefill_tokens: int = 0,
+    ) -> bool:
+        tree_cache = self.tree_cache
+        if tree_cache is None or tree_cache.fairinf_max_per_user is None:
+            return True
+
+        protected_tokens = self._user_prefill_protected_tokens(
+            req.uid,
+            running_batch=running_batch,
+            pending_prefill_tokens=pending_prefill_tokens,
+        )
+        decode_headroom = self._estimated_decode_headroom_for_user(
+            req.uid,
+            running_batch=running_batch,
+        )
+        return (
+            protected_tokens + decode_headroom + req.extend_input_len
+            <= tree_cache.fairinf_max_per_user
+        )
+
+    def _used_reserved_and_unreserved(
+        self,
+        *,
+        running_batch: Optional["ScheduleBatch"],
+    ) -> tuple[int, int]:
+        tree_cache = self.tree_cache
+        assert tree_cache is not None
+
+        reservation_size = self._delta_reservation_size()
+        running_decode_headroom_by_user: Dict[str, int] = {}
+        if running_batch is not None:
+            ratio = max(0.0, float(getattr(self, "_pass_new_token_ratio", 0.0)))
+            for req in running_batch.reqs:
+                remaining = max(0, req.sampling_params.max_new_tokens - len(req.output_ids))
+                running_decode_headroom_by_user[req.uid] = running_decode_headroom_by_user.get(req.uid, 0) + int(
+                    min(remaining, CLIP_MAX_NEW_TOKENS) * ratio
+                )
+
+        used_reserved = 0
+        used_unreserved = 0
+        user_ids = {user_id for user_id, _ in tree_cache.total_user_counters} | set(
+            running_decode_headroom_by_user
+        )
+        for user_id in user_ids:
+            protected_tokens = (
+                tree_cache.total_user_counters.get_tokens(user_id)
+                - tree_cache.evictable_total_user_counters.get_tokens(user_id)
+            )
+            used = protected_tokens + running_decode_headroom_by_user.get(user_id, 0)
+            used_reserved += min(reservation_size, used)
+            used_unreserved += max(0, used - reservation_size)
+        return used_reserved, used_unreserved
+
     def _reject_unfair_prefill_due_to_global_headroom(
         self,
         req: Req,
@@ -64,18 +186,27 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         if total_capacity is None:
             return False
 
-        global_limit = max(
-            1, int(total_capacity * DELTA_UNFAIR_PREFILL_PROTECTED_HEADROOM_FRACTION)
+        used_reserved, used_unreserved = self._used_reserved_and_unreserved(
+            running_batch=getattr(self, "_pass_running_batch", None)
         )
-        global_protected_tokens = self._global_protected_tokens()
-        if global_protected_tokens < global_limit:
+        available_unreserved = max(0, int(total_capacity - used_reserved))
+        if used_unreserved < available_unreserved:
             return False
 
         user_protected_tokens = (
             tree_cache.total_user_counters.get_tokens(req.uid)
             - tree_cache.evictable_total_user_counters.get_tokens(req.uid)
         )
-        return user_protected_tokens + req.extend_input_len + extra_tokens > tree_cache.fairinf_max_per_user
+        user_decode_headroom = self._estimated_decode_headroom_for_user(
+            req.uid, running_batch=getattr(self, "_pass_running_batch", None)
+        )
+        return (
+            user_protected_tokens
+            + user_decode_headroom
+            + req.extend_input_len
+            + extra_tokens
+            > tree_cache.fairinf_max_per_user
+        )
 
     def uses_static_isolated_memory(self) -> bool:
         return False
@@ -310,17 +441,18 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             else:
                 fair_retractable.append(i)
 
-        # Within each fairness tier, prefer retracting the least-decoded requests first
-        # so repeatedly retracted requests stay localized instead of disturbing older ones.
+        # `retract_decode()` pops from the end of this list, so the end must contain
+        # the highest-priority requests to retract: unfair before fair, then larger
+        # prompts, then least-decoded requests.
         unfair_retractable.sort(
-            key=lambda i: (-len(batch.reqs[i].origin_input_ids), -len(batch.reqs[i].output_ids)),
+            key=lambda i: (-len(batch.reqs[i].origin_input_ids), len(batch.reqs[i].output_ids)),
             reverse=True,
         )
         fair_retractable.sort(
-            key=lambda i: (-len(batch.reqs[i].origin_input_ids), -len(batch.reqs[i].output_ids)),
+            key=lambda i: (-len(batch.reqs[i].origin_input_ids), len(batch.reqs[i].output_ids)),
             reverse=True,
         )
-        return unfair_retractable + fair_retractable
+        return fair_retractable + unfair_retractable
 
     def alloc_decode_output_slots(self, batch: "ScheduleBatch"):
         """
@@ -427,6 +559,10 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             running_batch=running_batch,
             this_user_len=len(this_users_extras),
             this_user_sum=extra_sum,
+        ) and self._force_prefill_within_user_headroom(
+            req,
+            running_batch=running_batch,
+            pending_prefill_tokens=extra_sum,
         ):
             if req.waiting_time_in_decodes + 1 >= prefill_wait_in_decodes:
                 return True
@@ -490,6 +626,67 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
 
         return self.delta_fairness_n < total / this_user_len
 
+    def debug_user_fairness_state(
+        self,
+        user_id: str,
+        *,
+        running_batch: Optional["ScheduleBatch"],
+        this_user_len: int = 0,
+        this_user_sum: int = 0,
+    ) -> Dict[str, object]:
+        result: Dict[str, object] = {
+            "user_id": user_id,
+            "delta_fairness_n": self.delta_fairness_n,
+            "max_running_requests": self.max_running_requests,
+            "this_user_len": this_user_len,
+            "this_user_sum": this_user_sum,
+            "running_count": this_user_len,
+            "running_limit": None,
+            "unevictable_used": None,
+            "unevictable_limit": None,
+            "is_fair": False,
+            "reason": "disabled_or_no_running_batch",
+        }
+
+        if not self.delta_fairness_n or running_batch is None:
+            return result
+
+        tree_cache = self.tree_cache
+        if tree_cache is not None:
+            total_tokens = tree_cache.total_user_counters.get_tokens(user_id)
+            evictable_tokens = tree_cache.evictable_total_user_counters.get_tokens(user_id)
+            unevictable_used = total_tokens - evictable_tokens + this_user_sum
+            unevictable_limit = tree_cache.calculate_delta_fair_reservation_size(
+                tree_cache.fairinf_delta_unevictable
+            )
+            result["unevictable_used"] = int(unevictable_used)
+            result["unevictable_limit"] = int(unevictable_limit)
+            if unevictable_used >= unevictable_limit:
+                result["reason"] = "unevictable_limit"
+                return result
+
+        total = self.max_running_requests
+        if total is None:
+            raise ValueError("Can not run delta fairness without max running requests parameter")
+
+        running_count = this_user_len
+        for running_req in running_batch.reqs:
+            if running_req.uid == user_id:
+                running_count += 1
+        result["running_count"] = int(running_count)
+        running_limit = int(total // max(int(self.delta_fairness_n), 1))
+        result["running_limit"] = running_limit
+
+        if running_count == 0:
+            result["is_fair"] = True
+            result["reason"] = "no_running_requests"
+            return result
+
+        is_fair = self.delta_fairness_n < total / running_count
+        result["is_fair"] = bool(is_fair)
+        result["reason"] = "ok" if is_fair else "running_limit"
+        return result
+
     def req_is_fair_prefill(
         self,
         req: "Req",
@@ -535,6 +732,7 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         delta_fairness_deltas_microseconds: Optional[Dict[str, int]] = None,
         max_input_size: Optional[int] = None,
         prefix_computed: bool = False,
+        max_running_requests: Optional[int] = None,
     ) -> Tuple[int, Optional[List["Req"]]]:
         """ 
         Make space for the forced prefill requests
@@ -567,6 +765,37 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             )
             extra_space += total_tokens
             sz = new_sz = token_to_kv_pool.available_size() + tree_cache.evictable_size()
+            if (
+                running_batch is not None
+                and max_running_requests is not None
+                and running_batch.batch_size() + len(adder.can_run_list) >= max_running_requests
+            ):
+                slots_needed = (
+                    running_batch.batch_size() + len(adder.can_run_list) - max_running_requests + 1
+                )
+                try:
+                    last_evicted, _ = running_batch.retract_decode_for_slots(slots_needed)
+                except RuntimeError as exc:
+                    if "Delta fairness retraction blocked" in str(exc):
+                        logger.info(
+                            "Forced prefill skipped for uid=%s rid=%s: %s",
+                            req.uid,
+                            req.rid,
+                            exc,
+                        )
+                        last_evicted = []
+                    else:
+                        raise
+                if not last_evicted:
+                    logger.info(
+                        "Unable to retract decode requests for forced reservation slots; "
+                        "skipping forced prefill for uid=%s rid=%s.",
+                        req.uid,
+                        req.rid,
+                    )
+                    continue
+                waiting_queue.extend(last_evicted)
+                sz = new_sz = token_to_kv_pool.available_size() + tree_cache.evictable_size()
             while adder.rem_total_tokens < total_tokens:
                 if running_batch is None:
                     raise RuntimeError(
@@ -622,10 +851,43 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
                 extra_tokens=extra_for_user,
             )
             if res == "rejected":
-                raise RuntimeError("Fair reservation request rejected unexpectedly.")
+                logger.info(
+                    "Forced prefill skipped for uid=%s rid=%s: "
+                    "init_next_round_input rejected after reservation checks.",
+                    req.uid,
+                    req.rid,
+                )
+                continue
 
             if max_input_size is not None:
                 remaining_input_budget = max(0, max_input_size - adder.log_input_tokens)
+                while req.extend_input_len > remaining_input_budget:
+                    if running_batch is None:
+                        break
+                    try:
+                        last_evicted, _ = running_batch.retract_decode(
+                            req.extend_input_len - remaining_input_budget
+                        )
+                    except RuntimeError as exc:
+                        if "Delta fairness retraction blocked" in str(exc):
+                            logger.info(
+                                "Forced prefill skipped for uid=%s rid=%s: %s",
+                                req.uid,
+                                req.rid,
+                                exc,
+                            )
+                            last_evicted = []
+                        else:
+                            raise
+                    if not last_evicted:
+                        break
+                    waiting_queue.extend(last_evicted)
+                    new_sz = token_to_kv_pool.available_size() + tree_cache.evictable_size()
+                    adder.expand_capacity(new_sz - sz)
+                    sz = new_sz
+                    remaining_input_budget = max(
+                        0, max_input_size - adder.log_input_tokens
+                    )
                 if req.extend_input_len > remaining_input_budget:
                     logger.info(
                         "Forced prefill skipped for uid=%s rid=%s: "
@@ -640,7 +902,14 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             user_tokens.append(req.extend_input_len)
             add_res = adder.add_one_req(req, sum(user_tokens))
             if add_res == "rejected":
-                raise RuntimeError("Fair reservation request rejected unexpectedly.")
+                user_tokens.pop()
+                logger.info(
+                    "Forced prefill skipped for uid=%s rid=%s: "
+                    "adder rejected after reservation checks.",
+                    req.uid,
+                    req.rid,
+                )
+                continue
 
         if extra_space > 0 and last_evicted:
             logger.info(

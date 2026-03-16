@@ -280,29 +280,43 @@ class RadixCache(BasePrefixCache):
         )
 
     def calculate_delta_fair_reservation_size (self, time_microseconds):
+        # Delta-fair KV reservation model:
+        # - Start from one user's fair-share KV budget (`fairinf_max_per_user`).
+        # - Interpret `time_microseconds` as the amount of recomputation time we are willing
+        #   to tolerate for the *unreserved* portion of that fair share.
+        # - We estimate that recomputation time using a single prefill (`batch_length=1`)
+        #   over `recomputable` KV tokens.
+        # - Reservation is then:
+        #     reservation = fair_share - recomputable_within_delta
+        #
+        # Consequences:
+        # - Larger delta means less reservation.
+        # - `delta = 0` means reserve the whole fair share.
+        # - If delta is at least the single-prefill time for the entire fair share,
+        #   reservation becomes zero.
         if self.fairinf_max_per_user is None:
             return 0
 
         target_seconds = max(0.0, float(time_microseconds) / 1_000_000.0)
-        upper_bound = min(int(self.fairinf_max_per_user * 0.9), int(self.fairinf_max_per_user))
-        if upper_bound <= 0:
+        fair_share = int(self.fairinf_max_per_user)
+        if fair_share <= 0:
             return 0
         if target_seconds <= 0.0:
-            return upper_bound
+            return fair_share
 
         lo = 0
-        hi = upper_bound
-        best = 0
+        hi = fair_share
+        recomputable = 0
         while lo <= hi:
             mid = (lo + hi) // 2
             estimated_seconds = self._estimate_pooled_prefill_worst_case_seconds(mid)
             if estimated_seconds <= target_seconds:
-                best = mid
+                recomputable = mid
                 lo = mid + 1
             else:
                 hi = mid - 1
 
-        return max(0, best)
+        return max(0, fair_share - recomputable)
 
     def calculate_real_expandable_size_for_user_fairinf (self, user_id, fair_users, self_unfair=False):
         # Exclude reservations for others

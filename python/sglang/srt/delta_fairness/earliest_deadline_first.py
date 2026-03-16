@@ -21,6 +21,7 @@ if False:  # pragma: no cover - imported only for type checkers
     from sglang.srt.managers.policy_scheduler import PrefillAdder
 
 import time
+from sglang.srt.request_timeline import TIMELINE_WRITER
 
 class Event  ():
     def __init__ (self, duration=None, end_timestamp=None):
@@ -109,7 +110,7 @@ class RequestTimeline ():
 
 USER_CONFIG = {
     "max_prefill_tokens": 4096,
-    "max_running_batch": 56
+    "max_running_batch": 256,
 }
 
 class UserTimeline ():
@@ -148,7 +149,11 @@ class UserTimeline ():
         
         if start_time is None:
             return None # no waiting requests to schedule, and nothing has been done so far
-        
+
+        remaining_slots = USER_CONFIG["max_running_batch"] - len(self.active_request_timelines)
+        if remaining_slots <= 0:
+            return start_time
+
         batch = []
         batch_size = 0
         get_prompt_tokens = lambda tracked_req: len(tracked_req.req.origin_input_ids)
@@ -160,10 +165,15 @@ class UserTimeline ():
             
             if batch_size + get_prompt_tokens(tracked_req) > USER_CONFIG["max_prefill_tokens"]:
                 continue
+
+            if len(batch) >= remaining_slots:
+                break
             
             batch.append(tracked_req)
             batch_size += get_prompt_tokens(tracked_req)
-        
+        if not batch:
+            return start_time
+
         batch_duration = ISOLATED_PREFILL_TIME_ESTIMATION(batch_size, max(get_prompt_tokens(tracked_req) for tracked_req in batch), len(batch))
         batch_end_time = start_time + batch_duration
 
@@ -257,7 +267,10 @@ class UserTimeline ():
             start_time = last_event.end_timestamp
         
         while start_time is not None and start_time < timestamp:
-            if len(self.waiting_request_timelines) > 0:
+            if (
+                len(self.waiting_request_timelines) > 0
+                and len(self.active_request_timelines) < USER_CONFIG["max_running_batch"]
+            ):
                 # schedule a prefill batch
                 start_time = self.schedule_prefill(start_time)
             elif len(self.active_request_timelines) > 0:
@@ -353,9 +366,11 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
 
     
     def finished_decode (self, batch: "ScheduleBatch"):
+        super().finished_decode(batch)
         self.event_queue.finished_decode(batch)
 
     def finished_prefill (self, batch: "ScheduleBatch"):
+        super().finished_prefill(batch)
         self.event_queue.finished_prefill(batch)
     
     def mark_request_finished (self, req):
@@ -373,7 +388,16 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
     
     # todo implement more
     def __init__(self, *args, **kwargs):
-        self._edf_quanta_us = int(kwargs.pop("delta_fairness_quanta_us", 0) or 0)
+        self._edf_pooled_quanta_us = int(
+            kwargs.pop(
+                "delta_fairness_pooled_quanta_us",
+                kwargs.pop("delta_fairness_quanta_us", 0),
+            )
+            or 0
+        )
+        self._edf_exclusive_quanta_us = int(
+            kwargs.pop("delta_fairness_exclusive_quanta_us", 0) or 0
+        )
         runtime_max_prefill_tokens = kwargs.pop("max_prefill_tokens", None)
         runtime_max_running_batch = kwargs.get("max_running_requests", None)
         super().__init__(*args, **kwargs)
@@ -389,7 +413,8 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
         if runtime_max_prefill_tokens is not None:
             USER_CONFIG["max_prefill_tokens"] = int(runtime_max_prefill_tokens)
         if runtime_max_running_batch is not None:
-            USER_CONFIG["max_running_batch"] = int(runtime_max_running_batch)
+            per_user_running_batch = max(1, int(runtime_max_running_batch) // max(int(self.delta_fairness_n or 1), 1))
+            USER_CONFIG["max_running_batch"] = per_user_running_batch
         self._patch_timeline_helpers()
 
     def fairinf_prioritize_force_prefill(self):
@@ -410,10 +435,13 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
     def _earliest_within_quanta(self) -> bool:
         if self._edf_earliest is None:
             return False
-        if self._edf_quanta_us <= 0:
+        if self._edf_pooled_quanta_us <= 0:
             return True
         deadline, _, _ = self._edf_earliest
-        return (deadline - time.time()) <= (self._edf_quanta_us / 1_000_000.0)
+        return (deadline - time.time()) <= (self._edf_pooled_quanta_us / 1_000_000.0)
+
+    def _within_exclusive_quanta(self, deadline: float) -> bool:
+        return (deadline - time.time()) <= (self._edf_exclusive_quanta_us / 1_000_000.0)
 
     def _write_fairinf_log(self, phase: str, action: str, note: str):
         if not self._fairinf_log_this_pass:
@@ -449,6 +477,31 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
                     ]
                 )
             writer.writerow(row)
+
+    def _format_fairness_snapshot(
+        self,
+        running_batch: Optional["ScheduleBatch"],
+        waiting_queue: List["Req"],
+    ) -> str:
+        user_ids = sorted(
+            {
+                str(req.uid)
+                for req in (running_batch.reqs if running_batch is not None else [])
+            }
+            | {str(req.uid) for req in waiting_queue}
+        )
+        parts = []
+        for uid in user_ids:
+            state = self.debug_user_fairness_state(uid, running_batch=running_batch)
+            parts.append(
+                (
+                    f"{uid}:fair={int(bool(state['is_fair']))}:"
+                    f"reason={state['reason']}:"
+                    f"unevictable={state['unevictable_used']}/{state['unevictable_limit']}:"
+                    f"running={state['running_count']}/{state['running_limit']}"
+                )
+            )
+        return "|".join(parts)
 
     def _patch_timeline_helpers(self):
         # Patch buggy helper methods in this module at runtime so EDF can rely on
@@ -500,6 +553,12 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             if start_time is None:
                 return None
 
+            remaining_slots = USER_CONFIG["max_running_batch"] - len(
+                self_ut.active_request_timelines
+            )
+            if remaining_slots <= 0:
+                return start_time
+
             batch, batch_size, next_start_time = [], 0, None
             for tracked_req in reqs:
                 tracked_start_time = tracked_req.most_recent_event().end_timestamp
@@ -512,11 +571,13 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
                 ), "Request has more prompt tokens than the user max prefill tokens, cannot schedule"
                 if batch_size + prompt_tokens > USER_CONFIG["max_prefill_tokens"]:
                     continue
+                if len(batch) >= remaining_slots:
+                    break
                 batch.append(tracked_req)
                 batch_size += prompt_tokens
 
             if not batch:
-                return next_start_time
+                return start_time if remaining_slots <= 0 else next_start_time
 
             batch_duration = ISOLATED_PREFILL_TIME_ESTIMATION(
                 batch_size,
@@ -548,12 +609,19 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             for rid, tracked_req in self_ut.active_request_timelines.items():
                 most_recent = tracked_req.most_recent_event()
                 real_decode = req_id_decodes.get(rid, 0)
+                req_token_count = len(
+                    tracked_req.req.fill_ids
+                    if tracked_req.req.fill_ids is not None
+                    else (tracked_req.req.origin_input_ids + tracked_req.req.output_ids)
+                )
                 if real_decode == 0:
-                    batch.append((rid, 1, len(tracked_req.req.fill_ids)))
+                    batch.append((rid, 1, req_token_count))
                     continue
-                assert isinstance(most_recent, RequestDecodeEvent)
+                if not isinstance(most_recent, RequestDecodeEvent):
+                    batch.append((rid, real_decode + 1, req_token_count))
+                    continue
                 anticipated = anticipated or most_recent.completion_number > real_decode
-                batch.append((rid, most_recent.completion_number + 1, len(tracked_req.req.fill_ids)))
+                batch.append((rid, most_recent.completion_number + 1, req_token_count))
 
             if not batch:
                 return None
@@ -590,11 +658,124 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             self_ut.schedule_decode(batch_end_time, req_id_real_statuses, anticipated=True)
             return batch_end_time
 
+        def _next_prefill_end_time(self_ut: "UserTimeline", start_time=None):
+            reqs = sorted(
+                self_ut.waiting_request_timelines.values(),
+                key=lambda tracked_req: tracked_req.most_recent_event().end_timestamp,
+            )
+            if start_time is None and reqs:
+                start_time = reqs[0].most_recent_event().end_timestamp
+            if start_time is None:
+                return None
+
+            remaining_slots = USER_CONFIG["max_running_batch"] - len(
+                self_ut.active_request_timelines
+            )
+            if remaining_slots <= 0:
+                return None
+
+            batch = []
+            batch_size = 0
+            for tracked_req in reqs:
+                tracked_start_time = tracked_req.most_recent_event().end_timestamp
+                if tracked_start_time > start_time:
+                    break
+                prompt_tokens = len(tracked_req.req.origin_input_ids)
+                if prompt_tokens > USER_CONFIG["max_prefill_tokens"]:
+                    continue
+                if batch_size + prompt_tokens > USER_CONFIG["max_prefill_tokens"]:
+                    continue
+                if len(batch) >= remaining_slots:
+                    break
+                batch.append(tracked_req)
+                batch_size += prompt_tokens
+
+            if not batch:
+                return None
+
+            batch_duration = ISOLATED_PREFILL_TIME_ESTIMATION(
+                batch_size,
+                max(len(tracked_req.req.origin_input_ids) for tracked_req in batch),
+                len(batch),
+            )
+            return start_time + batch_duration
+
+        def _next_decode_end_time(self_ut: "UserTimeline", start_time, req_id_real_statuses):
+            if len(self_ut.active_request_timelines) == 0:
+                return None
+
+            req_id_decodes = {
+                rid: (event.completion_number if isinstance(event, RequestDecodeEvent) else 0)
+                for rid, event in req_id_real_statuses.items()
+            }
+            batch = []
+            for rid, tracked_req in self_ut.active_request_timelines.items():
+                req_token_count = len(
+                    tracked_req.req.fill_ids
+                    if tracked_req.req.fill_ids is not None
+                    else (tracked_req.req.origin_input_ids + tracked_req.req.output_ids)
+                )
+                real_decode = req_id_decodes.get(rid, 0)
+                if real_decode == 0:
+                    batch.append((rid, 1, req_token_count))
+                    continue
+
+                most_recent = tracked_req.most_recent_event()
+                if isinstance(most_recent, RequestDecodeEvent):
+                    completion_number = max(
+                        getattr(most_recent, "completion_number", 0) + 1,
+                        real_decode + 1,
+                    )
+                else:
+                    completion_number = real_decode + 1
+                batch.append((rid, completion_number, req_token_count))
+
+            if not batch:
+                return None
+
+            batch_duration = ISOLATED_DECODE_TIME_ESTIMATION(
+                sum(num_tokens for _, _, num_tokens in batch),
+                max(num_tokens for _, _, num_tokens in batch),
+                len(batch),
+            )
+            return start_time + batch_duration
+
+        def _complete_upto_time(self_ut: "UserTimeline", timestamp, req_id_real_statuses):
+            if len(self_ut.history) == 0:
+                waiting_reqs = sorted(
+                    self_ut.waiting_request_timelines.values(),
+                    key=lambda tracked_req: tracked_req.most_recent_event().end_timestamp,
+                )
+                start_time = (
+                    waiting_reqs[0].most_recent_event().end_timestamp if waiting_reqs else None
+                )
+            else:
+                start_time = self_ut.history[-1].end_timestamp
+
+            while start_time is not None and start_time < timestamp:
+                next_prefill_end = _next_prefill_end_time(self_ut, start_time)
+                next_decode_end = _next_decode_end_time(self_ut, start_time, req_id_real_statuses)
+
+                if next_prefill_end is None and next_decode_end is None:
+                    break
+                if next_decode_end is None:
+                    start_time = self_ut.schedule_prefill(start_time)
+                    continue
+                if next_prefill_end is None:
+                    start_time = self_ut.schedule_decode(start_time, req_id_real_statuses)
+                    continue
+
+                if next_decode_end <= next_prefill_end:
+                    start_time = self_ut.schedule_decode(start_time, req_id_real_statuses)
+                else:
+                    start_time = self_ut.schedule_prefill(start_time)
+
         RequestPrefillEvent.is_logically_after = _prefill_after
         RequestDecodeEvent.is_logically_after = _decode_after
         RequestTimeline.prune_till_after_event = _prune_after
         UserTimeline.schedule_prefill = _schedule_prefill
         UserTimeline.schedule_decode = _schedule_decode
+        UserTimeline.complete_upto_time = _complete_upto_time
         RequestTimeline._edf_patch_applied = True
 
     def _read_deltas(self, delta_fairness_deltas_microseconds: Optional[Dict[str, int]]):
@@ -795,7 +976,7 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             self._write_fairinf_log(
                 "force_decision",
                 "no_force_prefill",
-                f"nearest deadline not within quanta_us={self._edf_quanta_us}",
+                f"nearest deadline not within pooled_quanta_us={self._edf_pooled_quanta_us}",
             )
             return False
 
@@ -825,7 +1006,7 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             self._write_fairinf_log(
                 "force_decision",
                 "no_force_decode",
-                f"nearest deadline not within quanta_us={self._edf_quanta_us}",
+                f"nearest deadline not within pooled_quanta_us={self._edf_pooled_quanta_us}",
             )
             return False, None
         if self._edf_earliest is not None and self._edf_earliest[1] == "decode":
@@ -843,6 +1024,36 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
         )
         return False, None
 
+    def fairinf_overdue_decode_subset_rids(
+        self,
+        running_batch: Optional["ScheduleBatch"],
+    ) -> Optional[set[str]]:
+        if (
+            running_batch is None
+            or self._edf_earliest is None
+            or self._edf_earliest[1] != "decode"
+        ):
+            return None
+
+        earliest_deadline, _, _ = self._edf_earliest
+        if not self._within_exclusive_quanta(earliest_deadline):
+            return None
+
+        overdue_decode_uids = {
+            req.uid
+            for deadline, event_type, req in self._edf_deadline_queue
+            if event_type == "decode" and self._within_exclusive_quanta(deadline)
+        }
+        if not overdue_decode_uids:
+            return None
+
+        selected_rids = {
+            req.rid
+            for req in running_batch.reqs
+            if req.uid in overdue_decode_uids
+        }
+        return selected_rids or None
+
     def sorted_waiting_queue(self, waiting_queue: List["Req"]):
         # For forced prefill, prioritize waiting requests with earliest prefill deadlines.
         indexed = list(enumerate(waiting_queue))
@@ -853,6 +1064,15 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
                 x[0],
             )
         )
+        overdue = [
+            req
+            for _, req in indexed
+            if self._within_exclusive_quanta(
+                self._edf_waiting_prefill_deadline_by_rid.get(req.rid, float("inf"))
+            )
+        ]
+        if overdue:
+            return overdue
         return [x[1] for x in indexed]
 
     def _ensure_tracked_request(self, req: "Req") -> "TrackedRequest":
@@ -891,7 +1111,11 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
                 RequestPrefillEvent(tracked.req.rid, 0, event_ts)
             ]
             return
-        completion_number = len(tracked.req.output_ids)
+        completion_number = 0
+        if isinstance(real_e, RequestDecodeEvent):
+            completion_number = getattr(real_e, "completion_number", 0) or 0
+        else:
+            completion_number = len(tracked.req.output_ids)
         if completion_number > 0:
             tracked.alternate_history_timeline.history = [
                 RequestDecodeEvent(completion_number, tracked.req.rid, 0, event_ts)
@@ -931,8 +1155,20 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             self._seed_request_tracking(tracked, user_timeline, now, waiting=waiting)
         other.pop(req.rid, None)
         target[req.rid] = tracked
+        real_e = self.event_queue.most_recent_event_real.get(req.rid)
         if waiting:
-            self.event_queue.most_recent_event_real[req.rid] = RequestStartEvent(req.rid, 0, now)
+            # Preserve the original waiting-start timestamp while a request remains queued.
+            # Resetting it every sync pass keeps pushing the prefill deadline forward and
+            # prevents fair waiting requests from ever becoming force-prefill candidates.
+            if not isinstance(real_e, RequestStartEvent):
+                self.event_queue.most_recent_event_real[req.rid] = RequestStartEvent(req.rid, 0, now)
+        elif isinstance(real_e, RequestDecodeEvent):
+            self.event_queue.most_recent_event_real[req.rid] = RequestDecodeEvent(
+                getattr(real_e, "completion_number", len(req.output_ids)),
+                req.rid,
+                0,
+                now,
+            )
         elif len(req.output_ids) > 0:
             self.event_queue.most_recent_event_real[req.rid] = RequestDecodeEvent(
                 len(req.output_ids), req.rid, 0, now
@@ -1001,7 +1237,14 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
 
         return fair_users
 
-    def start_of_pass(self, running_batch, waiting_queue):
+    def start_of_pass(
+        self,
+        running_batch,
+        waiting_queue,
+        *,
+        new_token_ratio: float = 0.0,
+        max_running_requests=None,
+    ):
         # Keep event queue internals updated without relying on the buggy pre-TODO version.
         self._fairinf_pass_id += 1
         fair_users = self._sync_fair_user_tracking(running_batch, waiting_queue)
@@ -1023,7 +1266,10 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
         self._write_fairinf_log(
             "start_of_pass",
             "pass_begin",
-            f"fair_users={len(fair_users)},tracked_reqs={len(self.event_queue.requests)}",
+            (
+                f"fair_users={len(fair_users)},tracked_reqs={len(self.event_queue.requests)},"
+                f"fairness_snapshot={self._format_fairness_snapshot(running_batch, waiting_queue)}"
+            ),
         )
 
     def process_new_request (self, req: "Req"):
@@ -1039,9 +1285,51 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             req.rid, 0, time.time()
         )
 
+    def _mark_violation_if_executed_after_deadline(
+        self,
+        req: "Req",
+        *,
+        event_type: str,
+        completion_number: Optional[int] = None,
+        now: Optional[float] = None,
+    ) -> None:
+        tracked = self.event_queue.requests.get(req.rid)
+        real_e = self.event_queue.most_recent_event_real.get(req.rid)
+        if tracked is None or real_e is None:
+            return
+
+        now_ts = time.time() if now is None else now
+        try:
+            upcoming_events = tracked.earliest_events_after_real_time(real_e) or []
+        except Exception:
+            return
+
+        matched_event = None
+        for event in upcoming_events:
+            if event_type == "prefill" and isinstance(event, RequestPrefillEvent):
+                matched_event = event
+                break
+            if event_type == "decode" and isinstance(event, RequestDecodeEvent):
+                if completion_number is None or event.completion_number == completion_number:
+                    matched_event = event
+                    break
+
+        if matched_event is None:
+            return
+
+        deadline = matched_event.end_timestamp + self._event_delta_seconds(tracked, matched_event)
+        if now_ts > deadline:
+            TIMELINE_WRITER.mark_delta_violation(req.rid, req.uid, event_type=event_type)
+
     def finished_prefill (self, batch: "ScheduleBatch"):
+        super().finished_prefill(batch)
         for req in batch.reqs:
             now = time.time()
+            self._mark_violation_if_executed_after_deadline(
+                req,
+                event_type="prefill",
+                now=now,
+            )
             tracked = self.event_queue.requests.get(req.rid)
             if tracked is not None:
                 tracked.alternate_history_timeline.history.append(
@@ -1053,9 +1341,16 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             self.event_queue.most_recent_event_real[req.rid] = RequestPrefillEvent(req.rid, 0, now)
 
     def finished_decode (self, batch: "ScheduleBatch"):
+        super().finished_decode(batch)
         for req in batch.reqs:
             now = time.time()
             completion_number = len(req.output_ids)
+            self._mark_violation_if_executed_after_deadline(
+                req,
+                event_type="decode",
+                completion_number=completion_number,
+                now=now,
+            )
             tracked = self.event_queue.requests.get(req.rid)
             if tracked is not None:
                 tracked.alternate_history_timeline.history.append(
@@ -1069,5 +1364,6 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             )
 
     def mark_request_finished (self, req):
+        super().mark_request_finished(req)
         self.event_queue.requests.pop(req.rid, None)
         self.event_queue.most_recent_event_real.pop(req.rid, None)

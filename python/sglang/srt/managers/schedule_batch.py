@@ -645,6 +645,70 @@ class ScheduleBatch:
 
         return retracted_reqs, new_estimate_ratio
 
+    def retract_decode_for_slots(self, required_slots: int = 1):
+        if required_slots <= 0:
+            return [], 1.0
+
+        sorted_indices = self.fairness_policy.get_retract_order(self)
+        if len(sorted_indices) == 0:
+            raise RuntimeError(
+                "Delta fairness retraction blocked: no retractable decode requests "
+                "without evicting fair clients."
+            )
+
+        retracted_reqs = []
+        seq_lens_cpu = self.seq_lens.cpu().numpy()
+        slots_to_free = required_slots
+
+        while slots_to_free > 0 and len(sorted_indices) > 0:
+            if len(sorted_indices) == 1 and len(self.reqs) <= 1:
+                break
+
+            idx = sorted_indices.pop()
+            req = self.reqs[idx]
+            retracted_reqs.append(req)
+            slots_to_free -= 1
+            TIMELINE_WRITER.mark_running_batch_removed(req.rid, req.uid)
+
+            if isinstance(self.tree_cache, ChunkCache):
+                token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                    : seq_lens_cpu[idx]
+                ]
+                self.token_to_kv_pool.free(token_indices)
+                self.req_to_token_pool.free(req.req_pool_idx)
+                del self.tree_cache.entries[req.rid]
+            else:
+                last_uncached_pos = len(req.prefix_indices)
+                token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                    last_uncached_pos : seq_lens_cpu[idx]
+                ]
+                self.token_to_kv_pool.free(token_indices)
+                self.req_to_token_pool.free(req.req_pool_idx)
+                self.tree_cache.dec_lock_ref(req.last_node)
+
+            req.prefix_indices = []
+            req.last_node = None
+            req.extend_input_len = 0
+            req.last_update_decode_tokens = 0
+            req.logprob_start_len = 10**9
+
+        if not retracted_reqs:
+            return retracted_reqs, 1.0
+
+        keep_indices = [i for i in sorted_indices]
+        self.filter_batch(keep_indices)
+
+        total_decoded_tokens = sum(len(r.output_ids) for r in self.reqs)
+        total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in self.reqs)
+        if total_max_new_tokens <= 0:
+            return retracted_reqs, 1.0
+
+        new_estimate_ratio = (
+            total_decoded_tokens + global_config.retract_decode_steps * len(self.reqs)
+        ) / total_max_new_tokens
+        new_estimate_ratio = min(1.0, new_estimate_ratio)
+        return retracted_reqs, new_estimate_ratio
+
     def check_for_jump_forward(self, model_runner):
         jump_forward_reqs = []
         filter_indices = [i for i in range(len(self.reqs))]
@@ -720,6 +784,8 @@ class ScheduleBatch:
         return jump_forward_reqs
 
     def prepare_for_decode(self, input_ids=None):
+        decode_prepare_breakdown = {}
+        step_start = time.perf_counter()
         if input_ids is None:
             input_ids = [
                 r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]
@@ -727,18 +793,38 @@ class ScheduleBatch:
             ]
         else:
             self.sampling_info.penalizer_orchestrator.cumulate_input_tokens(input_ids)
+        decode_prepare_breakdown["build_input_ids_ms"] = (
+            time.perf_counter() - step_start
+        ) * 1000.0
 
+        step_start = time.perf_counter()
         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
         self.seq_lens.add_(1)
+        decode_prepare_breakdown["input_tensor_and_seq_lens_ms"] = (
+            time.perf_counter() - step_start
+        ) * 1000.0
 
         # Alloc mem
+        step_start = time.perf_counter()
         self.out_cache_loc = self.fairness_policy.alloc_decode_output_slots(self)
+        decode_prepare_breakdown["alloc_decode_output_slots_ms"] = (
+            time.perf_counter() - step_start
+        ) * 1000.0
 
+        step_start = time.perf_counter()
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
+        decode_prepare_breakdown["write_req_to_token_ms"] = (
+            time.perf_counter() - step_start
+        ) * 1000.0
 
+        step_start = time.perf_counter()
         self.sampling_info.update_regex_vocab_mask(self)
+        decode_prepare_breakdown["update_regex_vocab_mask_ms"] = (
+            time.perf_counter() - step_start
+        ) * 1000.0
+        self.decode_prepare_breakdown = decode_prepare_breakdown
 
     def filter_batch(self, unfinished_indices: List[int]):
         if unfinished_indices is None or len(unfinished_indices) == 0:
@@ -761,6 +847,25 @@ class ScheduleBatch:
         self.return_logprob = any(req.return_logprob for req in self.reqs)
 
         self.sampling_info.filter(unfinished_indices, new_indices)
+
+    def reorder_batch(self, indices: List[int]):
+        if indices is None or len(indices) == 0:
+            self.reqs = []
+            return
+
+        if len(indices) != len(self.reqs):
+            raise ValueError("reorder_batch requires a permutation of the whole batch")
+
+        self.reqs = [self.reqs[i] for i in indices]
+        new_indices = torch.tensor(indices, dtype=torch.int32, device="cuda")
+        self.seq_lens = self.seq_lens[new_indices]
+        self.input_ids = None
+        self.req_pool_indices = self.req_pool_indices[new_indices]
+        self.position_ids_offsets = self.position_ids_offsets[new_indices]
+        self.out_cache_loc = None
+        self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in indices]
+        self.return_logprob = any(req.return_logprob for req in self.reqs)
+        self.sampling_info.filter(indices, new_indices)
 
     def merge(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because

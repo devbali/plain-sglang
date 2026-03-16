@@ -3,13 +3,14 @@ from __future__ import annotations
 """Fairness helpers for static per-user KV cache reservations."""
 
 import logging
+import os
 from collections import Counter
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .no_fairness_policy import NoFairnessPolicy
 
 logger = logging.getLogger(__name__)
-PREFILL_PROTECTED_HEADROOM_FRACTION = 0.9
+CLIP_MAX_NEW_TOKENS = int(os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS", "4096"))
 
 if False:  # pragma: no cover - imported only for type checkers
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -152,11 +153,41 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         )
         return protected_tokens + req.extend_input_len <= tree_cache.static_max_per_user
 
-    def _static_prefill_headroom_limit(self) -> Optional[int]:
+    def _estimated_decode_headroom_for_user(
+        self,
+        user_id: str,
+        *,
+        running_batch: Optional["ScheduleBatch"],
+    ) -> int:
+        if running_batch is None:
+            return 0
+        ratio = max(0.0, float(getattr(self, "_pass_new_token_ratio", 0.0)))
+        total = 0.0
+        for req in running_batch.reqs:
+            if req.uid != user_id:
+                continue
+            remaining = max(0, req.sampling_params.max_new_tokens - len(req.output_ids))
+            total += min(remaining, CLIP_MAX_NEW_TOKENS) * ratio
+        return int(total)
+
+    def _static_prefill_headroom_limit(
+        self,
+        user_id: str,
+        *,
+        running_batch: Optional["ScheduleBatch"],
+    ) -> Optional[int]:
         tree_cache = self.tree_cache
         if tree_cache is None or tree_cache.static_max_per_user is None:
             return None
-        return max(1, int(tree_cache.static_max_per_user * PREFILL_PROTECTED_HEADROOM_FRACTION))
+        return max(
+            1,
+            int(
+                tree_cache.static_max_per_user
+                - self._estimated_decode_headroom_for_user(
+                    user_id, running_batch=running_batch
+                )
+            ),
+        )
 
     def _reject_due_to_static_prefill_headroom(
         self,
@@ -164,7 +195,10 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         *,
         extra_tokens: int = 0,
     ) -> bool:
-        headroom_limit = self._static_prefill_headroom_limit()
+        headroom_limit = self._static_prefill_headroom_limit(
+            req.uid,
+            running_batch=getattr(self, "_pass_running_batch", None),
+        )
         if headroom_limit is None:
             return False
 
@@ -499,11 +533,11 @@ class StaticFairnessPolicy(NoFairnessPolicy):
             violating_indices = list(range(len(batch.reqs)))
             violating_indices.sort(
                 key=lambda i: (
-                    usage_and_slack[batch.reqs[i].uid][1],
-                    usage_and_slack[batch.reqs[i].uid][0],
-                    -usage_and_slack[batch.reqs[i].uid][2],
+                    -usage_and_slack[batch.reqs[i].uid][1],
+                    -usage_and_slack[batch.reqs[i].uid][0],
+                    usage_and_slack[batch.reqs[i].uid][2],
                     -len(batch.reqs[i].origin_input_ids),
-                    -len(batch.reqs[i].output_ids),
+                    len(batch.reqs[i].output_ids),
                 ),
                 reverse=True,
             )
@@ -511,9 +545,9 @@ class StaticFairnessPolicy(NoFairnessPolicy):
 
         violating_indices.sort(
             key=lambda i: (
-                overages[batch.reqs[i].uid],
+                -overages[batch.reqs[i].uid],
                 -len(batch.reqs[i].origin_input_ids),
-                -len(batch.reqs[i].output_ids),
+                len(batch.reqs[i].output_ids),
             ),
             reverse=True,
         )
