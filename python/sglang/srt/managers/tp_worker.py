@@ -473,8 +473,12 @@ class ModelTpServer:
                 self.running_batch.delta_fairness_n = self.delta_fairness_n
                 # Run a few decode batches continuously for reducing overhead
                 for _ in range(global_config.num_continue_decode_steps):
-                    selected_rids = self.fairness_policy.fairinf_overdue_decode_subset_rids(
-                        self.running_batch
+                    selected_rids = (
+                        self.fairness_policy.fairinf_overdue_decode_subset_rids(
+                            self.running_batch
+                        )
+                        if force_decode
+                        else None
                     )
                     for req in self.running_batch.reqs:
                         if selected_rids is None or req.rid in selected_rids:
@@ -1079,64 +1083,140 @@ class ModelTpServer:
         self.last_decode_step_breakdown = None
         decode_step_start = time.perf_counter()
         restore_state = None
-        if selected_rids:
+
+        def apply_restricted_decode_subset() -> Optional[dict]:
+            if not selected_rids:
+                return None
+
             selected_indices = [i for i, req in enumerate(batch.reqs) if req.rid in selected_rids]
-            if selected_indices and len(selected_indices) < len(batch.reqs):
-                deferred_indices = [i for i, req in enumerate(batch.reqs) if req.rid not in selected_rids]
-                batch.reorder_batch(selected_indices + deferred_indices)
-                selected_count = len(selected_indices)
-                restore_state = {
-                    "selected_count": selected_count,
-                    "deferred_reqs": list(batch.reqs[selected_count:]),
-                    "deferred_req_pool_indices": batch.req_pool_indices[selected_count:],
-                    "deferred_seq_lens": batch.seq_lens[selected_count:],
-                    "deferred_position_ids_offsets": batch.position_ids_offsets[selected_count:],
-                    "deferred_top_logprobs_nums": list(batch.top_logprobs_nums[selected_count:]),
-                    "full_sampling_attrs": {},
-                    "full_penalizer_attrs": {},
-                }
-                sampling_info = batch.sampling_info
-                for attr in [
-                    "temperatures",
-                    "top_ps",
-                    "top_ks",
-                    "min_ps",
-                    "logit_bias",
-                    "vocab_mask",
-                    "linear_penalties",
-                    "scaling_penalties",
-                ]:
-                    value = getattr(sampling_info, attr, None)
-                    restore_state["full_sampling_attrs"][attr] = value
-                    if value is not None and hasattr(value, "shape") and value.shape[0] == len(batch.reqs):
-                        setattr(sampling_info, attr, value[:selected_count])
-                for penalizer in sampling_info.penalizer_orchestrator.penalizers.values():
-                    attrs = {}
-                    for attr, value in list(vars(penalizer).items()):
-                        attrs[attr] = value
-                        if (
-                            isinstance(value, torch.Tensor)
-                            and value.ndim >= 1
-                            and value.shape[0] == len(batch.reqs)
-                        ):
-                            setattr(penalizer, attr, value[:selected_count])
-                    restore_state["full_penalizer_attrs"][id(penalizer)] = attrs
-                logger.info(
-                    "EDF restricted decode batch to overdue-user requests only. selected=%s deferred=%s",
-                    selected_count,
-                    len(deferred_indices),
-                )
-                batch.reqs = list(batch.reqs[:selected_count])
-                batch.req_pool_indices = batch.req_pool_indices[:selected_count]
-                batch.seq_lens = batch.seq_lens[:selected_count]
-                batch.position_ids_offsets = batch.position_ids_offsets[:selected_count]
-                batch.top_logprobs_nums = list(batch.top_logprobs_nums[:selected_count])
-                batch.return_logprob = any(req.return_logprob for req in batch.reqs)
-                batch.input_ids = None
-                batch.out_cache_loc = None
+            if not selected_indices or len(selected_indices) == len(batch.reqs):
+                return None
+
+            deferred_indices = [i for i, req in enumerate(batch.reqs) if req.rid not in selected_rids]
+            batch.reorder_batch(selected_indices + deferred_indices)
+            selected_count = len(selected_indices)
+            state = {
+                "selected_count": selected_count,
+                "deferred_reqs": list(batch.reqs[selected_count:]),
+                "deferred_req_pool_indices": batch.req_pool_indices[selected_count:],
+                "deferred_seq_lens": batch.seq_lens[selected_count:],
+                "deferred_position_ids_offsets": batch.position_ids_offsets[selected_count:],
+                "deferred_top_logprobs_nums": list(batch.top_logprobs_nums[selected_count:]),
+                "full_sampling_attrs": {},
+                "full_penalizer_attrs": {},
+            }
+            sampling_info = batch.sampling_info
+            for attr in [
+                "temperatures",
+                "top_ps",
+                "top_ks",
+                "min_ps",
+                "logit_bias",
+                "vocab_mask",
+                "linear_penalties",
+                "scaling_penalties",
+            ]:
+                value = getattr(sampling_info, attr, None)
+                state["full_sampling_attrs"][attr] = value
+                if value is not None and hasattr(value, "shape") and value.shape[0] == len(batch.reqs):
+                    setattr(sampling_info, attr, value[:selected_count])
+            for penalizer in sampling_info.penalizer_orchestrator.penalizers.values():
+                attrs = {}
+                for attr, value in list(vars(penalizer).items()):
+                    attrs[attr] = value
+                    if (
+                        isinstance(value, torch.Tensor)
+                        and value.ndim >= 1
+                        and value.shape[0] == len(batch.reqs)
+                    ):
+                        setattr(penalizer, attr, value[:selected_count])
+                state["full_penalizer_attrs"][id(penalizer)] = attrs
+            logger.info(
+                "EDF restricted decode batch to overdue-user requests only. selected=%s deferred=%s",
+                selected_count,
+                len(deferred_indices),
+            )
+            batch.reqs = list(batch.reqs[:selected_count])
+            batch.req_pool_indices = batch.req_pool_indices[:selected_count]
+            batch.seq_lens = batch.seq_lens[:selected_count]
+            batch.position_ids_offsets = batch.position_ids_offsets[:selected_count]
+            batch.top_logprobs_nums = list(batch.top_logprobs_nums[:selected_count])
+            batch.return_logprob = any(req.return_logprob for req in batch.reqs)
+            batch.input_ids = None
+            batch.out_cache_loc = None
+            return state
+
+        def restore_restricted_decode_subset(state: dict) -> None:
+            selected_survivors = len(batch.reqs)
+            batch.reqs.extend(state["deferred_reqs"])
+            batch.req_pool_indices = torch.concat(
+                [batch.req_pool_indices[:selected_survivors], state["deferred_req_pool_indices"]]
+            )
+            batch.seq_lens = torch.concat(
+                [batch.seq_lens[:selected_survivors], state["deferred_seq_lens"]]
+            )
+            batch.position_ids_offsets = torch.concat(
+                [batch.position_ids_offsets[:selected_survivors], state["deferred_position_ids_offsets"]]
+            )
+            batch.top_logprobs_nums = (
+                list(batch.top_logprobs_nums[:selected_survivors])
+                + state["deferred_top_logprobs_nums"]
+            )
+            batch.return_logprob = any(req.return_logprob for req in batch.reqs)
+
+            sampling_info = batch.sampling_info
+            for attr, full_value in state["full_sampling_attrs"].items():
+                cur_value = getattr(sampling_info, attr, None)
+                if (
+                    isinstance(full_value, torch.Tensor)
+                    and full_value.ndim >= 1
+                    and full_value.shape[0] == state["selected_count"] + len(state["deferred_reqs"])
+                    and isinstance(cur_value, torch.Tensor)
+                ):
+                    setattr(
+                        sampling_info,
+                        attr,
+                        torch.concat(
+                            [cur_value[:selected_survivors], full_value[state["selected_count"] :]],
+                            dim=0,
+                        ),
+                    )
+                else:
+                    setattr(sampling_info, attr, full_value)
+
+            for penalizer in sampling_info.penalizer_orchestrator.penalizers.values():
+                full_attrs = state["full_penalizer_attrs"][id(penalizer)]
+                for attr, full_value in full_attrs.items():
+                    cur_value = getattr(penalizer, attr, None)
+                    if (
+                        isinstance(full_value, torch.Tensor)
+                        and full_value.ndim >= 1
+                        and full_value.shape[0] == state["selected_count"] + len(state["deferred_reqs"])
+                        and isinstance(cur_value, torch.Tensor)
+                    ):
+                        setattr(
+                            penalizer,
+                            attr,
+                            torch.concat(
+                                [cur_value[:selected_survivors], full_value[state["selected_count"] :]],
+                                dim=0,
+                            ),
+                        )
+                    else:
+                        setattr(penalizer, attr, full_value)
+            batch.input_ids = None
+            batch.out_cache_loc = None
+
+        restore_state = apply_restricted_decode_subset()
         # Check if decode out of memory
         try:
             if not batch.check_decode_mem():
+                if restore_state is not None:
+                    # Decode retraction must consider the full globally running batch, not the
+                    # temporary EDF-restricted subset. Restore first, retract globally, then
+                    # re-apply the subset on the surviving requests for the actual decode step.
+                    restore_restricted_decode_subset(restore_state)
+                    restore_state = None
                 old_ratio = self.new_token_ratio
 
                 retracted_reqs, new_token_ratio = batch.retract_decode()
@@ -1148,6 +1228,7 @@ class ModelTpServer:
                     f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
                 )
                 self.waiting_queue.extend(retracted_reqs)
+                restore_state = apply_restricted_decode_subset()
             else:
                 self.new_token_ratio = max(
                     self.new_token_ratio - self.new_token_ratio_decay,
@@ -1239,65 +1320,7 @@ class ModelTpServer:
             }
         finally:
             if restore_state is not None:
-                selected_survivors = len(batch.reqs)
-                batch.reqs.extend(restore_state["deferred_reqs"])
-                batch.req_pool_indices = torch.concat(
-                    [batch.req_pool_indices[:selected_survivors], restore_state["deferred_req_pool_indices"]]
-                )
-                batch.seq_lens = torch.concat(
-                    [batch.seq_lens[:selected_survivors], restore_state["deferred_seq_lens"]]
-                )
-                batch.position_ids_offsets = torch.concat(
-                    [batch.position_ids_offsets[:selected_survivors], restore_state["deferred_position_ids_offsets"]]
-                )
-                batch.top_logprobs_nums = (
-                    list(batch.top_logprobs_nums[:selected_survivors])
-                    + restore_state["deferred_top_logprobs_nums"]
-                )
-                batch.return_logprob = any(req.return_logprob for req in batch.reqs)
-
-                sampling_info = batch.sampling_info
-                for attr, full_value in restore_state["full_sampling_attrs"].items():
-                    cur_value = getattr(sampling_info, attr, None)
-                    if (
-                        isinstance(full_value, torch.Tensor)
-                        and full_value.ndim >= 1
-                        and full_value.shape[0] == restore_state["selected_count"] + len(restore_state["deferred_reqs"])
-                        and isinstance(cur_value, torch.Tensor)
-                    ):
-                        setattr(
-                            sampling_info,
-                            attr,
-                            torch.concat(
-                                [cur_value[:selected_survivors], full_value[restore_state["selected_count"] :]],
-                                dim=0,
-                            ),
-                        )
-                    else:
-                        setattr(sampling_info, attr, full_value)
-
-                for penalizer in sampling_info.penalizer_orchestrator.penalizers.values():
-                    full_attrs = restore_state["full_penalizer_attrs"][id(penalizer)]
-                    for attr, full_value in full_attrs.items():
-                        cur_value = getattr(penalizer, attr, None)
-                        if (
-                            isinstance(full_value, torch.Tensor)
-                            and full_value.ndim >= 1
-                            and full_value.shape[0] == restore_state["selected_count"] + len(restore_state["deferred_reqs"])
-                            and isinstance(cur_value, torch.Tensor)
-                        ):
-                            setattr(
-                                penalizer,
-                                attr,
-                                torch.concat(
-                                    [cur_value[:selected_survivors], full_value[restore_state["selected_count"] :]],
-                                    dim=0,
-                                ),
-                            )
-                        else:
-                            setattr(penalizer, attr, full_value)
-                batch.input_ids = None
-                batch.out_cache_loc = None
+                restore_restricted_decode_subset(restore_state)
 
     def handle_finished_requests(self, batch: ScheduleBatch):
         output_rids = []

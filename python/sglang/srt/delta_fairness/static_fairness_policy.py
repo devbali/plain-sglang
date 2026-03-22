@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections import Counter
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -30,6 +31,43 @@ class StaticFairnessPolicy(NoFairnessPolicy):
     ):
         super().__init__(tree_cache=tree_cache)
         self.static_reservation_n = static_reservation_n
+        self.static_debug_admission = os.environ.get(
+            "SGLANG_STATIC_DEBUG_ADMISSION", ""
+        ).lower() in ("1", "true", "yes", "on")
+        self._last_static_debug_log_ts = 0.0
+
+    def _maybe_log_static_prefill_summary(
+        self,
+        *,
+        summaries_by_user: Dict[str, Dict[str, int]],
+        details_by_user: Dict[str, Dict[str, int]],
+    ) -> None:
+        if not self.static_debug_admission or not summaries_by_user:
+            return
+        now = time.time()
+        if now - self._last_static_debug_log_ts < 5.0:
+            return
+        self._last_static_debug_log_ts = now
+
+        parts = []
+        for user_id in sorted(summaries_by_user):
+            summary = summaries_by_user[user_id]
+            detail = details_by_user.get(user_id, {})
+            parts.append(
+                (
+                    f"user={user_id} "
+                    f"admitted={summary.get('admitted', 0)} "
+                    f"blocked_partition={summary.get('blocked_partition', 0)} "
+                    f"blocked_protected={summary.get('blocked_protected', 0)} "
+                    f"rejected_init={summary.get('rejected_init', 0)} "
+                    f"rejected_adder={summary.get('rejected_adder', 0)} "
+                    f"running={detail.get('running_for_user', -1)}/{detail.get('partition_size', -1)} "
+                    f"pending={detail.get('pending_for_user', -1)} "
+                    f"protected={detail.get('protected_tokens', -1)}/{detail.get('static_limit', -1)} "
+                    f"req_extend={detail.get('req_extend_input_len', -1)}"
+                )
+            )
+        logger.info("StaticFairnessPolicy prefill gate summary: %s", " | ".join(parts))
 
     def _has_static_limit(self) -> bool:
         tree_cache = self.tree_cache
@@ -151,7 +189,14 @@ class StaticFairnessPolicy(NoFairnessPolicy):
             running_batch=running_batch,
             pending_prefill_tokens=pending_prefill_tokens,
         )
-        return protected_tokens + req.extend_input_len <= tree_cache.static_max_per_user
+        decode_headroom = self._estimated_decode_headroom_for_user(
+            req.uid,
+            running_batch=running_batch,
+        )
+        return (
+            protected_tokens + decode_headroom + req.extend_input_len
+            <= tree_cache.static_max_per_user
+        )
 
     def _estimated_decode_headroom_for_user(
         self,
@@ -195,20 +240,24 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         *,
         extra_tokens: int = 0,
     ) -> bool:
-        headroom_limit = self._static_prefill_headroom_limit(
-            req.uid,
-            running_batch=getattr(self, "_pass_running_batch", None),
-        )
-        if headroom_limit is None:
+        tree_cache = self.tree_cache
+        if tree_cache is None or tree_cache.static_max_per_user is None:
             return False
 
-        tree_cache = self.tree_cache
-        assert tree_cache is not None
-        protected_tokens = (
-            tree_cache.total_user_counters.get_tokens(req.uid)
-            - tree_cache.evictable_total_user_counters.get_tokens(req.uid)
+        running_batch = getattr(self, "_pass_running_batch", None)
+        protected_tokens = self._user_prefill_protected_tokens(
+            req.uid,
+            running_batch=running_batch,
+            pending_prefill_tokens=extra_tokens,
         )
-        return protected_tokens + req.extend_input_len + extra_tokens > headroom_limit
+        decode_headroom = self._estimated_decode_headroom_for_user(
+            req.uid,
+            running_batch=running_batch,
+        )
+        return (
+            protected_tokens + decode_headroom + req.extend_input_len
+            > tree_cache.static_max_per_user
+        )
 
     # ---- Request admission -------------------------------------------------
     def init_next_round_input_control(
@@ -415,6 +464,11 @@ class StaticFairnessPolicy(NoFairnessPolicy):
             max_running_requests,
             running_batch_size + max(0, available_req_slots),
         )
+        partition_size = self.running_request_partition_size(
+            max_running_requests=max_running_requests
+        )
+        summaries_by_user: Dict[str, Dict[str, int]] = {}
+        details_by_user: Dict[str, Dict[str, int]] = {}
 
         if running_batch_size >= effective_running_limit:
             return
@@ -428,20 +482,64 @@ class StaticFairnessPolicy(NoFairnessPolicy):
             if req in adder.can_run_list:
                 continue
 
-            if not self.can_admit_running_request(
+            running_for_user = 0
+            if running_batch is not None:
+                running_for_user = sum(
+                    1 for running_req in running_batch.reqs if running_req.uid == req.uid
+                )
+            pending_for_user = len(token_counters_by_user.get(req.uid, []))
+            protected_tokens = self._user_prefill_protected_tokens(
+                req.uid,
+                running_batch=running_batch,
+                pending_prefill_tokens=sum(token_counters_by_user.get(req.uid, [])),
+            )
+            static_limit = (
+                self.tree_cache.static_max_per_user
+                if self.tree_cache is not None
+                and getattr(self.tree_cache, "static_max_per_user", None) is not None
+                else -1
+            )
+            summary = summaries_by_user.setdefault(req.uid, {})
+            detail = details_by_user.setdefault(
+                req.uid,
+                {
+                    "running_for_user": running_for_user,
+                    "pending_for_user": pending_for_user,
+                    "partition_size": partition_size if partition_size is not None else -1,
+                    "protected_tokens": protected_tokens,
+                    "static_limit": static_limit,
+                    "req_extend_input_len": req.extend_input_len,
+                },
+            )
+            detail.update(
+                {
+                    "running_for_user": running_for_user,
+                    "pending_for_user": pending_for_user,
+                    "partition_size": partition_size if partition_size is not None else -1,
+                    "protected_tokens": protected_tokens,
+                    "static_limit": static_limit,
+                    "req_extend_input_len": req.extend_input_len,
+                }
+            )
+
+            can_admit_running = self.can_admit_running_request(
                 req,
                 running_batch=running_batch,
                 token_counters_by_user=token_counters_by_user,
                 max_running_requests=max_running_requests,
-            ):
+            )
+            if not can_admit_running:
+                summary["blocked_partition"] = summary.get("blocked_partition", 0) + 1
                 continue
 
             extra_tokens = sum(token_counters_by_user.get(req.uid, []))
-            if not self._can_admit_prefill_without_decode_retraction(
+            can_admit_prefill = self._can_admit_prefill_without_decode_retraction(
                 req,
                 running_batch=running_batch,
                 pending_prefill_tokens=extra_tokens,
-            ):
+            )
+            if not can_admit_prefill:
+                summary["blocked_protected"] = summary.get("blocked_protected", 0) + 1
                 continue
 
             res = req.init_next_round_input(
@@ -451,12 +549,15 @@ class StaticFairnessPolicy(NoFairnessPolicy):
                 extra_tokens=extra_tokens,
             )
             if res == "rejected":
+                summary["rejected_init"] = summary.get("rejected_init", 0) + 1
                 continue
 
             add_result = adder.add_one_req(req, extra_tokens=extra_tokens)
             if add_result == "rejected":
+                summary["rejected_adder"] = summary.get("rejected_adder", 0) + 1
                 continue
 
+            summary["admitted"] = summary.get("admitted", 0) + 1
             token_counters_by_user.setdefault(req.uid, []).append(req.extend_input_len)
 
             if (
@@ -468,6 +569,11 @@ class StaticFairnessPolicy(NoFairnessPolicy):
                 or running_batch_size + len(adder.can_run_list) >= effective_running_limit
             ):
                 break
+
+        self._maybe_log_static_prefill_summary(
+            summaries_by_user=summaries_by_user,
+            details_by_user=details_by_user,
+        )
 
     # ---- Decode helpers ----------------------------------------------------
     def check_decode_memory(self, batch: "ScheduleBatch") -> bool:
