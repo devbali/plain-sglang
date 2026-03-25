@@ -6,6 +6,7 @@ import logging
 import os
 import time
 from collections import Counter
+from collections import defaultdict
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .no_fairness_policy import NoFairnessPolicy
@@ -82,6 +83,8 @@ class StaticFairnessPolicy(NoFairnessPolicy):
     ) -> Dict[str, int]:
         tree_cache = self.tree_cache
         assert tree_cache is not None
+        if tree_cache.static_max_per_user is None:
+            return {}
 
         uncached_running_tokens: Dict[str, int] = {}
         if getattr(batch, "seq_lens", None) is not None:
@@ -97,54 +100,28 @@ class StaticFairnessPolicy(NoFairnessPolicy):
                 tree_cache.total_user_counters.get_tokens(user_id)
                 + uncached_running_tokens.get(user_id, 0)
             )
-            overage = current_tokens + needed_tokens - tree_cache.static_max_per_user
+            overage = (
+                current_tokens
+                + needed_tokens
+                - tree_cache.static_max_per_user
+            )
             if overage > 0:
                 overages[user_id] = overage
+
+        if not overages:
+            deficit = batch.batch_size() - batch.token_to_kv_pool.available_size()
+            if deficit > 0:
+                usage_by_user: Dict[str, int] = {}
+                for user_id, needed_tokens in self._decode_token_needs_by_user(batch).items():
+                    usage_by_user[user_id] = (
+                        tree_cache.total_user_counters.get_tokens(user_id)
+                        + uncached_running_tokens.get(user_id, 0)
+                        + needed_tokens
+                    )
+                if usage_by_user:
+                    fallback_user = max(usage_by_user, key=usage_by_user.get)
+                    overages[fallback_user] = deficit
         return overages
-
-    def _decode_usage_and_slack_by_user(
-        self,
-        batch: "ScheduleBatch",
-    ) -> Dict[str, Tuple[int, int, int]]:
-        tree_cache = self.tree_cache
-        assert tree_cache is not None
-
-        uncached_running_tokens: Dict[str, int] = {}
-        if getattr(batch, "seq_lens", None) is not None:
-            seq_lens_cpu = batch.seq_lens.cpu().tolist()
-            for i, req in enumerate(batch.reqs):
-                uncached_running_tokens[req.uid] = uncached_running_tokens.get(req.uid, 0) + max(
-                    0, int(seq_lens_cpu[i]) - len(req.prefix_indices)
-                )
-
-        usage_and_slack: Dict[str, Tuple[int, int, int]] = {}
-        for user_id in self._decode_token_needs_by_user(batch):
-            cached_total_tokens = tree_cache.total_user_counters.get_tokens(user_id)
-            cached_evictable_tokens = tree_cache.evictable_total_user_counters.get_tokens(
-                user_id
-            )
-            current_tokens = cached_total_tokens + uncached_running_tokens.get(user_id, 0)
-            unevictable_tokens = (
-                cached_total_tokens - cached_evictable_tokens
-            ) + uncached_running_tokens.get(user_id, 0)
-            slack = tree_cache.static_max_per_user - unevictable_tokens
-            usage_and_slack[user_id] = (current_tokens, unevictable_tokens, slack)
-        return usage_and_slack
-
-    def _evict_non_batch_users_for_decode(
-        self,
-        batch: "ScheduleBatch",
-        num_tokens: int,
-    ) -> int:
-        tree_cache = self.tree_cache
-        assert tree_cache is not None
-
-        batch_users = {req.uid for req in batch.reqs}
-        return tree_cache.evict(
-            num_tokens,
-            batch.token_to_kv_pool.free,
-            evict_condition=lambda node: node.owner not in batch_users,
-        )
 
     def _user_prefill_protected_tokens(
         self,
@@ -172,33 +149,7 @@ class StaticFairnessPolicy(NoFairnessPolicy):
 
         return cached_unevictable_tokens + uncached_running_tokens + pending_prefill_tokens
 
-    def _can_admit_prefill_without_decode_retraction(
-        self,
-        req: "Req",
-        *,
-        running_batch: Optional["ScheduleBatch"],
-        pending_prefill_tokens: int,
-    ) -> bool:
-        tree_cache = self.tree_cache
-        assert tree_cache is not None
-        if tree_cache.static_max_per_user is None:
-            return True
-
-        protected_tokens = self._user_prefill_protected_tokens(
-            req.uid,
-            running_batch=running_batch,
-            pending_prefill_tokens=pending_prefill_tokens,
-        )
-        decode_headroom = self._estimated_decode_headroom_for_user(
-            req.uid,
-            running_batch=running_batch,
-        )
-        return (
-            protected_tokens + decode_headroom + req.extend_input_len
-            <= tree_cache.static_max_per_user
-        )
-
-    def _estimated_decode_headroom_for_user(
+    def _user_running_decode_liability_tokens(
         self,
         user_id: str,
         *,
@@ -206,58 +157,75 @@ class StaticFairnessPolicy(NoFairnessPolicy):
     ) -> int:
         if running_batch is None:
             return 0
-        ratio = max(0.0, float(getattr(self, "_pass_new_token_ratio", 0.0)))
-        total = 0.0
+
+        liability = 0
         for req in running_batch.reqs:
             if req.uid != user_id:
                 continue
-            remaining = max(0, req.sampling_params.max_new_tokens - len(req.output_ids))
-            total += min(remaining, CLIP_MAX_NEW_TOKENS) * ratio
-        return int(total)
+            liability += max(
+                0,
+                min(
+                    req.sampling_params.max_new_tokens - len(req.output_ids),
+                    CLIP_MAX_NEW_TOKENS,
+                ),
+            )
+        return liability
 
-    def _static_prefill_headroom_limit(
-        self,
-        user_id: str,
-        *,
-        running_batch: Optional["ScheduleBatch"],
-    ) -> Optional[int]:
-        tree_cache = self.tree_cache
-        if tree_cache is None or tree_cache.static_max_per_user is None:
-            return None
-        return max(
-            1,
-            int(
-                tree_cache.static_max_per_user
-                - self._estimated_decode_headroom_for_user(
-                    user_id, running_batch=running_batch
-                )
-            ),
-        )
+    def _prefill_total_tokens_for_req(self, req: "Req") -> int:
+        return req.extend_input_len + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
 
-    def _reject_due_to_static_prefill_headroom(
+    def _reject_due_to_static_partition_total(
         self,
         req: "Req",
         *,
-        extra_tokens: int = 0,
+        pending_total_tokens: int = 0,
     ) -> bool:
         tree_cache = self.tree_cache
         if tree_cache is None or tree_cache.static_max_per_user is None:
             return False
-
-        running_batch = getattr(self, "_pass_running_batch", None)
         protected_tokens = self._user_prefill_protected_tokens(
             req.uid,
-            running_batch=running_batch,
-            pending_prefill_tokens=extra_tokens,
+            running_batch=getattr(self, "_pass_running_batch", None),
+            pending_prefill_tokens=0,
         )
-        decode_headroom = self._estimated_decode_headroom_for_user(
+        running_decode_liability = self._user_running_decode_liability_tokens(
             req.uid,
-            running_batch=running_batch,
+            running_batch=getattr(self, "_pass_running_batch", None),
         )
         return (
-            protected_tokens + decode_headroom + req.extend_input_len
+            protected_tokens
+            + running_decode_liability
+            + pending_total_tokens
+            + self._prefill_total_tokens_for_req(req)
             > tree_cache.static_max_per_user
         )
+
+    def _reject_due_to_static_immediate_extend_capacity(
+        self,
+        req: "Req",
+        *,
+        pending_global_extend_tokens: int = 0,
+    ) -> bool:
+        tree_cache = self.tree_cache
+        if tree_cache is None:
+            return False
+
+        available_now = max(
+            0,
+            tree_cache.token_to_kv_pool.available_size() - pending_global_extend_tokens,
+        )
+        user_evictable = tree_cache.evictable_total_user_counters.get_tokens(req.uid)
+        overlimit_evictable = 0
+        if tree_cache.static_max_per_user is not None:
+            total_snapshot = tree_cache.total_user_counters.snapshot()
+            evictable_snapshot = tree_cache.evictable_total_user_counters.snapshot()
+            for user_id, total_tokens in total_snapshot.items():
+                if user_id == req.uid:
+                    continue
+                if total_tokens > tree_cache.static_max_per_user:
+                    overlimit_evictable += evictable_snapshot.get(user_id, 0)
+
+        return req.extend_input_len > available_now + user_evictable + overlimit_evictable
 
     # ---- Request admission -------------------------------------------------
     def init_next_round_input_control(
@@ -270,11 +238,10 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         if not self._has_static_limit():
             return None
 
-        tree_cache = self.tree_cache
-        assert tree_cache is not None
-        if self._reject_due_to_static_prefill_headroom(req, extra_tokens=extra_tokens):
-            return "rejected"
-        if tree_cache.reject_based_on_static_limit(req.uid, req.extend_input_len + extra_tokens):
+        if self._reject_due_to_static_partition_total(
+            req,
+            pending_total_tokens=extra_tokens,
+        ):
             return "rejected"
         return None
 
@@ -287,11 +254,10 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         if not self._has_static_limit():
             return None
 
-        tree_cache = self.tree_cache
-        assert tree_cache is not None
-        if self._reject_due_to_static_prefill_headroom(req, extra_tokens=extra_tokens):
-            return "rejected"
-        if tree_cache.reject_based_on_static_limit(req.uid, req.extend_input_len + extra_tokens):
+        if self._reject_due_to_static_partition_total(
+            req,
+            pending_total_tokens=extra_tokens,
+        ):
             return "rejected"
         return None
 
@@ -303,22 +269,21 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         return self._has_static_limit()
 
     def ignore_global_prefill_token_budget(self) -> bool:
-        return self._has_static_limit()
+        return False
 
     def continue_scanning_waiting_queue_on_prefill_block(self) -> bool:
         return self._has_static_limit()
 
     def deny_prefill_if_decode_retraction_needed(self) -> bool:
-        return self._has_static_limit()
+        return False
 
     def running_request_partition_size(
         self,
         *,
         max_running_requests: int,
     ) -> Optional[int]:
-        if not self._has_static_limit() or not self.static_reservation_n:
-            return None
-        return max(1, max_running_requests // self.static_reservation_n)
+        del max_running_requests
+        return None
 
     def can_admit_running_request(
         self,
@@ -328,18 +293,8 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         token_counters_by_user: Dict[str, List[int]],
         max_running_requests: int,
     ) -> bool:
-        partition_size = self.running_request_partition_size(
-            max_running_requests=max_running_requests
-        )
-        if partition_size is None:
-            return True
-
-        running_for_user = 0
-        if running_batch is not None:
-            running_for_user = sum(1 for running_req in running_batch.reqs if running_req.uid == req.uid)
-
-        pending_for_user = len(token_counters_by_user.get(req.uid, []))
-        return running_for_user + pending_for_user < partition_size
+        del req, running_batch, token_counters_by_user, max_running_requests
+        return True
 
     def alloc_token_slots(
         self,
@@ -377,6 +332,25 @@ class StaticFairnessPolicy(NoFairnessPolicy):
             if not evict_only_force:
                 out_cache_loc = token_to_kv_pool.alloc(num_tokens)
 
+        if (
+            out_cache_loc is None
+            and not evict_only_force
+            and tree_cache.static_max_per_user is not None
+        ):
+            # If the requesting user is still within its partition but the pooled KV
+            # space is tight, reclaim only evictable cache from users currently above
+            # their static partition before giving up.
+            tree_cache.evict(
+                num_tokens,
+                token_to_kv_pool.free,
+                evict_condition=lambda node: (
+                    node.owner != user_id
+                    and tree_cache.total_user_counters.get_tokens(node.owner)
+                    > tree_cache.static_max_per_user
+                ),
+            )
+            out_cache_loc = token_to_kv_pool.alloc(num_tokens)
+
         if out_cache_loc is None and not evict_only_force:
             logger.error("Prefill out of memory even after static eviction.")
             raise RuntimeError("Prefill out of memory under static fairness policy.")
@@ -398,40 +372,12 @@ class StaticFairnessPolicy(NoFairnessPolicy):
                 running_batch=running_batch,
                 requesting_users=requesting_users,
             )
-
-        out_cache_loc = None
-        removed_requests: List["Req"] = []
-
-        while out_cache_loc is None:
-            eviction_necessary = batch.token_to_kv_pool.available_size() < extend_num_tokens
-            if eviction_necessary:
-                for req in batch.reqs:
-                    num_tokens = len(req.fill_ids[len(req.prefix_indices) :])
-                    self.alloc_token_slots(
-                        batch.token_to_kv_pool,
-                        num_tokens,
-                        user_id=req.uid,
-                        evict_only_force=True,
-                    )
-
-            out_cache_loc = batch.token_to_kv_pool.alloc(extend_num_tokens)
-            if out_cache_loc is None and running_batch is not None:
-                if self.deny_prefill_if_decode_retraction_needed():
-                    logger.info(
-                        "StaticFairnessPolicy: denying prefill admission because it would require decode retraction."
-                    )
-                    break
-                removed, _ = running_batch.retract_decode(extend_num_tokens)
-                removed_requests += removed
-            else:
-                break
-
-        if out_cache_loc is None:
-            raise RuntimeError(
-                "Static prefill admission denied: insufficient user-local capacity without decode retraction."
-            )
-
-        return out_cache_loc, removed_requests
+        out_cache_loc = self.alloc_token_slots(
+            batch.token_to_kv_pool,
+            extend_num_tokens,
+            user_id=batch.reqs[0].uid if batch.reqs else None,
+        )
+        return out_cache_loc, []
 
     def process_waiting_queue_prefills(
         self,
@@ -467,13 +413,57 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         partition_size = self.running_request_partition_size(
             max_running_requests=max_running_requests
         )
+        pending_global_extend_tokens = 0
         summaries_by_user: Dict[str, Dict[str, int]] = {}
         details_by_user: Dict[str, Dict[str, int]] = {}
 
         if running_batch_size >= effective_running_limit:
             return
 
-        for req in waiting_queue:
+        ordered_waiting_queue = waiting_queue
+        if (
+            self.tree_cache is not None
+            and getattr(self.tree_cache, "static_max_per_user", None) is not None
+        ):
+            static_limit = self.tree_cache.static_max_per_user
+            queue_by_user = defaultdict(list)
+            for idx, req in enumerate(waiting_queue):
+                queue_by_user[req.uid].append((idx, req))
+
+            user_order = sorted(
+                queue_by_user,
+                key=lambda user_id: (
+                    (
+                        self._user_prefill_protected_tokens(
+                            user_id,
+                            running_batch=running_batch,
+                            pending_prefill_tokens=sum(
+                                token_counters_by_user.get(user_id, [])
+                            ),
+                        )
+                        + self._user_running_decode_liability_tokens(
+                            user_id,
+                            running_batch=running_batch,
+                        )
+                    )
+                    / max(1, static_limit),
+                    queue_by_user[user_id][0][0],
+                ),
+            )
+
+            ordered_waiting_queue = []
+            exhausted = False
+            round_index = 0
+            while not exhausted:
+                exhausted = True
+                for user_id in user_order:
+                    user_queue = queue_by_user[user_id]
+                    if round_index < len(user_queue):
+                        ordered_waiting_queue.append(user_queue[round_index][1])
+                        exhausted = False
+                round_index += 1
+
+        for req in ordered_waiting_queue:
             if max_input_size is not None and adder.log_input_tokens > max_input_size:
                 break
             elif max_input_size is not None:
@@ -522,43 +512,43 @@ class StaticFairnessPolicy(NoFairnessPolicy):
                 }
             )
 
+            if self._reject_due_to_static_immediate_extend_capacity(
+                req,
+                pending_global_extend_tokens=pending_global_extend_tokens,
+            ):
+                summary["blocked_immediate_capacity"] = (
+                    summary.get("blocked_immediate_capacity", 0) + 1
+                )
+                continue
+
             can_admit_running = self.can_admit_running_request(
                 req,
                 running_batch=running_batch,
                 token_counters_by_user=token_counters_by_user,
                 max_running_requests=max_running_requests,
             )
-            if not can_admit_running:
-                summary["blocked_partition"] = summary.get("blocked_partition", 0) + 1
-                continue
-
-            extra_tokens = sum(token_counters_by_user.get(req.uid, []))
-            can_admit_prefill = self._can_admit_prefill_without_decode_retraction(
-                req,
-                running_batch=running_batch,
-                pending_prefill_tokens=extra_tokens,
-            )
-            if not can_admit_prefill:
-                summary["blocked_protected"] = summary.get("blocked_protected", 0) + 1
-                continue
-
             res = req.init_next_round_input(
                 target_tree_cache,
                 fairness_policy=self,
                 fair=False,
-                extra_tokens=extra_tokens,
+                extra_tokens=sum(token_counters_by_user.get(req.uid, [])),
             )
             if res == "rejected":
                 summary["rejected_init"] = summary.get("rejected_init", 0) + 1
                 continue
 
-            add_result = adder.add_one_req(req, extra_tokens=extra_tokens)
+            add_result = adder.add_one_req(
+                req, extra_tokens=sum(token_counters_by_user.get(req.uid, []))
+            )
             if add_result == "rejected":
                 summary["rejected_adder"] = summary.get("rejected_adder", 0) + 1
                 continue
 
             summary["admitted"] = summary.get("admitted", 0) + 1
-            token_counters_by_user.setdefault(req.uid, []).append(req.extend_input_len)
+            token_counters_by_user.setdefault(req.uid, []).append(
+                self._prefill_total_tokens_for_req(req)
+            )
+            pending_global_extend_tokens += req.extend_input_len
 
             if (
                 (
@@ -594,15 +584,6 @@ class StaticFairnessPolicy(NoFairnessPolicy):
             bs,
             overages,
         )
-        if not overages and batch.token_to_kv_pool.available_size() < bs:
-            evicted = self._evict_non_batch_users_for_decode(
-                batch, bs - batch.token_to_kv_pool.available_size()
-            )
-            logger.info(
-                "StaticFairnessPolicy: evicted %s tokens from non-batch users for decode pressure.",
-                evicted,
-            )
-
         for user_id, overage in overages.items():
             tree_cache.evict_from_user(overage, batch.token_to_kv_pool.free, user_id)
 
@@ -623,31 +604,8 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         overages = self._users_exceeding_static_limit_for_decode(batch)
         violating_indices = [i for i, req in enumerate(batch.reqs) if req.uid in overages]
 
-        if not violating_indices and batch.token_to_kv_pool.available_size() < batch.batch_size():
-            usage_and_slack = self._decode_usage_and_slack_by_user(batch)
-            logger.info(
-                "StaticFairnessPolicy: decode retraction fallback with usage/slack=%s",
-                {
-                    user_id: {
-                        "usage": usage,
-                        "unevictable": unevictable,
-                        "slack": slack,
-                    }
-                    for user_id, (usage, unevictable, slack) in usage_and_slack.items()
-                },
-            )
-            violating_indices = list(range(len(batch.reqs)))
-            violating_indices.sort(
-                key=lambda i: (
-                    -usage_and_slack[batch.reqs[i].uid][1],
-                    -usage_and_slack[batch.reqs[i].uid][0],
-                    usage_and_slack[batch.reqs[i].uid][2],
-                    -len(batch.reqs[i].origin_input_ids),
-                    len(batch.reqs[i].output_ids),
-                ),
-                reverse=True,
-            )
-            return violating_indices
+        if not violating_indices:
+            return []
 
         violating_indices.sort(
             key=lambda i: (
@@ -663,12 +621,7 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         if not self.requires_per_user_allocation():
             return super().alloc_decode_output_slots(batch)
 
-        bs = batch.batch_size()
         overages = self._users_exceeding_static_limit_for_decode(batch)
-        if not overages and batch.token_to_kv_pool.available_size() < bs:
-            self._evict_non_batch_users_for_decode(
-                batch, bs - batch.token_to_kv_pool.available_size()
-            )
         for user_id, overage in overages.items():
             self.alloc_token_slots(
                 batch.token_to_kv_pool,
@@ -677,7 +630,7 @@ class StaticFairnessPolicy(NoFairnessPolicy):
                 evict_only_force=True,
             )
 
-        out_cache_loc = batch.token_to_kv_pool.alloc(bs)
+        out_cache_loc = batch.token_to_kv_pool.alloc(batch.batch_size())
         if out_cache_loc is None:
             raise RuntimeError(
                 "Failed to allocate decode slots under static fairness policy."

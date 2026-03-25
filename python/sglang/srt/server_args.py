@@ -488,7 +488,7 @@ class ServerArgs:
             "--delta-fairness-policy",
             type=str,
             default=ServerArgs.delta_fairness_policy,
-            choices=["delta", "earliest_deadline_first"],
+            choices=["delta", "earliest_deadline_first", "doc_policy"],
             help="Policy to use when --delta-fairness-n is enabled.",
         )
 

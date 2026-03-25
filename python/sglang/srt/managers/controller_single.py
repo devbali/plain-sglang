@@ -17,6 +17,8 @@ limitations under the License.
 
 import logging
 import multiprocessing
+import queue
+import threading
 from typing import List
 
 import zmq
@@ -61,10 +63,14 @@ class ControllerSingle:
                 f"tcp://127.0.0.1:{port_args.controller_port}"
             )
 
-        self.send_to_detokenizer = context.socket(zmq.PUSH)
-        self.send_to_detokenizer.connect(
-            f"tcp://127.0.0.1:{port_args.detokenizer_port}"
+        self.detokenizer_port = port_args.detokenizer_port
+        self.send_queue: "queue.SimpleQueue[object]" = queue.SimpleQueue()
+        self.sender_thread = threading.Thread(
+            target=self._send_loop,
+            name="controller-send-to-detokenizer",
+            daemon=True,
         )
+        self.sender_thread.start()
 
         # Launch other tp ranks
         tp_size_local = server_args.tp_size // server_args.nnodes
@@ -89,6 +95,16 @@ class ControllerSingle:
         )
         self.tp_cpu_group = self.tp_server.model_runner.tp_group.cpu_group
 
+    def _send_loop(self):
+        context = zmq.Context(1)
+        send_to_detokenizer = context.socket(zmq.PUSH)
+        send_to_detokenizer.connect(
+            f"tcp://127.0.0.1:{self.detokenizer_port}"
+        )
+        while True:
+            obj = self.send_queue.get()
+            send_to_detokenizer.send_pyobj(obj)
+
     def loop_for_forward(self):
         while True:
             if not self.is_dp_worker:
@@ -102,7 +118,7 @@ class ControllerSingle:
             out_pyobjs = self.tp_server.exposed_step(recv_reqs)
 
             for obj in out_pyobjs:
-                self.send_to_detokenizer.send_pyobj(obj)
+                self.send_queue.put(obj)
 
     def recv_requests_from_zmq(self):
         recv_reqs = []

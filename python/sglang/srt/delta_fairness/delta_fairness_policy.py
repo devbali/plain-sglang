@@ -430,29 +430,21 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
 
         tree_cache = self.tree_cache
         assert tree_cache is not None
-        unfair_retractable: List[int] = []
-        fair_retractable: List[int] = []
-        for i, req in enumerate(batch.reqs):
-            if not self.req_is_fair_decode(
-                req,
-                running_batch=batch,
-            ):
-                unfair_retractable.append(i)
-            else:
-                fair_retractable.append(i)
 
-        # `retract_decode()` pops from the end of this list, so the end must contain
-        # the highest-priority requests to retract: unfair before fair, then larger
-        # prompts, then least-decoded requests.
-        unfair_retractable.sort(
-            key=lambda i: (-len(batch.reqs[i].origin_input_ids), len(batch.reqs[i].output_ids)),
-            reverse=True,
+        def _user_kv_tokens(uid: str) -> int:
+            total = tree_cache.total_user_counters.get_tokens(uid)
+            evictable = tree_cache.evictable_total_user_counters.get_tokens(uid)
+            return max(0, total - evictable)
+
+        indexed = list(range(len(batch.reqs)))
+        indexed.sort(
+            key=lambda i: (
+                _user_kv_tokens(batch.reqs[i].uid),
+                -len(batch.reqs[i].output_ids),
+                len(batch.reqs[i].origin_input_ids),
+            )
         )
-        fair_retractable.sort(
-            key=lambda i: (-len(batch.reqs[i].origin_input_ids), len(batch.reqs[i].output_ids)),
-            reverse=True,
-        )
-        return fair_retractable + unfair_retractable
+        return indexed
 
     def alloc_decode_output_slots(self, batch: "ScheduleBatch"):
         """
@@ -605,7 +597,7 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         Determine if a user is delta fair when looking at the prefill running batch 
         resource
         """
-        if not self.delta_fairness_n or running_batch is None:
+        if not self.delta_fairness_n:
             return False
 
         tree_cache = self.tree_cache
@@ -613,18 +605,7 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             user_id, this_user_sum
         ):
             return False
-
-        total = self.max_running_requests
-        if total is None:
-            raise ValueError("Can not run delta fairness without max running requests parameter")
-        for running_req in running_batch.reqs:
-            if running_req.uid == user_id:
-                this_user_len += 1
-
-        if this_user_len == 0:
-            return True
-
-        return self.delta_fairness_n < total / this_user_len
+        return True
 
     def debug_user_fairness_state(
         self,
@@ -648,7 +629,7 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             "reason": "disabled_or_no_running_batch",
         }
 
-        if not self.delta_fairness_n or running_batch is None:
+        if not self.delta_fairness_n:
             return result
 
         tree_cache = self.tree_cache
@@ -664,27 +645,10 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             if unevictable_used >= unevictable_limit:
                 result["reason"] = "unevictable_limit"
                 return result
-
-        total = self.max_running_requests
-        if total is None:
-            raise ValueError("Can not run delta fairness without max running requests parameter")
-
-        running_count = this_user_len
-        for running_req in running_batch.reqs:
-            if running_req.uid == user_id:
-                running_count += 1
-        result["running_count"] = int(running_count)
-        running_limit = int(total // max(int(self.delta_fairness_n), 1))
-        result["running_limit"] = running_limit
-
-        if running_count == 0:
-            result["is_fair"] = True
-            result["reason"] = "no_running_requests"
-            return result
-
-        is_fair = self.delta_fairness_n < total / running_count
-        result["is_fair"] = bool(is_fair)
-        result["reason"] = "ok" if is_fair else "running_limit"
+        result["running_count"] = None
+        result["running_limit"] = None
+        result["is_fair"] = True
+        result["reason"] = "ok"
         return result
 
     def req_is_fair_prefill(

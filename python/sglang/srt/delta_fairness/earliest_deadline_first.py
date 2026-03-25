@@ -71,10 +71,26 @@ class RequestStartEvent (RequestEvent):
     def is_logically_after (self, e: RequestEvent):
         return False
 
-ISOLATED_DECODE_TIME_ESTIMATION = isolated_decode_time_estimation
-ISOLATED_PREFILL_TIME_ESTIMATION = isolated_prefill_time_estimation
-POOLED_DECODE_TIME_ESTIMATION = pooled_decode_time_estimation
-POOLED_PREFILL_TIME_ESTIMATION = pooled_prefill_time_estimation
+ISOLATED_DECODE_TIME_ESTIMATION = (
+    lambda total_batch_sum, max_token_size, batch_length: isolated_decode_time_estimation(
+        total_batch_sum, max_token_size, batch_length, 1
+    )
+)
+ISOLATED_PREFILL_TIME_ESTIMATION = (
+    lambda total_batch_sum, max_token_size, batch_length: isolated_prefill_time_estimation(
+        total_batch_sum, max_token_size, batch_length, 1
+    )
+)
+POOLED_DECODE_TIME_ESTIMATION = (
+    lambda total_batch_sum, max_token_size, batch_length: pooled_decode_time_estimation(
+        total_batch_sum, max_token_size, batch_length, 1
+    )
+)
+POOLED_PREFILL_TIME_ESTIMATION = (
+    lambda total_batch_sum, max_token_size, batch_length: pooled_prefill_time_estimation(
+        total_batch_sum, max_token_size, batch_length, 1
+    )
+)
 
 class RequestTimeline ():
     def __init__ (self):

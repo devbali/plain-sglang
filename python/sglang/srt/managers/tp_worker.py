@@ -19,7 +19,9 @@ import logging
 import multiprocessing
 import os
 import pickle
+import queue
 import time
+import threading
 import warnings
 import json
 from typing import Any, Dict, List, Optional, Union
@@ -62,6 +64,7 @@ from sglang.srt.delta_fairness.no_fairness_policy import NoFairnessPolicy
 from sglang.srt.delta_fairness.static_fairness_policy import StaticFairnessPolicy
 from sglang.srt.delta_fairness.delta_fairness_policy import DeltaFairnessPolicy
 from sglang.srt.delta_fairness.earliest_deadline_first import EarliestDeltaFirst
+from sglang.srt.delta_fairness.doc_policy import DocPolicy
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 from sglang.srt.utils import (
@@ -75,9 +78,58 @@ from sglang.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
-def _normalize_single_delta_config(
-    raw_deltas: Optional[Dict[str, int]], max_prefill_tokens: int
-) -> Dict[str, int]:
+class AsyncCSVLogger:
+    def __init__(self, csv_path: str, header: str):
+        self.csv_path = csv_path
+        self.header = header
+        self._queue: "queue.SimpleQueue[str]" = queue.SimpleQueue()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"async-csv-{os.path.basename(csv_path)}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self):
+        header_written = os.path.exists(self.csv_path) and os.path.getsize(self.csv_path) > 0
+        pending: list[str] = []
+        while not self._stop_event.is_set():
+            try:
+                line = self._queue.get(timeout=0.5)
+                pending.append(line)
+            except queue.Empty:
+                pass
+
+            if not pending:
+                continue
+
+            write_header = not header_written
+            try:
+                with open(self.csv_path, "a") as f:
+                    if write_header:
+                        f.write(self.header)
+                        header_written = True
+                    f.writelines(pending)
+                pending.clear()
+            except OSError:
+                logger.exception("Failed to write telemetry CSV %s", self.csv_path)
+                time.sleep(0.5)
+
+        if pending:
+            try:
+                with open(self.csv_path, "a") as f:
+                    if not header_written:
+                        f.write(self.header)
+                    f.writelines(pending)
+            except OSError:
+                logger.exception("Failed to flush telemetry CSV %s", self.csv_path)
+
+    def log(self, line: str) -> None:
+        self._queue.put(line)
+
+
+def _normalize_single_delta_config(raw_deltas: Optional[Dict[str, int]]) -> Dict[str, int]:
     raw_deltas = raw_deltas or {}
     candidate_keys = (
         "delta",
@@ -97,24 +149,11 @@ def _normalize_single_delta_config(
             continue
         effective_delta_us = max(effective_delta_us, int(value))
 
-    max_prefill_delta_us = int(
-        round(
-            pooled_prefill_time_estimation(
-                total_batch_sum=max_prefill_tokens,
-                max_token_size=max_prefill_tokens,
-                batch_length=1,
-            )
-            * 1_000_000
-        )
-    )
-    cache_reservation_delta_us = min(effective_delta_us, max_prefill_delta_us)
-    prefill_delta_us = max(0, effective_delta_us - cache_reservation_delta_us)
-
     return {
         "delta": effective_delta_us,
-        "prefix_cache": cache_reservation_delta_us,
-        "kv_cache": cache_reservation_delta_us,
-        "prefill": prefill_delta_us,
+        "prefix_cache": effective_delta_us,
+        "kv_cache": effective_delta_us,
+        "prefill": effective_delta_us,
         "first_decode": effective_delta_us,
         "decode": effective_delta_us,
     }
@@ -247,7 +286,6 @@ class ModelTpServer:
             )
             self.delta_fairness_deltas_microseconds = _normalize_single_delta_config(
                 self.delta_fairness_deltas_microseconds,
-                self.max_prefill_tokens,
             )
             logger.info(
                 "Normalized delta fairness single-delta config: "
@@ -304,6 +342,17 @@ class ModelTpServer:
                     delta_fairness_exclusive_quanta_us=self.delta_fairness_exclusive_quanta_us,
                     max_prefill_tokens=self.max_prefill_tokens,
                 )
+            elif server_args.delta_fairness_policy == "doc_policy":
+                self.fairness_policy = DocPolicy(
+                    delta_fairness_n=self.delta_fairness_n,
+                    max_running_requests=self.max_running_requests,
+                    delta_fairness_quanta_us=self.delta_fairness_quanta_us,
+                    delta_fairness_pooled_quanta_us=self.delta_fairness_pooled_quanta_us,
+                    delta_fairness_exclusive_quanta_us=self.delta_fairness_exclusive_quanta_us,
+                    max_prefill_tokens=self.max_prefill_tokens,
+                    isolated_kv_tokens_per_user=self.fair_share_tokens_per_user,
+                    schedule_conservativeness=server_args.schedule_conservativeness,
+                )
             else:
                 self.fairness_policy = DeltaFairnessPolicy(
                     delta_fairness_n=self.delta_fairness_n,
@@ -332,6 +381,17 @@ class ModelTpServer:
         self.last_running_batch_snapshot_tic = 0.0
         self.last_model_forward_elapsed_ms = None
         self.last_decode_step_breakdown = None
+        self._sglang_csv_logger = AsyncCSVLogger(
+            "sglang_log.csv",
+            "timestamp,type,time_elapsed,gpu_time_elapsed_ms,wall_time_elapsed_ms,"
+            "model_forward_elapsed_ms,"
+            "decode_check_mem_ms,decode_jump_forward_ms,decode_prepare_ms,"
+            "decode_build_input_ids_ms,decode_input_tensor_and_seq_lens_ms,"
+            "decode_alloc_decode_output_slots_ms,decode_write_req_to_token_ms,"
+            "decode_update_regex_vocab_mask_ms,"
+            "decode_sample_postprocess_ms,decode_handle_finished_ms,"
+            "running_reqs,num_tokens,token_usage,throughput,queue_reqs\n",
+        )
 
         # Chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
@@ -513,8 +573,6 @@ class ModelTpServer:
                         self.running_batch = None
                         break
 
-                    if self.out_pyobjs and self.running_batch.has_stream():
-                        break
             else:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
@@ -555,41 +613,26 @@ class ModelTpServer:
         
         # Log to CSV
         if self.tp_rank == 0:  # Only log from rank 0
-            csv_file = "sglang_log.csv"
-            write_header = not os.path.exists(csv_file)
-            
-            with open(csv_file, 'a') as f:
-                if write_header:
-                    f.write(
-                        "timestamp,type,time_elapsed,gpu_time_elapsed_ms,wall_time_elapsed_ms,"
-                        "model_forward_elapsed_ms,"
-                        "decode_check_mem_ms,decode_jump_forward_ms,decode_prepare_ms,"
-                        "decode_build_input_ids_ms,decode_input_tensor_and_seq_lens_ms,"
-                        "decode_alloc_decode_output_slots_ms,decode_write_req_to_token_ms,"
-                        "decode_update_regex_vocab_mask_ms,"
-                        "decode_sample_postprocess_ms,decode_handle_finished_ms,"
-                        "running_reqs,num_tokens,token_usage,throughput,queue_reqs\n"
-                    )
-                wall_time_ms = elapsed_time_ms if wall_time_ms is None else wall_time_ms
-                model_forward_ms = (
-                    "" if self.last_model_forward_elapsed_ms is None else self.last_model_forward_elapsed_ms
-                )
-                breakdown = self.last_decode_step_breakdown or {}
-                prepare_breakdown = breakdown.get("prepare_breakdown", {}) if breakdown else {}
-                f.write(
-                    f"{current_time},{'Decode' if decode else 'Prefill'},{wall_time_ms},"
-                    f"{elapsed_time_ms},{wall_time_ms},{model_forward_ms},"
-                    f"{breakdown.get('check_mem_ms', '')},{breakdown.get('jump_forward_ms', '')},"
-                    f"{breakdown.get('prepare_ms', '')},"
-                    f"{prepare_breakdown.get('build_input_ids_ms', '')},"
-                    f"{prepare_breakdown.get('input_tensor_and_seq_lens_ms', '')},"
-                    f"{prepare_breakdown.get('alloc_decode_output_slots_ms', '')},"
-                    f"{prepare_breakdown.get('write_req_to_token_ms', '')},"
-                    f"{prepare_breakdown.get('update_regex_vocab_mask_ms', '')},"
-                    f"{breakdown.get('sample_postprocess_ms', '')},"
-                    f"{breakdown.get('handle_finished_ms', '')},{running_reqs},{num_used},"
-                    f"{token_usage:.4f},{throughput:.4f},{queue_reqs}\n"
-                )
+            wall_time_ms = elapsed_time_ms if wall_time_ms is None else wall_time_ms
+            model_forward_ms = (
+                "" if self.last_model_forward_elapsed_ms is None else self.last_model_forward_elapsed_ms
+            )
+            breakdown = self.last_decode_step_breakdown or {}
+            prepare_breakdown = breakdown.get("prepare_breakdown", {}) if breakdown else {}
+            self._sglang_csv_logger.log(
+                f"{current_time},{'Decode' if decode else 'Prefill'},{wall_time_ms},"
+                f"{elapsed_time_ms},{wall_time_ms},{model_forward_ms},"
+                f"{breakdown.get('check_mem_ms', '')},{breakdown.get('jump_forward_ms', '')},"
+                f"{breakdown.get('prepare_ms', '')},"
+                f"{prepare_breakdown.get('build_input_ids_ms', '')},"
+                f"{prepare_breakdown.get('input_tensor_and_seq_lens_ms', '')},"
+                f"{prepare_breakdown.get('alloc_decode_output_slots_ms', '')},"
+                f"{prepare_breakdown.get('write_req_to_token_ms', '')},"
+                f"{prepare_breakdown.get('update_regex_vocab_mask_ms', '')},"
+                f"{breakdown.get('sample_postprocess_ms', '')},"
+                f"{breakdown.get('handle_finished_ms', '')},{running_reqs},{num_used},"
+                f"{token_usage:.4f},{throughput:.4f},{queue_reqs}\n"
+            )
 
 
     def check_memory(self):
@@ -724,6 +767,17 @@ class ModelTpServer:
             new_token_ratio=self.new_token_ratio,
             max_running_requests=self.max_running_requests,
         )
+
+        # Some fairness policies, notably doc_policy, compute a hard fair-prefill cap
+        # for the pass. If it is already zero, do not spin through prefill-side
+        # reservation and queue scanning only to reject everything again. Hand control
+        # back to forward_step so it can run decode immediately.
+        if (
+            self.running_batch is not None
+            and max_prefill_token_size is not None
+            and max_prefill_token_size <= 0
+        ):
+            return None
 
         has_inflight = self.current_inflight_req is not None
         token_counters_by_user: Dict[str, List[int]] = {}
@@ -867,7 +921,10 @@ class ModelTpServer:
             if "Static prefill admission denied" not in str(exc):
                 raise
             logger.info("Skipping prefill batch: %s", exc)
-            self.waiting_queue.extend(batch.reqs)
+            if self.fairness_policy.uses_static_isolated_memory():
+                self.waiting_queue = list(batch.reqs) + self.waiting_queue
+            else:
+                self.waiting_queue.extend(batch.reqs)
             batch.reqs = []
             return
         _log_prefill_step("prepare_for_extend")
@@ -877,7 +934,10 @@ class ModelTpServer:
                 "Prefill displaced %s decodes; pushing back to waiting queue",
                 len(removed_requests),
             )
-            self.waiting_queue.extend(removed_requests)
+            if self.fairness_policy.uses_static_isolated_memory():
+                self.waiting_queue = list(removed_requests) + self.waiting_queue
+            else:
+                self.waiting_queue.extend(removed_requests)
         _log_prefill_step("requeue_removed_requests")
 
         for req in batch.reqs:
@@ -1227,7 +1287,10 @@ class ModelTpServer:
                     f"#retracted_reqs: {len(retracted_reqs)}, "
                     f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
                 )
-                self.waiting_queue.extend(retracted_reqs)
+                if self.fairness_policy.uses_static_isolated_memory():
+                    self.waiting_queue = list(retracted_reqs) + self.waiting_queue
+                else:
+                    self.waiting_queue.extend(retracted_reqs)
                 restore_state = apply_restricted_decode_subset()
             else:
                 self.new_token_ratio = max(

@@ -5,6 +5,7 @@ import os
 import re
 import threading
 import atexit
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Iterable, Optional
@@ -35,6 +36,9 @@ class TimelineRow:
     prefill_request_event_count: int = 0
     decode_request_event_count: int = 0
     first_decode_start_ts: str = ""
+    isolated_prefill_done_ts: str = ""
+    isolated_first_decode_done_ts: str = ""
+    isolated_latest_decode_done_ts: str = ""
     completed_ts: str = ""
 
 
@@ -44,7 +48,21 @@ class RequestTimelineWriter:
         self._lock = threading.Lock()
         self._rows: Dict[str, TimelineRow] = {}
         self._write_failed = False
+        self._dirty = False
+        self._flush_interval_s = 0.5
+        self._stop_event = threading.Event()
+        self._flush_thread = threading.Thread(
+            target=self._flush_loop,
+            name="request-timeline-writer",
+            daemon=True,
+        )
+        self._flush_thread.start()
         atexit.register(self.flush)
+        atexit.register(self.close)
+
+    def _flush_loop(self) -> None:
+        while not self._stop_event.wait(self._flush_interval_s):
+            self.flush()
 
     def _parse_ids(self, request_id: str, uid: Optional[str]) -> tuple[str, str]:
         match = _RID_PATTERN.match(request_id or "")
@@ -88,6 +106,9 @@ class RequestTimelineWriter:
             "prefill_request_event_count",
             "decode_request_event_count",
             "first_decode_start_ts",
+            "isolated_prefill_done_ts",
+            "isolated_first_decode_done_ts",
+            "isolated_latest_decode_done_ts",
             "completed_ts",
         ]
         tmp_path = f"{self.csv_path}.tmp"
@@ -115,6 +136,9 @@ class RequestTimelineWriter:
                             row.prefill_request_event_count,
                             row.decode_request_event_count,
                             row.first_decode_start_ts,
+                            row.isolated_prefill_done_ts,
+                            row.isolated_first_decode_done_ts,
+                            row.isolated_latest_decode_done_ts,
                             row.completed_ts,
                         ]
                     )
@@ -134,11 +158,18 @@ class RequestTimelineWriter:
             row = self._get_or_create(request_id, uid)
             changed = update_fn(row)
             if changed:
-                self._flush_locked()
+                self._dirty = True
 
     def flush(self) -> None:
         with self._lock:
+            if not self._dirty:
+                return
             self._flush_locked()
+            self._dirty = False
+
+    def close(self) -> None:
+        self._stop_event.set()
+        self.flush()
 
     def mark_queue_enter(self, request_id: str, uid: Optional[str]) -> None:
         now = _now_iso()
@@ -220,6 +251,37 @@ class RequestTimelineWriter:
             lambda row: False if row.completed_ts else setattr(row, "completed_ts", now) or True,
         )
 
+    def mark_isolated_prefill_done(
+        self, request_id: str, uid: Optional[str], *, timestamp_iso: str
+    ) -> None:
+        self._update(
+            request_id,
+            uid,
+            lambda row: False
+            if row.isolated_prefill_done_ts == timestamp_iso
+            else setattr(row, "isolated_prefill_done_ts", timestamp_iso) or True,
+        )
+
+    def mark_isolated_decode_done(
+        self,
+        request_id: str,
+        uid: Optional[str],
+        *,
+        timestamp_iso: str,
+        completion_number: int,
+    ) -> None:
+        def _apply(row: TimelineRow) -> bool:
+            changed = False
+            if completion_number <= 1 and not row.isolated_first_decode_done_ts:
+                row.isolated_first_decode_done_ts = timestamp_iso
+                changed = True
+            if row.isolated_latest_decode_done_ts != timestamp_iso:
+                row.isolated_latest_decode_done_ts = timestamp_iso
+                changed = True
+            return changed
+
+        self._update(request_id, uid, _apply)
+
 
 TIMELINE_WRITER = RequestTimelineWriter()
 
@@ -230,6 +292,20 @@ class RunningBatchSnapshotWriter:
         self._lock = threading.Lock()
         self._header_written = False
         self._write_failed = False
+        self._pending_rows: list[list[object]] = []
+        self._flush_interval_s = 0.5
+        self._stop_event = threading.Event()
+        self._flush_thread = threading.Thread(
+            target=self._flush_loop,
+            name="running-batch-writer",
+            daemon=True,
+        )
+        self._flush_thread.start()
+        atexit.register(self.close)
+
+    def _flush_loop(self) -> None:
+        while not self._stop_event.wait(self._flush_interval_s):
+            self.flush()
 
     def _ensure_header_locked(self) -> None:
         if self._header_written or self._write_failed:
@@ -271,38 +347,52 @@ class RunningBatchSnapshotWriter:
         now = _now_iso()
         reqs = list(running_reqs)
         with self._lock:
+            running_batch_size = len(reqs)
+            for req in reqs:
+                request_id = getattr(req, "rid", "")
+                uid = getattr(req, "uid", None)
+                user_id, user_request_number = TIMELINE_WRITER._parse_ids(
+                    request_id, uid
+                )
+                prompt_tokens = len(getattr(req, "origin_input_ids", []) or [])
+                completion_tokens = len(getattr(req, "output_ids", []) or [])
+                total_tokens = prompt_tokens + completion_tokens
+                self._pending_rows.append(
+                    [
+                        now,
+                        batch_type,
+                        running_batch_size,
+                        request_id,
+                        user_id,
+                        user_request_number,
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                        getattr(req, "waiting_time_in_decodes", 0),
+                    ]
+                )
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._write_failed or not self._pending_rows:
+                return
             self._ensure_header_locked()
             if self._write_failed:
                 return
-            try:
-                with open(self.csv_path, "a", newline="") as f:
-                    writer = csv.writer(f)
-                    running_batch_size = len(reqs)
-                    for req in reqs:
-                        request_id = getattr(req, "rid", "")
-                        uid = getattr(req, "uid", None)
-                        user_id, user_request_number = TIMELINE_WRITER._parse_ids(
-                            request_id, uid
-                        )
-                        prompt_tokens = len(getattr(req, "origin_input_ids", []) or [])
-                        completion_tokens = len(getattr(req, "output_ids", []) or [])
-                        total_tokens = prompt_tokens + completion_tokens
-                        writer.writerow(
-                            [
-                                now,
-                                batch_type,
-                                running_batch_size,
-                                request_id,
-                                user_id,
-                                user_request_number,
-                                prompt_tokens,
-                                completion_tokens,
-                                total_tokens,
-                                getattr(req, "waiting_time_in_decodes", 0),
-                            ]
-                        )
-            except OSError:
-                self._write_failed = True
+            rows = self._pending_rows
+            self._pending_rows = []
+        try:
+            with open(self.csv_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerows(rows)
+        except OSError:
+            self._write_failed = True
+            with self._lock:
+                self._pending_rows = rows + self._pending_rows
+
+    def close(self) -> None:
+        self._stop_event.set()
+        self.flush()
 
 
 RUNNING_BATCH_WRITER = RunningBatchSnapshotWriter()

@@ -36,7 +36,7 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
 from sglang.srt.metrics.prefix_match import flush_prefix_match_metrics
-from sglang.srt.delta_fairness.time_estimation import pooled_prefill_time_estimation
+from sglang.srt.delta_fairness.time_estimation import pooled_cache_prefill_time_estimation
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -272,10 +272,11 @@ class RadixCache(BasePrefixCache):
         if kv_tokens <= 0:
             return 0.0
         return float(
-            pooled_prefill_time_estimation(
+            pooled_cache_prefill_time_estimation(
                 total_batch_sum=kv_tokens,
                 max_token_size=kv_tokens,
                 batch_length=1,
+                n=max(int(self.fairinf_n or 1), 1),
             )
         )
 
