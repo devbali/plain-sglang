@@ -589,17 +589,31 @@ class AlternateHistorySimulator:
         *,
         user_is_fair: Callable[[str, Optional[ScheduleBatch]], bool],
         deltas_in_microseconds: Optional[Dict[str, int]] = None,
+        timing_breakdown: Optional[Dict[str, float]] = None,
     ) -> List[str]:
+        pass_start = time.perf_counter()
         fair_users = self.sync_fair_user_tracking(
             running_batch,
             waiting_queue,
             user_is_fair=user_is_fair,
             deltas_in_microseconds=deltas_in_microseconds,
         )
+        after_sync = time.perf_counter()
         for uid in fair_users:
             user_timeline = self.users.get(uid)
             if user_timeline is not None:
                 user_timeline.rebuild_from_real_state(self.most_recent_event_real)
+        after_rebuild = time.perf_counter()
+        if timing_breakdown is not None:
+            timing_breakdown["sync_fair_user_tracking_ms"] = (
+                after_sync - pass_start
+            ) * 1000.0
+            timing_breakdown["rebuild_from_real_state_ms"] = (
+                after_rebuild - after_sync
+            ) * 1000.0
+            timing_breakdown["simulator_start_of_pass_ms"] = (
+                after_rebuild - pass_start
+            ) * 1000.0
         return fair_users
 
     def build_deadline_candidates(

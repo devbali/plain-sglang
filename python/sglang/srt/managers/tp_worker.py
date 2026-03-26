@@ -129,6 +129,19 @@ class AsyncCSVLogger:
         self._queue.put(line)
 
 
+class StepTimer:
+    def __init__(self):
+        self._last = time.perf_counter()
+        self.parts: Dict[str, float] = {}
+
+    def mark(self, name: str) -> float:
+        now = time.perf_counter()
+        elapsed_ms = (now - self._last) * 1000.0
+        self.parts[name] = elapsed_ms
+        self._last = now
+        return elapsed_ms
+
+
 def _normalize_single_delta_config(raw_deltas: Optional[Dict[str, int]]) -> Dict[str, int]:
     raw_deltas = raw_deltas or {}
     candidate_keys = (
@@ -392,6 +405,30 @@ class ModelTpServer:
             "decode_sample_postprocess_ms,decode_handle_finished_ms,"
             "running_reqs,num_tokens,token_usage,throughput,queue_reqs\n",
         )
+        self._intermediate_gap_csv_logger = AsyncCSVLogger(
+            "sglang_intermediate_gaps.csv",
+            "timestamp,after_event_type,next_event_type,"
+            "after_running_reqs,after_num_tokens,after_queue_reqs,"
+            "current_running_reqs,current_num_tokens,current_queue_reqs,"
+            "gap_total_ms,decision_overhead_ms,force_prefill_check_ms,force_decode_check_ms,"
+            "get_new_prefill_batch_ms,calc_priority_ms,prefill_adder_init_ms,"
+            "remove_running_tokens_ms,fairness_start_of_pass_ms,inflight_ms,"
+            "force_prefill_reservations_ms,waiting_queue_prefills_ms,build_batch_ms,"
+            "doc_sync_fair_user_tracking_ms,doc_rebuild_from_real_state_ms,"
+            "doc_build_deadline_candidates_ms,doc_sort_waiting_prefills_ms,"
+            "doc_safe_prefix_scan_ms,doc_build_pass_state_ms,doc_start_of_pass_total_ms\n",
+        )
+        self._doc_policy_snapshot_logger = AsyncCSVLogger(
+            "doc_policy_pass_snapshots.jsonl", ""
+        )
+        self._doc_policy_snapshot_threshold_ms = float(
+            os.environ.get("DOC_POLICY_SNAPSHOT_THRESHOLD_MS", "200")
+        )
+        self._doc_policy_snapshot_limit = int(
+            os.environ.get("DOC_POLICY_SNAPSHOT_LIMIT", "20")
+        )
+        self._doc_policy_snapshot_count = 0
+        self._last_event_snapshot = None
 
         # Chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
@@ -465,6 +502,8 @@ class ModelTpServer:
 
     @torch.inference_mode()
     def forward_step(self):
+        decision_timer = StepTimer()
+        prefill_telemetry: Dict[str, float] = {}
         force_decode = False
         max_prefill_size = None
         new_batch = None
@@ -483,19 +522,51 @@ class ModelTpServer:
         if self.fairness_policy.fairinf_prioritize_force_prefill():
             # Force prefill is checked first
             force_prefill = force_prefill_func()
+            decision_timer.mark("force_prefill_check_ms")
 
             if not force_prefill:
                 force_decode, max_prefill_size = force_decode_func()
+                decision_timer.mark("force_decode_check_ms")
 
-            new_batch = None if force_decode else self.get_new_prefill_batch(max_prefill_size)
+            new_batch = (
+                None
+                if force_decode
+                else self.get_new_prefill_batch(
+                    max_prefill_size, telemetry=prefill_telemetry
+                )
+            )
+            decision_timer.mark("get_new_prefill_batch_ms")
         
         else:
             # Force decode is checked first
             force_decode, max_prefill_size = force_decode_func()
+            decision_timer.mark("force_decode_check_ms")
             
             if not force_decode:
                 force_prefill = force_prefill_func()
-                new_batch = None if force_prefill else self.get_new_prefill_batch(max_prefill_size)
+                decision_timer.mark("force_prefill_check_ms")
+                new_batch = (
+                    None
+                    if force_prefill
+                    else self.get_new_prefill_batch(
+                        max_prefill_size, telemetry=prefill_telemetry
+                    )
+                )
+                decision_timer.mark("get_new_prefill_batch_ms")
+
+        if "force_prefill_check_ms" not in decision_timer.parts:
+            decision_timer.parts["force_prefill_check_ms"] = 0.0
+        if "force_decode_check_ms" not in decision_timer.parts:
+            decision_timer.parts["force_decode_check_ms"] = 0.0
+        if "get_new_prefill_batch_ms" not in decision_timer.parts:
+            decision_timer.parts["get_new_prefill_batch_ms"] = 0.0
+        self._log_intermediate_gap(
+            next_event_type=(
+                "prefill" if new_batch is not None else "decode" if self.running_batch is not None else "idle"
+            ),
+            decision_parts=decision_timer.parts,
+            prefill_parts=prefill_telemetry,
+        )
 
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
@@ -633,6 +704,147 @@ class ModelTpServer:
                 f"{breakdown.get('handle_finished_ms', '')},{running_reqs},{num_used},"
                 f"{token_usage:.4f},{throughput:.4f},{queue_reqs}\n"
             )
+            self._last_event_snapshot = {
+                "event_type": "decode" if decode else "prefill",
+                "running_reqs": running_reqs,
+                "num_tokens": num_used,
+                "queue_reqs": queue_reqs,
+                "perf_counter": time.perf_counter(),
+                "timestamp": current_time,
+            }
+
+    def _current_num_used_tokens(self) -> int:
+        return self.max_total_num_tokens - (
+            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
+        )
+
+    def _log_intermediate_gap(
+        self,
+        *,
+        next_event_type: str,
+        decision_parts: Dict[str, float],
+        prefill_parts: Dict[str, float],
+    ) -> None:
+        if (
+            self.tp_rank != 0
+            or self._last_event_snapshot is None
+            or next_event_type == "idle"
+        ):
+            return
+
+        snapshot = self._last_event_snapshot
+        now_perf = time.perf_counter()
+        gap_total_ms = (now_perf - snapshot["perf_counter"]) * 1000.0
+        current_running_reqs = (
+            len(self.running_batch.reqs) if self.running_batch is not None else 0
+        )
+        current_queue_reqs = len(self.waiting_queue)
+        current_num_tokens = self._current_num_used_tokens()
+        self._intermediate_gap_csv_logger.log(
+            f"{time.time()},{snapshot['event_type']},{next_event_type},"
+            f"{snapshot['running_reqs']},{snapshot['num_tokens']},{snapshot['queue_reqs']},"
+            f"{current_running_reqs},{current_num_tokens},{current_queue_reqs},"
+            f"{gap_total_ms},"
+            f"{decision_parts.get('force_prefill_check_ms', 0.0) + decision_parts.get('force_decode_check_ms', 0.0) + decision_parts.get('get_new_prefill_batch_ms', 0.0)},"
+            f"{decision_parts.get('force_prefill_check_ms', 0.0)},"
+            f"{decision_parts.get('force_decode_check_ms', 0.0)},"
+            f"{decision_parts.get('get_new_prefill_batch_ms', 0.0)},"
+            f"{prefill_parts.get('calc_priority_ms', 0.0)},"
+            f"{prefill_parts.get('prefill_adder_init_ms', 0.0)},"
+            f"{prefill_parts.get('remove_running_tokens_ms', 0.0)},"
+            f"{prefill_parts.get('fairness_start_of_pass_ms', 0.0)},"
+            f"{prefill_parts.get('inflight_ms', 0.0)},"
+            f"{prefill_parts.get('force_prefill_reservations_ms', 0.0)},"
+            f"{prefill_parts.get('waiting_queue_prefills_ms', 0.0)},"
+            f"{prefill_parts.get('build_batch_ms', 0.0)},"
+            f"{prefill_parts.get('doc_sync_fair_user_tracking_ms', 0.0)},"
+            f"{prefill_parts.get('doc_rebuild_from_real_state_ms', 0.0)},"
+            f"{prefill_parts.get('doc_build_deadline_candidates_ms', 0.0)},"
+            f"{prefill_parts.get('doc_sort_waiting_prefills_ms', 0.0)},"
+            f"{prefill_parts.get('doc_safe_prefix_scan_ms', 0.0)},"
+            f"{prefill_parts.get('doc_build_pass_state_ms', 0.0)},"
+            f"{prefill_parts.get('doc_start_of_pass_total_ms', 0.0)}\n"
+        )
+
+    def _serialize_doc_policy_req(self, req: Req) -> Dict[str, Any]:
+        return {
+            "uid": req.uid,
+            "rid": req.rid,
+            "prompt_tokens": len(req.origin_input_ids),
+            "output_tokens": len(req.output_ids),
+            "fill_tokens": len(req.fill_ids) if req.fill_ids is not None else None,
+            "max_new_tokens": (
+                None
+                if getattr(req, "sampling_params", None) is None
+                else getattr(req.sampling_params, "max_new_tokens", None)
+            ),
+            "waiting_time_in_decodes": getattr(req, "waiting_time_in_decodes", None),
+        }
+
+    def _serialize_doc_policy_real_event(self, event) -> Optional[Dict[str, Any]]:
+        if event is None:
+            return None
+        return {
+            "type": event.__class__.__name__,
+            "req_id": getattr(event, "req_id", None),
+            "end_timestamp": getattr(event, "end_timestamp", None),
+            "completion_number": getattr(event, "completion_number", None),
+        }
+
+    def _capture_doc_policy_pass_snapshot_state(self) -> Optional[Dict[str, Any]]:
+        if self.tp_rank != 0:
+            return None
+        if not isinstance(self.fairness_policy, DocPolicy):
+            return None
+
+        simulator = self.fairness_policy.simulator
+        return {
+            "running_batch_size": 0
+            if self.running_batch is None
+            else len(self.running_batch.reqs),
+            "waiting_queue_size": len(self.waiting_queue),
+            "running_reqs": []
+            if self.running_batch is None
+            else [self._serialize_doc_policy_req(req) for req in self.running_batch.reqs],
+            "waiting_reqs": [self._serialize_doc_policy_req(req) for req in self.waiting_queue],
+            "most_recent_event_real": {
+                rid: self._serialize_doc_policy_real_event(event)
+                for rid, event in simulator.most_recent_event_real.items()
+            },
+            "tracked_requests": {
+                rid: {
+                    "uid": tracked.req.uid,
+                    "arrival_timestamp": tracked.arrival_timestamp,
+                    "most_recent_real_event": self._serialize_doc_policy_real_event(
+                        simulator.most_recent_event_real.get(rid)
+                    ),
+                }
+                for rid, tracked in simulator.requests.items()
+            },
+        }
+
+    def _maybe_dump_doc_policy_pass_snapshot(
+        self,
+        fairness_start_of_pass_ms: float,
+        pre_pass_snapshot: Optional[Dict[str, Any]],
+    ) -> None:
+        if self.tp_rank != 0:
+            return
+        if not isinstance(self.fairness_policy, DocPolicy):
+            return
+        if fairness_start_of_pass_ms < self._doc_policy_snapshot_threshold_ms:
+            return
+        if self._doc_policy_snapshot_count >= self._doc_policy_snapshot_limit:
+            return
+
+        snapshot = {
+            "timestamp": time.time(),
+            "fairness_start_of_pass_ms": fairness_start_of_pass_ms,
+            "pre": pre_pass_snapshot,
+            "post": self._capture_doc_policy_pass_snapshot_state(),
+        }
+        self._doc_policy_snapshot_logger.log(json.dumps(snapshot) + "\n")
+        self._doc_policy_snapshot_count += 1
 
 
     def check_memory(self):
@@ -730,8 +942,14 @@ class ModelTpServer:
         self.waiting_queue.append(req)
 
     def get_new_prefill_batch(
-        self, max_prefill_token_size: Optional[int] = None
+        self,
+        max_prefill_token_size: Optional[int] = None,
+        *,
+        telemetry: Optional[Dict[str, float]] = None,
     ) -> Optional[ScheduleBatch]:
+        step_timer = StepTimer()
+        telemetry = telemetry if telemetry is not None else {}
+        pre_pass_snapshot = self._capture_doc_policy_pass_snapshot_state()
         running_bs = (
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
@@ -741,6 +959,7 @@ class ModelTpServer:
 
         # Get priority queue
         prefix_computed = self.scheduler.calc_priority(self.waiting_queue)
+        telemetry["calc_priority_ms"] = step_timer.mark("calc_priority_ms")
 
         num_mixed_running = running_bs if self.is_mixed_chunk else 0
         max_input_size = (
@@ -757,15 +976,61 @@ class ModelTpServer:
             num_mixed_running,
             fairness_policy=self.fairness_policy,
         )
+        telemetry["prefill_adder_init_ms"] = step_timer.mark("prefill_adder_init_ms")
 
         if self.running_batch is not None:
             adder.remove_running_tokens(self.running_batch, self.new_token_ratio)
+        telemetry["remove_running_tokens_ms"] = step_timer.mark(
+            "remove_running_tokens_ms"
+        )
 
         self.fairness_policy.start_of_pass(
             self.running_batch,
             self.waiting_queue,
             new_token_ratio=self.new_token_ratio,
             max_running_requests=self.max_running_requests,
+        )
+        telemetry["fairness_start_of_pass_ms"] = step_timer.mark(
+            "fairness_start_of_pass_ms"
+        )
+        if isinstance(self.fairness_policy, DocPolicy):
+            telemetry["doc_sync_fair_user_tracking_ms"] = (
+                self.fairness_policy._last_pass_breakdown_ms.get(
+                    "sync_fair_user_tracking_ms", 0.0
+                )
+            )
+            telemetry["doc_rebuild_from_real_state_ms"] = (
+                self.fairness_policy._last_pass_breakdown_ms.get(
+                    "rebuild_from_real_state_ms", 0.0
+                )
+            )
+            telemetry["doc_build_deadline_candidates_ms"] = (
+                self.fairness_policy._last_pass_breakdown_ms.get(
+                    "build_deadline_candidates_ms", 0.0
+                )
+            )
+            telemetry["doc_sort_waiting_prefills_ms"] = (
+                self.fairness_policy._last_pass_breakdown_ms.get(
+                    "sort_waiting_prefills_ms", 0.0
+                )
+            )
+            telemetry["doc_safe_prefix_scan_ms"] = (
+                self.fairness_policy._last_pass_breakdown_ms.get(
+                    "safe_prefix_scan_ms", 0.0
+                )
+            )
+            telemetry["doc_build_pass_state_ms"] = (
+                self.fairness_policy._last_pass_breakdown_ms.get(
+                    "build_pass_state_ms", 0.0
+                )
+            )
+            telemetry["doc_start_of_pass_total_ms"] = (
+                self.fairness_policy._last_pass_breakdown_ms.get(
+                    "doc_policy_start_of_pass_total_ms", 0.0
+                )
+            )
+        self._maybe_dump_doc_policy_pass_snapshot(
+            telemetry["fairness_start_of_pass_ms"], pre_pass_snapshot
         )
 
         # Some fairness policies, notably doc_policy, compute a hard fair-prefill cap
@@ -796,6 +1061,7 @@ class ModelTpServer:
             else:
                 self.current_inflight_req = None
                 has_inflight = False
+        telemetry["inflight_ms"] = step_timer.mark("inflight_ms")
 
         extra_space, evicted_reqs = self.fairness_policy.force_prefill_reservations(
             self.waiting_queue,
@@ -807,6 +1073,9 @@ class ModelTpServer:
             max_input_size=max_input_size,
             prefix_computed=prefix_computed,
             max_running_requests=self.max_running_requests,
+        )
+        telemetry["force_prefill_reservations_ms"] = step_timer.mark(
+            "force_prefill_reservations_ms"
         )
         running_bs = len(self.running_batch.reqs) if self.running_batch is not None else 0
         available_req_slots = len(self.req_to_token_pool.free_slots)
@@ -830,6 +1099,9 @@ class ModelTpServer:
             max_running_requests=self.max_running_requests,
             available_req_slots=available_req_slots,
             max_input_size=max_input_size,
+        )
+        telemetry["waiting_queue_prefills_ms"] = step_timer.mark(
+            "waiting_queue_prefills_ms"
         )
 
         can_run_list = adder.can_run_list
@@ -890,6 +1162,7 @@ class ModelTpServer:
         new_batch.max_running_requests = self.max_running_requests
         new_batch.delta_fairness_n = self.delta_fairness_n
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
+        telemetry["build_batch_ms"] = step_timer.mark("build_batch_ms")
         return new_batch
 
     def forward_prefill_batch(self, batch: ScheduleBatch):

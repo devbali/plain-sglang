@@ -60,6 +60,7 @@ class DocPolicy(DeltaFairnessPolicy):
         self._max_safe_prefill_tokens: Optional[int] = None
         self._has_fair_waiting = False
         self._has_decode_deadline = False
+        self._last_pass_breakdown_ms: Dict[str, float] = {}
 
     def _read_deltas(self, delta_fairness_deltas_microseconds: Optional[Dict[str, int]]) -> None:
         deltas = delta_fairness_deltas_microseconds or {}
@@ -140,7 +141,9 @@ class DocPolicy(DeltaFairnessPolicy):
         waiting_queue: List[Req],
         running_batch: Optional[ScheduleBatch],
         delta_fairness_deltas_microseconds: Optional[Dict[str, int]],
+        timing_breakdown: Optional[Dict[str, float]] = None,
     ) -> None:
+        phase_start = time.perf_counter()
         self._read_deltas(delta_fairness_deltas_microseconds)
         self._deadline_queue, self._waiting_prefill_start_deadline_by_rid = (
             self.simulator.build_deadline_candidates(
@@ -164,6 +167,7 @@ class DocPolicy(DeltaFairnessPolicy):
                 ),
             )
         )
+        after_deadline_build = time.perf_counter()
 
         indexed = list(enumerate(waiting_queue))
         indexed.sort(
@@ -177,6 +181,7 @@ class DocPolicy(DeltaFairnessPolicy):
                 item[0],
             )
         )
+        after_waiting_sort = time.perf_counter()
         self._safe_waiting_queue = [req for _, req in indexed]
         self._safe_waiting_rids = {req.rid for req in self._safe_waiting_queue}
         self._has_fair_waiting = bool(self._safe_waiting_queue)
@@ -193,6 +198,17 @@ class DocPolicy(DeltaFairnessPolicy):
             default=None,
         )
         if earliest_decode_deadline is None:
+            if timing_breakdown is not None:
+                timing_breakdown["build_deadline_candidates_ms"] = (
+                    after_deadline_build - phase_start
+                ) * 1000.0
+                timing_breakdown["sort_waiting_prefills_ms"] = (
+                    after_waiting_sort - after_deadline_build
+                ) * 1000.0
+                timing_breakdown["safe_prefix_scan_ms"] = 0.0
+                timing_breakdown["build_pass_state_ms"] = (
+                    after_waiting_sort - phase_start
+                ) * 1000.0
             return
         self._has_decode_deadline = True
 
@@ -209,6 +225,20 @@ class DocPolicy(DeltaFairnessPolicy):
             break
 
         self._max_safe_prefill_tokens = safe_prompt_tokens
+        after_safe_scan = time.perf_counter()
+        if timing_breakdown is not None:
+            timing_breakdown["build_deadline_candidates_ms"] = (
+                after_deadline_build - phase_start
+            ) * 1000.0
+            timing_breakdown["sort_waiting_prefills_ms"] = (
+                after_waiting_sort - after_deadline_build
+            ) * 1000.0
+            timing_breakdown["safe_prefix_scan_ms"] = (
+                after_safe_scan - after_waiting_sort
+            ) * 1000.0
+            timing_breakdown["build_pass_state_ms"] = (
+                after_safe_scan - phase_start
+            ) * 1000.0
 
     def start_of_pass(
         self,
@@ -224,13 +254,28 @@ class DocPolicy(DeltaFairnessPolicy):
             new_token_ratio=new_token_ratio,
             max_running_requests=max_running_requests,
         )
+        breakdown: Dict[str, float] = {}
+        pass_start = time.perf_counter()
         self.simulator.start_of_pass(
             running_batch,
             waiting_queue,
             user_is_fair=self._user_is_fair_for_tracking,
             deltas_in_microseconds=self._deltas_us,
+            timing_breakdown=breakdown,
         )
-        self._build_pass_state(waiting_queue, running_batch, self._deltas_us)
+        after_simulator = time.perf_counter()
+        self._build_pass_state(
+            waiting_queue,
+            running_batch,
+            self._deltas_us,
+            timing_breakdown=breakdown,
+        )
+        after_build = time.perf_counter()
+        breakdown["doc_policy_after_super_ms"] = (after_simulator - pass_start) * 1000.0
+        breakdown["doc_policy_start_of_pass_total_ms"] = (
+            after_build - pass_start
+        ) * 1000.0
+        self._last_pass_breakdown_ms = breakdown
 
     def process_new_request(self, req: Req) -> None:
         super().process_new_request(req)
