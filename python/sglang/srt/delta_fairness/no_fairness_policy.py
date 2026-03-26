@@ -192,11 +192,33 @@ class NoFairnessPolicy:
         waiting_queue: List["Req"],
         scheduled_batch: Optional["ScheduleBatch"] = None,
         selected_rids: Optional[set[str]] = None,
+        prepare_pass_state: bool = True,
     ) -> None:
-        del event_type, running_batch, waiting_queue, scheduled_batch, selected_rids
+        del (
+            event_type,
+            running_batch,
+            waiting_queue,
+            scheduled_batch,
+            selected_rids,
+            prepare_pass_state,
+        )
 
     def consume_prepared_next_pass(self) -> bool:
         return False
+
+    def launch_async_decode_epoch_prepare(
+        self,
+        *,
+        running_batch: Optional["ScheduleBatch"],
+        waiting_queue: List["Req"],
+        selected_rids: Optional[set[str]] = None,
+        decode_steps: int = 1,
+    ) -> bool:
+        del running_batch, waiting_queue, selected_rids, decode_steps
+        return False
+
+    def wait_for_async_prepare(self) -> float:
+        return 0.0
 
     # ---- Delta fairness hooks (no-op defaults) ----
     

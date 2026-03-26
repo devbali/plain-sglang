@@ -394,11 +394,13 @@ class ModelTpServer:
         self.last_running_batch_snapshot_tic = 0.0
         self.last_model_forward_elapsed_ms = None
         self.last_decode_step_breakdown = None
+        self._last_prepare_async_wait_ms = 0.0
         self._sglang_csv_logger = AsyncCSVLogger(
             "sglang_log.csv",
             "timestamp,type,time_elapsed,gpu_time_elapsed_ms,wall_time_elapsed_ms,"
             "model_forward_elapsed_ms,"
             "decode_sync_wait_ms,decode_after_sync_ms,"
+            "decode_prepare_async_wait_ms,"
             "decode_check_mem_ms,decode_jump_forward_ms,decode_prepare_ms,"
             "decode_fairness_prepare_ms,"
             "decode_fairness_sync_live_user_tracking_ms,"
@@ -416,7 +418,7 @@ class ModelTpServer:
             "timestamp,after_event_type,next_event_type,"
             "after_running_reqs,after_num_tokens,after_queue_reqs,"
             "current_running_reqs,current_num_tokens,current_queue_reqs,"
-            "gap_total_ms,decision_overhead_ms,force_prefill_check_ms,force_decode_check_ms,"
+            "gap_total_ms,decision_overhead_ms,prepare_async_wait_ms,force_prefill_check_ms,force_decode_check_ms,"
             "get_new_prefill_batch_ms,calc_priority_ms,prefill_adder_init_ms,"
             "remove_running_tokens_ms,fairness_start_of_pass_ms,inflight_ms,"
             "force_prefill_reservations_ms,waiting_queue_prefills_ms,build_batch_ms,"
@@ -631,8 +633,16 @@ class ModelTpServer:
             if self.running_batch is not None:
                 self.running_batch.max_running_requests = self.max_running_requests
                 self.running_batch.delta_fairness_n = self.delta_fairness_n
+                async_prepare_launched = self.fairness_policy.launch_async_decode_epoch_prepare(
+                    running_batch=self.running_batch,
+                    waiting_queue=list(self.waiting_queue),
+                    selected_rids=None if not force_decode else self.fairness_policy.fairinf_overdue_decode_subset_rids(
+                        self.running_batch
+                    ),
+                    decode_steps=global_config.num_continue_decode_steps,
+                )
                 # Run a few decode batches continuously for reducing overhead
-                for _ in range(global_config.num_continue_decode_steps):
+                for decode_step_idx in range(global_config.num_continue_decode_steps):
                     selected_rids = (
                         self.fairness_policy.fairinf_overdue_decode_subset_rids(
                             self.running_batch
@@ -655,7 +665,14 @@ class ModelTpServer:
                     self.num_generated_tokens += generated_count
                     wall_start = time.perf_counter()
                     start.record()
-                    self.forward_decode_batch(self.running_batch, selected_rids=selected_rids)
+                    self.forward_decode_batch(
+                        self.running_batch,
+                        selected_rids=selected_rids,
+                        prepare_pass_state=(
+                            (decode_step_idx == global_config.num_continue_decode_steps - 1)
+                            and not async_prepare_launched
+                        ),
+                    )
                     end.record()
                     torch.cuda.synchronize()
                     elapsed_time_ms = start.elapsed_time(end)
@@ -672,6 +689,11 @@ class ModelTpServer:
                     if self.running_batch.is_empty():
                         self.running_batch = None
                         break
+                self._last_prepare_async_wait_ms = (
+                    self.fairness_policy.wait_for_async_prepare()
+                    if async_prepare_launched
+                    else 0.0
+                )
 
             else:
                 self.check_memory()
@@ -726,6 +748,7 @@ class ModelTpServer:
                 f"{current_time},{'Decode' if decode else 'Prefill'},{wall_time_ms},"
                 f"{elapsed_time_ms},{wall_time_ms},{model_forward_ms},"
                 f"{breakdown.get('sync_wait_ms', '')},{breakdown.get('after_sync_ms', '')},"
+                f"{self._last_prepare_async_wait_ms if decode else ''},"
                 f"{breakdown.get('check_mem_ms', '')},{breakdown.get('jump_forward_ms', '')},"
                 f"{breakdown.get('prepare_ms', '')},"
                 f"{breakdown.get('fairness_prepare_ms', '')},"
@@ -784,6 +807,7 @@ class ModelTpServer:
             f"{current_running_reqs},{current_num_tokens},{current_queue_reqs},"
             f"{gap_total_ms},"
             f"{decision_parts.get('force_prefill_check_ms', 0.0) + decision_parts.get('force_decode_check_ms', 0.0) + decision_parts.get('get_new_prefill_batch_ms', 0.0)},"
+            f"{self._last_prepare_async_wait_ms},"
             f"{decision_parts.get('force_prefill_check_ms', 0.0)},"
             f"{decision_parts.get('force_decode_check_ms', 0.0)},"
             f"{decision_parts.get('get_new_prefill_batch_ms', 0.0)},"
@@ -803,6 +827,7 @@ class ModelTpServer:
             f"{prefill_parts.get('doc_build_pass_state_ms', 0.0)},"
             f"{prefill_parts.get('doc_start_of_pass_total_ms', 0.0)}\n"
         )
+        self._last_prepare_async_wait_ms = 0.0
 
     def _log_scheduler_pass(
         self,
@@ -1558,6 +1583,7 @@ class ModelTpServer:
         batch: ScheduleBatch,
         *,
         selected_rids: Optional[set[str]] = None,
+        prepare_pass_state: bool = True,
     ):
         self.last_model_forward_elapsed_ms = None
         self.last_decode_step_breakdown = None
@@ -1760,6 +1786,7 @@ class ModelTpServer:
                 waiting_queue=list(self.waiting_queue),
                 scheduled_batch=None,
                 selected_rids=selected_rids,
+                prepare_pass_state=prepare_pass_state,
             )
             fairness_prepare_end = time.perf_counter()
             torch.cuda.synchronize()

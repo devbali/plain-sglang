@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+import threading
 from copy import copy
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
@@ -83,6 +84,12 @@ class DocPolicy(DeltaFairnessPolicy):
         self._current_pass_running_sig: Optional[Tuple[str, ...]] = None
         self._current_pass_waiting_sig: Optional[Tuple[str, ...]] = None
         self._last_prepare_breakdown_ms: Dict[str, float] = {}
+        self._async_prepare_lock = threading.Lock()
+        self._async_prepare_thread: Optional[threading.Thread] = None
+        self._async_prepare_exception: Optional[BaseException] = None
+        self._async_prepare_result: Optional[Dict[str, object]] = None
+        self._async_prepare_active = False
+        self._async_pending_finished: List[Req] = []
 
     def _read_deltas(self, delta_fairness_deltas_microseconds: Optional[Dict[str, int]]) -> None:
         deltas = delta_fairness_deltas_microseconds or {}
@@ -304,9 +311,12 @@ class DocPolicy(DeltaFairnessPolicy):
         self,
         waiting_queue: List[Req],
         running_batch: Optional[ScheduleBatch],
+        *,
+        simulator: Optional[AlternateHistorySimulator] = None,
     ) -> None:
+        target_simulator = self.simulator if simulator is None else simulator
         self._prepared_deadline_queue, self._prepared_waiting_prefill_start_deadline_by_rid = (
-            self.simulator.build_deadline_candidates(
+            target_simulator.build_deadline_candidates(
                 waiting_queue,
                 running_batch,
                 req_is_fair_prefill=lambda req, rb: self.req_is_fair_prefill(
@@ -329,6 +339,201 @@ class DocPolicy(DeltaFairnessPolicy):
         )
         self._prepared_waiting_sig = self._queue_sig(waiting_queue)
         self._prepared_running_sig = self._running_sig(running_batch)
+
+    def _async_snapshot_req(self, req: Req, *, output_delta: int = 0) -> Req:
+        cloned = copy(req)
+        cloned.origin_input_ids = list(req.origin_input_ids)
+        cloned.output_ids = _LengthOnlyTokens(len(req.output_ids) + output_delta)
+        cloned.fill_ids = (
+            None
+            if req.fill_ids is None
+            else _LengthOnlyTokens(len(req.fill_ids))
+        )
+        return cloned
+
+    def _async_prepare_decode_epoch(
+        self,
+        *,
+        running_batch: ScheduleBatch,
+        waiting_queue: List[Req],
+        selected_rids: Optional[set[str]],
+        decode_steps: int,
+    ) -> None:
+        try:
+            predicted_running = SimpleNamespace(reqs=list(running_batch.reqs))
+            predicted_waiting = list(waiting_queue)
+            self.simulator.sync_live_user_tracking(
+                predicted_running,
+                predicted_waiting,
+                deltas_in_microseconds=self._deltas_us,
+            )
+            affected_user_ids = sorted(
+                {
+                    req.uid
+                    for req in running_batch.reqs
+                    if selected_rids is None or req.rid in selected_rids
+                }
+            )
+            self._apply_logical_decode_updates(
+                self.simulator,
+                predicted_running,
+                selected_rids=selected_rids,
+                decode_steps=decode_steps,
+            )
+            rebuild_breakdown: Dict[str, float] = {}
+            self.simulator.rebuild_all_tracked_requests(
+                affected_user_ids,
+                timing_breakdown=rebuild_breakdown,
+            )
+            deadline_start = time.perf_counter()
+            deadline_queue, waiting_prefill_start_deadline_by_rid = (
+                self.simulator.build_deadline_candidates(
+                    predicted_waiting,
+                    predicted_running,
+                    req_is_fair_prefill=lambda req, rb: self.req_is_fair_prefill(
+                        req, running_batch=rb
+                    ),
+                    req_is_fair_decode=lambda req, rb: self.req_is_fair_decode(
+                        req, running_batch=rb
+                    ),
+                    event_delta_seconds=self._event_delta_seconds,
+                    pooled_prefill_estimate_seconds=lambda req: pooled_prefill_time_estimation(
+                        len(req.origin_input_ids),
+                        len(req.origin_input_ids),
+                        1,
+                        max(int(self.delta_fairness_n or 1), 1),
+                    ),
+                    pooled_decode_estimate_seconds=lambda req, rb: self._current_pooled_decode_seconds(
+                        rb
+                    ),
+                )
+            )
+            deadline_elapsed_ms = (time.perf_counter() - deadline_start) * 1000.0
+            result = {
+                "deadline_queue": deadline_queue,
+                "waiting_prefill_start_deadline_by_rid": waiting_prefill_start_deadline_by_rid,
+                "waiting_sig": self._queue_sig(predicted_waiting),
+                "running_sig": self._running_sig(predicted_running),
+                "breakdown": {
+                    "sync_live_user_tracking_ms": 0.0,
+                    "logical_event_update_ms": 0.0,
+                    "rebuild_from_real_state_ms": rebuild_breakdown.get(
+                        "rebuild_scheduler_loop_ms", 0.0
+                    )
+                    + rebuild_breakdown.get("rebuild_live_states_ms", 0.0)
+                    + rebuild_breakdown.get("rebuild_state_setup_ms", 0.0),
+                    "rebuild_live_states_ms": rebuild_breakdown.get(
+                        "rebuild_live_states_ms", 0.0
+                    ),
+                    "rebuild_state_setup_ms": rebuild_breakdown.get(
+                        "rebuild_state_setup_ms", 0.0
+                    ),
+                    "rebuild_scheduler_loop_ms": rebuild_breakdown.get(
+                        "rebuild_scheduler_loop_ms", 0.0
+                    ),
+                    "rebuild_scheduler_step_count": rebuild_breakdown.get(
+                        "rebuild_scheduler_step_count", 0
+                    ),
+                    "rebuild_prefill_step_count": rebuild_breakdown.get(
+                        "rebuild_prefill_step_count", 0
+                    ),
+                    "rebuild_decode_step_count": rebuild_breakdown.get(
+                        "rebuild_decode_step_count", 0
+                    ),
+                    "build_deadline_candidates_ms": deadline_elapsed_ms,
+                },
+            }
+            with self._async_prepare_lock:
+                self._async_prepare_result = result
+                self._async_prepare_exception = None
+        except BaseException as exc:
+            with self._async_prepare_lock:
+                self._async_prepare_exception = exc
+
+    def launch_async_decode_epoch_prepare(
+        self,
+        *,
+        running_batch: Optional[ScheduleBatch],
+        waiting_queue: List[Req],
+        selected_rids: Optional[set[str]] = None,
+        decode_steps: int = 1,
+    ) -> bool:
+        if (
+            running_batch is None
+            or decode_steps <= 1
+            or selected_rids is not None
+        ):
+            return False
+        self.wait_for_async_prepare()
+        with self._async_prepare_lock:
+            self._async_prepare_result = None
+            self._async_prepare_exception = None
+        self._async_prepare_active = True
+        self._async_pending_finished = []
+        self._async_prepare_thread = threading.Thread(
+            target=self._async_prepare_decode_epoch,
+            kwargs={
+                "running_batch": SimpleNamespace(
+                    reqs=[
+                        self._async_snapshot_req(
+                            req,
+                            output_delta=(
+                                decode_steps
+                                if selected_rids is None or req.rid in selected_rids
+                                else 0
+                            ),
+                        )
+                        for req in running_batch.reqs
+                    ]
+                ),
+                "waiting_queue": [self._async_snapshot_req(req) for req in waiting_queue],
+                "selected_rids": selected_rids,
+                "decode_steps": decode_steps,
+            },
+            name="doc-policy-prepare-epoch",
+            daemon=True,
+        )
+        self._async_prepare_thread.start()
+        return True
+
+    def wait_for_async_prepare(self) -> float:
+        thread = self._async_prepare_thread
+        if thread is None:
+            return 0.0
+        wait_start = time.perf_counter()
+        thread.join()
+        wait_ms = (time.perf_counter() - wait_start) * 1000.0
+        self._async_prepare_thread = None
+        self._async_prepare_active = False
+        with self._async_prepare_lock:
+            if self._async_prepare_exception is not None:
+                exc = self._async_prepare_exception
+                self._async_prepare_exception = None
+                raise exc
+            result = self._async_prepare_result
+            self._async_prepare_result = None
+        if result is not None:
+            self._prepared_deadline_queue = list(result["deadline_queue"])
+            self._prepared_waiting_prefill_start_deadline_by_rid = dict(
+                result["waiting_prefill_start_deadline_by_rid"]
+            )
+            self._prepared_waiting_sig = result["waiting_sig"]
+            self._prepared_running_sig = result["running_sig"]
+            self._last_prepare_breakdown_ms = dict(result["breakdown"])
+            self._last_prepare_breakdown_ms[
+                "prepare_during_gpu_execution_total_ms"
+            ] = sum(
+                float(v)
+                for k, v in self._last_prepare_breakdown_ms.items()
+                if k.endswith("_ms")
+            )
+            self._simulator_rebuild_prepared = True
+        if self._async_pending_finished:
+            for req in self._async_pending_finished:
+                self.simulator.mark_request_finished(req)
+            self._async_pending_finished = []
+            self._simulator_rebuild_prepared = False
+        return wait_ms
 
     def _consume_prepared_pass_state(
         self,
@@ -441,11 +646,17 @@ class DocPolicy(DeltaFairnessPolicy):
         ) * 1000.0
         self._last_pass_breakdown_ms = breakdown
 
-    def _logical_event_timestamp(self, req: Req) -> float:
-        real_event = self.simulator.most_recent_event_real.get(req.rid)
+    def _logical_event_timestamp(
+        self,
+        req: Req,
+        *,
+        simulator: Optional[AlternateHistorySimulator] = None,
+    ) -> float:
+        target = self.simulator if simulator is None else simulator
+        real_event = target.most_recent_event_real.get(req.rid)
         if real_event is not None:
             return float(real_event.end_timestamp)
-        tracked = self.simulator.requests.get(req.rid)
+        tracked = target.requests.get(req.rid)
         if tracked is not None:
             return float(tracked.arrival_timestamp)
         return 0.0
@@ -456,9 +667,11 @@ class DocPolicy(DeltaFairnessPolicy):
         *,
         event_type: str,
         completion_number: Optional[int] = None,
+        simulator: Optional[AlternateHistorySimulator] = None,
     ) -> float:
-        tracked = self.simulator.requests.get(req.rid)
-        real_event = self.simulator.most_recent_event_real.get(req.rid)
+        target = self.simulator if simulator is None else simulator
+        tracked = target.requests.get(req.rid)
+        real_event = target.most_recent_event_real.get(req.rid)
         if tracked is not None and real_event is not None:
             upcoming = tracked.earliest_events_after_real_time(real_event) or []
             for event in upcoming:
@@ -473,7 +686,33 @@ class DocPolicy(DeltaFairnessPolicy):
                     )
                 ):
                     return float(event.end_timestamp)
-        return self._logical_event_timestamp(req)
+        return self._logical_event_timestamp(req, simulator=target)
+
+    def _apply_logical_decode_updates(
+        self,
+        simulator: AlternateHistorySimulator,
+        running_batch,
+        *,
+        selected_rids: Optional[set[str]],
+        decode_steps: int,
+    ) -> None:
+        chosen = selected_rids
+        for step in range(1, decode_steps + 1):
+            for req in running_batch.reqs:
+                if chosen is not None and req.rid not in chosen:
+                    continue
+                completion_number = len(req.output_ids) - decode_steps + step
+                logical_ts = self._logical_next_event_timestamp(
+                    req,
+                    event_type="decode",
+                    completion_number=completion_number,
+                    simulator=simulator,
+                )
+                simulator.most_recent_event_real[req.rid] = RequestDecodeEvent(
+                    req_id=req.rid,
+                    end_timestamp=logical_ts,
+                    completion_number=completion_number,
+                )
 
     def _predicted_running_batch(
         self,
@@ -495,9 +734,16 @@ class DocPolicy(DeltaFairnessPolicy):
         waiting_queue: List[Req],
         scheduled_batch: Optional[ScheduleBatch] = None,
         selected_rids: Optional[set[str]] = None,
+        prepare_pass_state: bool = True,
     ) -> None:
         breakdown: Dict[str, float] = {}
         phase_start = time.perf_counter()
+        if event_type == "decode" and self._async_prepare_active:
+            breakdown["prepare_during_gpu_execution_total_ms"] = (
+                time.perf_counter() - phase_start
+            ) * 1000.0
+            self._last_prepare_breakdown_ms = breakdown
+            return
         if event_type == "prefill" and scheduled_batch is not None:
             predicted_waiting = [
                 req
@@ -531,19 +777,35 @@ class DocPolicy(DeltaFairnessPolicy):
             breakdown["logical_event_update_ms"] = (
                 after_update - update_start
             ) * 1000.0
-            rebuild_start = after_update
-            affected_user_ids = sorted({req.uid for req in scheduled_batch.reqs})
-            self.simulator.rebuild_all_tracked_requests(affected_user_ids)
-            after_rebuild = time.perf_counter()
-            breakdown["rebuild_from_real_state_ms"] = (
-                after_rebuild - rebuild_start
-            ) * 1000.0
-            deadline_start = after_rebuild
-            self._prepare_deadline_state(predicted_waiting, predicted_running)
-            after_deadline = time.perf_counter()
-            breakdown["build_deadline_candidates_ms"] = (
-                after_deadline - deadline_start
-            ) * 1000.0
+            if prepare_pass_state:
+                rebuild_start = after_update
+                affected_user_ids = sorted({req.uid for req in scheduled_batch.reqs})
+                rebuild_breakdown: Dict[str, float] = {}
+                self.simulator.rebuild_all_tracked_requests(
+                    affected_user_ids,
+                    timing_breakdown=rebuild_breakdown,
+                )
+                after_rebuild = time.perf_counter()
+                breakdown["rebuild_from_real_state_ms"] = (
+                    after_rebuild - rebuild_start
+                ) * 1000.0
+                breakdown.update(rebuild_breakdown)
+                deadline_start = after_rebuild
+                self._prepare_deadline_state(predicted_waiting, predicted_running)
+                after_deadline = time.perf_counter()
+                breakdown["build_deadline_candidates_ms"] = (
+                    after_deadline - deadline_start
+                ) * 1000.0
+            else:
+                breakdown["rebuild_from_real_state_ms"] = 0.0
+                breakdown["rebuild_live_states_ms"] = 0.0
+                breakdown["rebuild_state_setup_ms"] = 0.0
+                breakdown["rebuild_scheduler_loop_ms"] = 0.0
+                breakdown["rebuild_scheduler_step_count"] = 0
+                breakdown["rebuild_prefill_step_count"] = 0
+                breakdown["rebuild_decode_step_count"] = 0
+                breakdown["build_deadline_candidates_ms"] = 0.0
+                self._simulator_rebuild_prepared = False
         elif event_type == "decode" and running_batch is not None:
             sync_start = time.perf_counter()
             self.simulator.sync_live_user_tracking(
@@ -575,33 +837,50 @@ class DocPolicy(DeltaFairnessPolicy):
             breakdown["logical_event_update_ms"] = (
                 after_update - update_start
             ) * 1000.0
-            rebuild_start = after_update
-            affected_user_ids = sorted(
-                {
-                    req.uid
-                    for req in running_batch.reqs
-                    if chosen is None or req.rid in chosen
-                }
-            )
-            self.simulator.rebuild_all_tracked_requests(affected_user_ids)
-            after_rebuild = time.perf_counter()
-            breakdown["rebuild_from_real_state_ms"] = (
-                after_rebuild - rebuild_start
-            ) * 1000.0
-            deadline_start = after_rebuild
-            predicted_running = self._predicted_decode_running_batch(
-                running_batch, selected_rids
-            )
-            self._prepare_deadline_state(waiting_queue, predicted_running)
-            after_deadline = time.perf_counter()
-            breakdown["build_deadline_candidates_ms"] = (
-                after_deadline - deadline_start
-            ) * 1000.0
+            if prepare_pass_state:
+                rebuild_start = after_update
+                affected_user_ids = sorted(
+                    {
+                        req.uid
+                        for req in running_batch.reqs
+                        if chosen is None or req.rid in chosen
+                    }
+                )
+                rebuild_breakdown = {}
+                self.simulator.rebuild_all_tracked_requests(
+                    affected_user_ids,
+                    timing_breakdown=rebuild_breakdown,
+                )
+                after_rebuild = time.perf_counter()
+                breakdown["rebuild_from_real_state_ms"] = (
+                    after_rebuild - rebuild_start
+                ) * 1000.0
+                breakdown.update(rebuild_breakdown)
+                deadline_start = after_rebuild
+                predicted_running = self._predicted_decode_running_batch(
+                    running_batch, selected_rids
+                )
+                self._prepare_deadline_state(waiting_queue, predicted_running)
+                after_deadline = time.perf_counter()
+                breakdown["build_deadline_candidates_ms"] = (
+                    after_deadline - deadline_start
+                ) * 1000.0
+            else:
+                breakdown["rebuild_from_real_state_ms"] = 0.0
+                breakdown["rebuild_live_states_ms"] = 0.0
+                breakdown["rebuild_state_setup_ms"] = 0.0
+                breakdown["rebuild_scheduler_loop_ms"] = 0.0
+                breakdown["rebuild_scheduler_step_count"] = 0
+                breakdown["rebuild_prefill_step_count"] = 0
+                breakdown["rebuild_decode_step_count"] = 0
+                breakdown["build_deadline_candidates_ms"] = 0.0
+                self._simulator_rebuild_prepared = False
         else:
             self._simulator_rebuild_prepared = False
             self._last_prepare_breakdown_ms = {}
             return
-        self._simulator_rebuild_prepared = True
+        if prepare_pass_state:
+            self._simulator_rebuild_prepared = True
         breakdown["prepare_during_gpu_execution_total_ms"] = (
             time.perf_counter() - phase_start
         ) * 1000.0
@@ -692,7 +971,13 @@ class DocPolicy(DeltaFairnessPolicy):
         )
         if not self._forced_prefill_rids:
             return 0, None
-        prioritized_waiting = self.sorted_waiting_queue(list(waiting_queue))
+        prioritized_waiting = [
+            req
+            for req in self.sorted_waiting_queue(list(waiting_queue))
+            if req.rid in self._forced_prefill_rids
+        ]
+        if not prioritized_waiting:
+            return 0, None
         return super().force_prefill_reservations(
             prioritized_waiting,
             token_counters_by_user=token_counters_by_user,
@@ -777,6 +1062,8 @@ class DocPolicy(DeltaFairnessPolicy):
 
     def finished_decode(self, batch: ScheduleBatch) -> None:
         super().finished_decode(batch)
+        if self._async_prepare_active:
+            return
         now = time.time()
         for req in batch.reqs:
             self._mark_violation_if_executed_after_deadline(
@@ -789,6 +1076,9 @@ class DocPolicy(DeltaFairnessPolicy):
 
     def mark_request_finished(self, req: Req) -> None:
         super().mark_request_finished(req)
+        if self._async_prepare_active:
+            self._async_pending_finished.append(req)
+            return
         self.simulator.mark_request_finished(req)
         self._simulator_rebuild_prepared = False
         self._prepared_running_sig = None

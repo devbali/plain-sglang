@@ -312,7 +312,7 @@ class TestDocPolicyGapBudget(unittest.TestCase):
     def _exercise_decode_prepare_epoch(self, policy: DocPolicy, running_batch, waiting_reqs):
         step_times_ms = []
         step_breakdowns = []
-        for _ in range(10):
+        for step_idx in range(10):
             prepare_start = time.perf_counter()
             policy.prepare_during_gpu_execution(
                 event_type="decode",
@@ -320,6 +320,7 @@ class TestDocPolicyGapBudget(unittest.TestCase):
                 waiting_queue=list(waiting_reqs),
                 scheduled_batch=None,
                 selected_rids={req.rid for req in running_batch.reqs},
+                prepare_pass_state=(step_idx == 9),
             )
             step_times_ms.append((time.perf_counter() - prepare_start) * 1000.0)
             step_breakdowns.append(dict(getattr(policy, "_last_prepare_breakdown_ms", {})))
