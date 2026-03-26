@@ -184,6 +184,20 @@ class NoFairnessPolicy:
     def mark_request_finished (self, req: "Req"):
         TIMELINE_WRITER.mark_completed(req.rid, req.uid)
 
+    def prepare_during_gpu_execution(
+        self,
+        *,
+        event_type: str,
+        running_batch: Optional["ScheduleBatch"],
+        waiting_queue: List["Req"],
+        scheduled_batch: Optional["ScheduleBatch"] = None,
+        selected_rids: Optional[set[str]] = None,
+    ) -> None:
+        del event_type, running_batch, waiting_queue, scheduled_batch, selected_rids
+
+    def consume_prepared_next_pass(self) -> bool:
+        return False
+
     # ---- Delta fairness hooks (no-op defaults) ----
     
     def fairinf_prioritize_force_prefill(self):

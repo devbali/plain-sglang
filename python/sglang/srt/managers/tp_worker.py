@@ -398,7 +398,13 @@ class ModelTpServer:
             "sglang_log.csv",
             "timestamp,type,time_elapsed,gpu_time_elapsed_ms,wall_time_elapsed_ms,"
             "model_forward_elapsed_ms,"
+            "decode_sync_wait_ms,decode_after_sync_ms,"
             "decode_check_mem_ms,decode_jump_forward_ms,decode_prepare_ms,"
+            "decode_fairness_prepare_ms,"
+            "decode_fairness_sync_live_user_tracking_ms,"
+            "decode_fairness_logical_event_update_ms,"
+            "decode_fairness_rebuild_from_real_state_ms,"
+            "decode_fairness_build_deadline_candidates_ms,"
             "decode_build_input_ids_ms,decode_input_tensor_and_seq_lens_ms,"
             "decode_alloc_decode_output_slots_ms,decode_write_req_to_token_ms,"
             "decode_update_regex_vocab_mask_ms,"
@@ -414,12 +420,25 @@ class ModelTpServer:
             "get_new_prefill_batch_ms,calc_priority_ms,prefill_adder_init_ms,"
             "remove_running_tokens_ms,fairness_start_of_pass_ms,inflight_ms,"
             "force_prefill_reservations_ms,waiting_queue_prefills_ms,build_batch_ms,"
-            "doc_sync_fair_user_tracking_ms,doc_rebuild_from_real_state_ms,"
+            "doc_sync_live_user_tracking_ms,doc_rebuild_from_real_state_ms,"
             "doc_build_deadline_candidates_ms,doc_sort_waiting_prefills_ms,"
             "doc_safe_prefix_scan_ms,doc_build_pass_state_ms,doc_start_of_pass_total_ms\n",
         )
         self._doc_policy_snapshot_logger = AsyncCSVLogger(
             "doc_policy_pass_snapshots.jsonl", ""
+        )
+        self._scheduler_pass_csv_logger = AsyncCSVLogger(
+            "scheduler_passes.csv",
+            "timestamp,running_reqs,waiting_reqs,current_num_tokens,"
+            "force_prefill,force_decode,max_prefill_size,new_batch_size,chosen_event,"
+            "get_new_prefill_reason,"
+            "decision_force_prefill_check_ms,decision_force_decode_check_ms,decision_get_new_prefill_batch_ms,"
+            "prefill_calc_priority_ms,prefill_adder_init_ms,prefill_remove_running_tokens_ms,"
+            "prefill_fairness_start_of_pass_ms,prefill_inflight_ms,prefill_force_prefill_reservations_ms,"
+            "prefill_waiting_queue_prefills_ms,prefill_build_batch_ms,"
+            "doc_forced_prefill_count,doc_safe_waiting_count,doc_deadline_queue_len,"
+            "doc_has_decode_deadline,doc_max_safe_prefill_tokens,doc_waiting_deadline_count,"
+            "doc_earliest_decode_start_deadline,doc_safe_prefix_now,doc_decode_deadline_slack_ms\n",
         )
         self._doc_policy_snapshot_threshold_ms = float(
             os.environ.get("DOC_POLICY_SNAPSHOT_THRESHOLD_MS", "200")
@@ -507,6 +526,7 @@ class ModelTpServer:
         force_decode = False
         max_prefill_size = None
         new_batch = None
+        force_prefill = False
 
         force_prefill_func = lambda: self.fairness_policy.fairinf_force_prefill_any_waiting(
                 self.waiting_queue,
@@ -560,6 +580,15 @@ class ModelTpServer:
             decision_timer.parts["force_decode_check_ms"] = 0.0
         if "get_new_prefill_batch_ms" not in decision_timer.parts:
             decision_timer.parts["get_new_prefill_batch_ms"] = 0.0
+        self._log_scheduler_pass(
+            force_prefill=force_prefill,
+            force_decode=force_decode,
+            max_prefill_size=max_prefill_size,
+            new_batch=new_batch,
+            get_new_prefill_reason=str(prefill_telemetry.get("reason", "")),
+            decision_parts=decision_timer.parts,
+            prefill_parts=prefill_telemetry,
+        )
         self._log_intermediate_gap(
             next_event_type=(
                 "prefill" if new_batch is not None else "decode" if self.running_batch is not None else "idle"
@@ -690,11 +719,20 @@ class ModelTpServer:
             )
             breakdown = self.last_decode_step_breakdown or {}
             prepare_breakdown = breakdown.get("prepare_breakdown", {}) if breakdown else {}
+            fairness_prepare_breakdown = (
+                breakdown.get("fairness_prepare_breakdown", {}) if breakdown else {}
+            )
             self._sglang_csv_logger.log(
                 f"{current_time},{'Decode' if decode else 'Prefill'},{wall_time_ms},"
                 f"{elapsed_time_ms},{wall_time_ms},{model_forward_ms},"
+                f"{breakdown.get('sync_wait_ms', '')},{breakdown.get('after_sync_ms', '')},"
                 f"{breakdown.get('check_mem_ms', '')},{breakdown.get('jump_forward_ms', '')},"
                 f"{breakdown.get('prepare_ms', '')},"
+                f"{breakdown.get('fairness_prepare_ms', '')},"
+                f"{fairness_prepare_breakdown.get('sync_live_user_tracking_ms', '')},"
+                f"{fairness_prepare_breakdown.get('logical_event_update_ms', '')},"
+                f"{fairness_prepare_breakdown.get('rebuild_from_real_state_ms', '')},"
+                f"{fairness_prepare_breakdown.get('build_deadline_candidates_ms', '')},"
                 f"{prepare_breakdown.get('build_input_ids_ms', '')},"
                 f"{prepare_breakdown.get('input_tensor_and_seq_lens_ms', '')},"
                 f"{prepare_breakdown.get('alloc_decode_output_slots_ms', '')},"
@@ -757,13 +795,105 @@ class ModelTpServer:
             f"{prefill_parts.get('force_prefill_reservations_ms', 0.0)},"
             f"{prefill_parts.get('waiting_queue_prefills_ms', 0.0)},"
             f"{prefill_parts.get('build_batch_ms', 0.0)},"
-            f"{prefill_parts.get('doc_sync_fair_user_tracking_ms', 0.0)},"
+            f"{prefill_parts.get('doc_sync_live_user_tracking_ms', 0.0)},"
             f"{prefill_parts.get('doc_rebuild_from_real_state_ms', 0.0)},"
             f"{prefill_parts.get('doc_build_deadline_candidates_ms', 0.0)},"
             f"{prefill_parts.get('doc_sort_waiting_prefills_ms', 0.0)},"
             f"{prefill_parts.get('doc_safe_prefix_scan_ms', 0.0)},"
             f"{prefill_parts.get('doc_build_pass_state_ms', 0.0)},"
             f"{prefill_parts.get('doc_start_of_pass_total_ms', 0.0)}\n"
+        )
+
+    def _log_scheduler_pass(
+        self,
+        *,
+        force_prefill: bool,
+        force_decode: bool,
+        max_prefill_size: Optional[int],
+        new_batch: Optional[ScheduleBatch],
+        get_new_prefill_reason: str,
+        decision_parts: Dict[str, float],
+        prefill_parts: Dict[str, float],
+    ) -> None:
+        if self.tp_rank != 0:
+            return
+
+        chosen_event = (
+            "prefill"
+            if new_batch is not None
+            else "decode"
+            if self.running_batch is not None
+            else "idle"
+        )
+        doc_forced_prefill_count = 0
+        doc_safe_waiting_count = 0
+        doc_deadline_queue_len = 0
+        doc_has_decode_deadline = 0
+        doc_max_safe_prefill_tokens = ""
+        doc_waiting_deadline_count = 0
+        doc_earliest_decode_start_deadline = ""
+        doc_safe_prefix_now = ""
+        doc_decode_deadline_slack_ms = ""
+        if isinstance(self.fairness_policy, DocPolicy):
+            doc_forced_prefill_count = len(
+                getattr(self.fairness_policy, "_forced_prefill_rids", ())
+            )
+            doc_safe_waiting_count = len(
+                getattr(self.fairness_policy, "_safe_waiting_queue", ())
+            )
+            doc_deadline_queue_len = len(
+                getattr(self.fairness_policy, "_deadline_queue", ())
+            )
+            doc_has_decode_deadline = int(
+                bool(getattr(self.fairness_policy, "_has_decode_deadline", False))
+            )
+            max_safe = getattr(
+                self.fairness_policy, "_max_safe_prefill_tokens", None
+            )
+            doc_max_safe_prefill_tokens = (
+                "" if max_safe is None else int(max_safe)
+            )
+            doc_waiting_deadline_count = len(
+                getattr(
+                    self.fairness_policy,
+                    "_waiting_prefill_start_deadline_by_rid",
+                    {},
+                )
+            )
+            earliest = getattr(
+                self.fairness_policy, "_earliest_decode_start_deadline", None
+            )
+            safe_now = getattr(self.fairness_policy, "_safe_prefix_now", None)
+            if earliest is not None:
+                doc_earliest_decode_start_deadline = earliest
+            if safe_now is not None:
+                doc_safe_prefix_now = safe_now
+            if earliest is not None and safe_now is not None:
+                doc_decode_deadline_slack_ms = (earliest - safe_now) * 1000.0
+
+        self._scheduler_pass_csv_logger.log(
+            f"{time.time()},"
+            f"{len(self.running_batch.reqs) if self.running_batch is not None else 0},"
+            f"{len(self.waiting_queue)},"
+            f"{self._current_num_used_tokens()},"
+            f"{int(force_prefill)},{int(force_decode)},"
+            f"{'' if max_prefill_size is None else max_prefill_size},"
+            f"{0 if new_batch is None else len(new_batch.reqs)},{chosen_event},"
+            f"{get_new_prefill_reason},"
+            f"{decision_parts.get('force_prefill_check_ms', 0.0)},"
+            f"{decision_parts.get('force_decode_check_ms', 0.0)},"
+            f"{decision_parts.get('get_new_prefill_batch_ms', 0.0)},"
+            f"{prefill_parts.get('calc_priority_ms', 0.0)},"
+            f"{prefill_parts.get('prefill_adder_init_ms', 0.0)},"
+            f"{prefill_parts.get('remove_running_tokens_ms', 0.0)},"
+            f"{prefill_parts.get('fairness_start_of_pass_ms', 0.0)},"
+            f"{prefill_parts.get('inflight_ms', 0.0)},"
+            f"{prefill_parts.get('force_prefill_reservations_ms', 0.0)},"
+            f"{prefill_parts.get('waiting_queue_prefills_ms', 0.0)},"
+            f"{prefill_parts.get('build_batch_ms', 0.0)},"
+            f"{doc_forced_prefill_count},{doc_safe_waiting_count},{doc_deadline_queue_len},"
+            f"{doc_has_decode_deadline},{doc_max_safe_prefill_tokens},{doc_waiting_deadline_count},"
+            f"{doc_earliest_decode_start_deadline},{doc_safe_prefix_now},{doc_decode_deadline_slack_ms}\n"
         )
 
     def _serialize_doc_policy_req(self, req: Req) -> Dict[str, Any]:
@@ -949,12 +1079,14 @@ class ModelTpServer:
     ) -> Optional[ScheduleBatch]:
         step_timer = StepTimer()
         telemetry = telemetry if telemetry is not None else {}
+        telemetry["reason"] = ""
         pre_pass_snapshot = self._capture_doc_policy_pass_snapshot_state()
         running_bs = (
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
         available_req_slots = len(self.req_to_token_pool.free_slots)
         if not self.waiting_queue and self.current_inflight_req is None:
+            telemetry["reason"] = "no_waiting_or_inflight"
             return None
 
         # Get priority queue
@@ -994,9 +1126,9 @@ class ModelTpServer:
             "fairness_start_of_pass_ms"
         )
         if isinstance(self.fairness_policy, DocPolicy):
-            telemetry["doc_sync_fair_user_tracking_ms"] = (
+            telemetry["doc_sync_live_user_tracking_ms"] = (
                 self.fairness_policy._last_pass_breakdown_ms.get(
-                    "sync_fair_user_tracking_ms", 0.0
+                    "sync_live_user_tracking_ms", 0.0
                 )
             )
             telemetry["doc_rebuild_from_real_state_ms"] = (
@@ -1042,6 +1174,7 @@ class ModelTpServer:
             and max_prefill_token_size is not None
             and max_prefill_token_size <= 0
         ):
+            telemetry["reason"] = "prefill_capped_to_zero_by_force_decode"
             return None
 
         has_inflight = self.current_inflight_req is not None
@@ -1080,6 +1213,11 @@ class ModelTpServer:
         running_bs = len(self.running_batch.reqs) if self.running_batch is not None else 0
         available_req_slots = len(self.req_to_token_pool.free_slots)
         if running_bs >= self.max_running_requests or available_req_slots <= 0:
+            telemetry["reason"] = (
+                "running_batch_full"
+                if running_bs >= self.max_running_requests
+                else "no_req_slots"
+            )
             return None
         if extra_space > 0 and evicted_reqs:
             logger.info(
@@ -1110,6 +1248,7 @@ class ModelTpServer:
             self.current_inflight_req = adder.new_inflight_req
 
         if len(can_run_list) == 0:
+            telemetry["reason"] = "adder_can_run_list_empty"
             return None
 
         # Print stats
@@ -1163,6 +1302,7 @@ class ModelTpServer:
         new_batch.delta_fairness_n = self.delta_fairness_n
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
         telemetry["build_batch_ms"] = step_timer.mark("build_batch_ms")
+        telemetry["reason"] = "built_prefill_batch"
         return new_batch
 
     def forward_prefill_batch(self, batch: ScheduleBatch):
@@ -1234,6 +1374,13 @@ class ModelTpServer:
                     batch, ForwardMode.EXTEND
                 )
                 model_forward_end.record()
+                self.fairness_policy.prepare_during_gpu_execution(
+                    event_type="prefill",
+                    running_batch=self.running_batch,
+                    waiting_queue=list(self.waiting_queue),
+                    scheduled_batch=batch,
+                    selected_rids=None,
+                )
                 torch.cuda.synchronize()
                 self.last_model_forward_elapsed_ms = model_forward_start.elapsed_time(
                     model_forward_end
@@ -1582,6 +1729,8 @@ class ModelTpServer:
                         "jump_forward_ms": (time.perf_counter() - after_check_mem) * 1000.0,
                         "prepare_ms": 0.0,
                         "prepare_breakdown": {},
+                        "sync_wait_ms": 0.0,
+                        "after_sync_ms": 0.0,
                         "sample_postprocess_ms": 0.0,
                         "handle_finished_ms": 0.0,
                     }
@@ -1604,7 +1753,17 @@ class ModelTpServer:
                 batch, ForwardMode.DECODE
             )
             model_forward_end.record()
+            fairness_prepare_start = time.perf_counter()
+            self.fairness_policy.prepare_during_gpu_execution(
+                event_type="decode",
+                running_batch=batch,
+                waiting_queue=list(self.waiting_queue),
+                scheduled_batch=None,
+                selected_rids=selected_rids,
+            )
+            fairness_prepare_end = time.perf_counter()
             torch.cuda.synchronize()
+            after_sync = time.perf_counter()
             self.last_model_forward_elapsed_ms = model_forward_start.elapsed_time(
                 model_forward_end
             )
@@ -1646,11 +1805,20 @@ class ModelTpServer:
 
             self.handle_finished_requests(batch)
             after_handle_finished = time.perf_counter()
+            fairness_prepare_breakdown = dict(
+                getattr(self.fairness_policy, "_last_prepare_breakdown_ms", {})
+            )
             self.last_decode_step_breakdown = {
                 "check_mem_ms": (after_check_mem - decode_step_start) * 1000.0,
                 "jump_forward_ms": (after_jump_forward - after_check_mem) * 1000.0,
                 "prepare_ms": (after_prepare - after_jump_forward) * 1000.0,
                 "prepare_breakdown": prepare_breakdown,
+                "fairness_prepare_ms": (
+                    fairness_prepare_end - fairness_prepare_start
+                ) * 1000.0,
+                "fairness_prepare_breakdown": fairness_prepare_breakdown,
+                "sync_wait_ms": (after_sync - after_prepare) * 1000.0,
+                "after_sync_ms": (after_sample_postprocess - after_sync) * 1000.0,
                 "sample_postprocess_ms": (after_sample_postprocess - after_prepare) * 1000.0,
                 "handle_finished_ms": (after_handle_finished - after_sample_postprocess) * 1000.0,
             }

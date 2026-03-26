@@ -38,7 +38,8 @@ def pooled_cache_prefill_time_estimation(
     )
 
 # shouldnt be hard coded but need to choose something
-MAX_POOLED_DECODE_LATENCY = pooled_decode_time_estimation(328784, 8192, 256, 1)
+TBT_DELTA = 0.005
+MAX_POOLED_DECODE_LATENCY = pooled_decode_time_estimation(328784, 8192, 256, 1) + TBT_DELTA
 print(f"MAX_POOLED_DECODE_LATENCY={MAX_POOLED_DECODE_LATENCY}")
 
 

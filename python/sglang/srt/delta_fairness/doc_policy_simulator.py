@@ -168,17 +168,28 @@ class UserTimeline:
         if tracked is not None:
             self.finished_request_timelines[req_id] = tracked
 
-    def _clear_simulation(self) -> None:
-        self.history = []
-        self.anticipated_future_events = []
-        for tracked in list(self.request_timelines.values()):
-            tracked.alternate_history_timeline.history = [
+    def _persistent_request_state(self, tracked: TrackedRequest) -> Tuple[bool, int]:
+        prefill_done = False
+        decode_count = 0
+        for event in tracked.alternate_history_timeline.history:
+            if isinstance(event, RequestPrefillEvent):
+                prefill_done = True
+            elif isinstance(event, RequestDecodeEvent):
+                prefill_done = True
+                decode_count = max(decode_count, event.completion_number)
+        return prefill_done, decode_count
+
+    def _merge_real_event_into_request_history(
+        self, tracked: TrackedRequest, real_event: Optional[RequestEvent]
+    ) -> None:
+        timeline = tracked.alternate_history_timeline
+        if not timeline.history:
+            timeline.history = [
                 RequestStartEvent(
                     req_id=tracked.req.rid,
                     end_timestamp=tracked.arrival_timestamp,
                 )
             ]
-            tracked.alternate_history_timeline.anticipated_future_events = []
 
     def _target_state_for_request(
         self, tracked: TrackedRequest, real_event: Optional[RequestEvent]
@@ -190,11 +201,15 @@ class UserTimeline:
         elif isinstance(real_event, RequestDecodeEvent):
             realized_prefill_done = True
             realized_decode_count = real_event.completion_number
+        self._merge_real_event_into_request_history(tracked, real_event)
+        prefill_done, simulated_decode_count = self._persistent_request_state(tracked)
         return _SimRequestState(
             tracked=tracked,
             arrival_timestamp=tracked.arrival_timestamp,
             realized_prefill_done=realized_prefill_done,
             realized_decode_count=realized_decode_count,
+            prefill_done=prefill_done,
+            simulated_decode_count=simulated_decode_count,
         )
 
     def _live_states(
@@ -230,10 +245,13 @@ class UserTimeline:
         self,
         waiting_states: List[_SimRequestState],
         active_states: List[_SimRequestState],
-        sim_time: float,
+        future_history: List[UserEvent],
     ) -> List[_SimRequestState]:
+        current_time = self._current_history_time(
+            waiting_states, active_states, future_history
+        )
         ready = [
-            state for state in waiting_states if state.arrival_timestamp <= sim_time
+            state for state in waiting_states if state.arrival_timestamp <= current_time
         ]
         if not ready:
             return []
@@ -261,6 +279,20 @@ class UserTimeline:
             batch.append(state)
             reserved_for_batch += total_tokens
         return batch
+
+    def _current_history_time(
+        self,
+        waiting_states: List[_SimRequestState],
+        active_states: List[_SimRequestState],
+        future_history: List[UserEvent],
+    ) -> float:
+        if future_history:
+            return future_history[-1].end_timestamp
+        if self.history:
+            return self.history[-1].end_timestamp
+        return min(
+            state.arrival_timestamp for state in waiting_states + active_states
+        )
 
     def _isolated_retract_decode(
         self,
@@ -297,181 +329,258 @@ class UserTimeline:
 
         return active_kv() + len(active_states) + extra_decode_tokens <= self.max_kv_tokens
 
-    def rebuild_from_real_state(
-        self, req_id_real_statuses: Dict[str, RequestEvent]
-    ) -> None:
-        self._clear_simulation()
-
-        live_states = self._live_states(req_id_real_statuses)
-        if not live_states:
-            return
-
-        waiting_states = list(live_states)
-        active_states: List[_SimRequestState] = []
-        sim_time = min(state.arrival_timestamp for state in live_states)
-
-        max_steps = sum(
-            max(1, state.realized_decode_count + 2) for state in live_states
-        ) + len(live_states) + 8
-
-        for _ in range(max_steps):
-            if all(state.anticipated_recorded for state in live_states):
-                break
-
-            batch = self._build_prefill_batch(waiting_states, active_states, sim_time)
-            if batch:
-                prompt_sizes = [state.prefill_context_tokens() for state in batch]
-                duration = isolated_prefill_time_estimation(
-                    sum(prompt_sizes),
-                    max(prompt_sizes),
-                    len(prompt_sizes),
-                    self.fairinf_n,
+    def _advance_scheduler_step(
+        self,
+        waiting_states: List[_SimRequestState],
+        active_states: List[_SimRequestState],
+        future_history: List[UserEvent],
+    ) -> bool:
+        current_time = self._current_history_time(
+            waiting_states, active_states, future_history
+        )
+        batch = self._build_prefill_batch(waiting_states, active_states, future_history)
+        if batch:
+            prompt_sizes = [state.prefill_context_tokens() for state in batch]
+            duration = isolated_prefill_time_estimation(
+                sum(prompt_sizes),
+                max(prompt_sizes),
+                len(prompt_sizes),
+                self.fairinf_n,
+            )
+            current_time += duration
+            user_event = UserPrefillEvent(duration=duration, end_timestamp=current_time)
+            persist_batch = all(state.realized_prefill_done for state in batch)
+            if persist_batch:
+                self.history.append(user_event)
+            else:
+                future_history.append(user_event)
+            for state in batch:
+                state.prefill_done = True
+                event = RequestPrefillEvent(
+                    req_id=state.tracked.req.rid,
+                    duration=duration,
+                    end_timestamp=current_time,
                 )
-                sim_time += duration
-                self.history.append(
-                    UserPrefillEvent(duration=duration, end_timestamp=sim_time)
-                )
-                for state in batch:
-                    state.prefill_done = True
-                    event = RequestPrefillEvent(
-                        req_id=state.tracked.req.rid,
-                        duration=duration,
-                        end_timestamp=sim_time,
-                    )
+                if persist_batch:
                     has_prior_prefill = any(
                         isinstance(history_event, RequestPrefillEvent)
                         for history_event in state.tracked.alternate_history_timeline.history
                     )
-                    if state.realized_prefill_done:
-                        state.tracked.alternate_history_timeline.history.append(event)
-                        if not has_prior_prefill:
-                            TIMELINE_WRITER.mark_isolated_prefill_done(
-                                state.tracked.req.rid,
-                                state.tracked.req.uid,
-                                timestamp_iso=_iso_ts(sim_time),
-                            )
-                    else:
-                        state.tracked.alternate_history_timeline.anticipated_future_events = [
-                            event
-                        ]
-                        state.anticipated_recorded = True
-                    waiting_states.remove(state)
-                    active_states.append(state)
-                continue
-
-            if active_states:
-                if not self._isolated_retract_decode(
-                    waiting_states,
-                    active_states,
-                    extra_decode_tokens=0,
-                ):
-                    break
-                if not active_states:
-                    continue
-                token_counts = [
-                    _request_token_count(state.tracked.req, state.simulated_decode_count)
-                    for state in active_states
-                ]
-                duration = isolated_decode_time_estimation(
-                    sum(token_counts),
-                    max(token_counts),
-                    len(token_counts),
-                    self.fairinf_n,
-                )
-                next_arrival = min(
-                    (
-                        state.arrival_timestamp
-                        for state in waiting_states
-                        if state.arrival_timestamp > sim_time
-                    ),
-                    default=None,
-                )
-                if next_arrival is not None and sim_time + duration > next_arrival:
-                    sim_time = next_arrival
-                    continue
-
-                milestone_rounds = [
-                    (
-                        state.realized_decode_count - state.simulated_decode_count
-                        if state.simulated_decode_count < state.realized_decode_count
-                        else 1
-                    )
-                    for state in active_states
-                    if not state.anticipated_recorded
-                ]
-                if not milestone_rounds:
-                    break
-
-                rounds = max(1, min(milestone_rounds))
-                if next_arrival is not None:
-                    rounds_until_arrival = int((next_arrival - sim_time) // duration)
-                    if rounds_until_arrival <= 0:
-                        sim_time = next_arrival
-                        continue
-                    rounds = min(rounds, rounds_until_arrival)
-
-                chunk_start = sim_time
-                sim_time += rounds * duration
-                self.history.append(
-                    UserDecodeEvent(duration=rounds * duration, end_timestamp=sim_time)
-                )
-                for state in active_states:
-                    prev_decode_count = state.simulated_decode_count
-                    state.simulated_decode_count += rounds
-
-                    if (
-                        prev_decode_count < state.realized_decode_count
-                        <= state.simulated_decode_count
-                    ):
-                        realized_round = state.realized_decode_count - prev_decode_count
-                        realized_ts = chunk_start + realized_round * duration
-                        realized_event = RequestDecodeEvent(
-                            req_id=state.tracked.req.rid,
-                            duration=duration,
-                            end_timestamp=realized_ts,
-                            completion_number=state.realized_decode_count,
-                        )
-                        state.tracked.alternate_history_timeline.history.append(
-                            realized_event
-                        )
-                        TIMELINE_WRITER.mark_isolated_decode_done(
+                    if not has_prior_prefill:
+                        TIMELINE_WRITER.mark_isolated_prefill_done(
                             state.tracked.req.rid,
                             state.tracked.req.uid,
-                            timestamp_iso=_iso_ts(realized_ts),
-                            completion_number=state.realized_decode_count,
+                            timestamp_iso=_iso_ts(current_time),
                         )
+                elif not state.realized_prefill_done:
+                    state.tracked.alternate_history_timeline.anticipated_future_events = [event]
+                    state.anticipated_recorded = True
+                waiting_states.remove(state)
+                active_states.append(state)
+            return True
 
-                    anticipated_completion = state.realized_decode_count + 1
-                    if (
-                        not state.anticipated_recorded
-                        and prev_decode_count < anticipated_completion
-                        <= state.simulated_decode_count
-                    ):
-                        anticipated_round = anticipated_completion - prev_decode_count
-                        anticipated_ts = chunk_start + anticipated_round * duration
-                        anticipated_event = RequestDecodeEvent(
-                            req_id=state.tracked.req.rid,
-                            duration=duration,
-                            end_timestamp=anticipated_ts,
-                            completion_number=anticipated_completion,
-                        )
-                        state.tracked.alternate_history_timeline.anticipated_future_events = [
-                            anticipated_event
-                        ]
-                        state.anticipated_recorded = True
-                continue
+        if active_states:
+            if not self._isolated_retract_decode(
+                waiting_states,
+                active_states,
+                extra_decode_tokens=0,
+            ):
+                return False
+            if not active_states:
+                return True
 
+            token_counts = [
+                _request_token_count(state.tracked.req, state.simulated_decode_count)
+                for state in active_states
+            ]
+            duration = isolated_decode_time_estimation(
+                sum(token_counts),
+                max(token_counts),
+                len(token_counts),
+                self.fairinf_n,
+            )
             next_arrival = min(
                 (
                     state.arrival_timestamp
                     for state in waiting_states
-                    if state.arrival_timestamp > sim_time
+                    if state.arrival_timestamp > current_time
                 ),
                 default=None,
             )
-            if next_arrival is None:
+            if next_arrival is not None and current_time + duration > next_arrival:
+                future_history.append(
+                    UserDecodeEvent(duration=0.0, end_timestamp=next_arrival)
+                )
+                return True
+
+            realized_gaps = [
+                state.realized_decode_count - state.simulated_decode_count
+                for state in active_states
+            ]
+            persist_rounds = min(realized_gaps) if realized_gaps and min(realized_gaps) > 0 else 0
+            milestone_rounds = [
+                (
+                    state.realized_decode_count - state.simulated_decode_count
+                    if state.simulated_decode_count < state.realized_decode_count
+                    else 1
+                )
+                for state in active_states
+                if not state.anticipated_recorded
+            ]
+            if not milestone_rounds:
+                return False
+
+            rounds = max(1, min(milestone_rounds))
+            persist_batch = persist_rounds > 0
+            if persist_batch:
+                rounds = min(rounds, persist_rounds)
+            if next_arrival is not None:
+                rounds_until_arrival = int((next_arrival - current_time) // duration)
+                if rounds_until_arrival <= 0:
+                    future_history.append(
+                        UserDecodeEvent(duration=0.0, end_timestamp=next_arrival)
+                    )
+                    return True
+                rounds = min(rounds, rounds_until_arrival)
+
+            chunk_start = current_time
+            current_time += rounds * duration
+            user_event = UserDecodeEvent(
+                duration=rounds * duration, end_timestamp=current_time
+            )
+            if persist_batch:
+                self.history.append(user_event)
+            else:
+                future_history.append(user_event)
+            for state in active_states:
+                prev_decode_count = state.simulated_decode_count
+                state.simulated_decode_count += rounds
+
+                if (
+                    persist_batch
+                    and
+                    prev_decode_count < state.realized_decode_count
+                    <= state.simulated_decode_count
+                ):
+                    realized_round = state.realized_decode_count - prev_decode_count
+                    realized_ts = chunk_start + realized_round * duration
+                    realized_event = RequestDecodeEvent(
+                        req_id=state.tracked.req.rid,
+                        duration=duration,
+                        end_timestamp=realized_ts,
+                        completion_number=state.realized_decode_count,
+                    )
+                    state.tracked.alternate_history_timeline.history.append(realized_event)
+                    TIMELINE_WRITER.mark_isolated_decode_done(
+                        state.tracked.req.rid,
+                        state.tracked.req.uid,
+                        timestamp_iso=_iso_ts(realized_ts),
+                        completion_number=state.realized_decode_count,
+                    )
+
+                anticipated_completion = state.realized_decode_count + 1
+                if (
+                    not state.anticipated_recorded
+                    and prev_decode_count < anticipated_completion
+                    <= state.simulated_decode_count
+                ):
+                    anticipated_round = anticipated_completion - prev_decode_count
+                    anticipated_ts = chunk_start + anticipated_round * duration
+                    anticipated_event = RequestDecodeEvent(
+                        req_id=state.tracked.req.rid,
+                        duration=duration,
+                        end_timestamp=anticipated_ts,
+                        completion_number=anticipated_completion,
+                    )
+                    state.tracked.alternate_history_timeline.anticipated_future_events = [
+                        anticipated_event
+                    ]
+                    state.anticipated_recorded = True
+            return True
+
+        next_arrival = min(
+            (
+                state.arrival_timestamp
+                for state in waiting_states
+                if state.arrival_timestamp > current_time
+            ),
+            default=None,
+        )
+        if next_arrival is None:
+            return False
+        future_history.append(UserPrefillEvent(duration=0.0, end_timestamp=next_arrival))
+        return True
+
+    def rebuild_from_real_state(
+        self,
+        req_id_real_statuses: Dict[str, RequestEvent],
+        timing_breakdown: Optional[Dict[str, float]] = None,
+    ) -> None:
+        rebuild_start = time.perf_counter()
+        live_states = self._live_states(req_id_real_statuses)
+        after_live_states = time.perf_counter()
+        if not live_states:
+            self.anticipated_future_events = []
+            if timing_breakdown is not None:
+                timing_breakdown["rebuild_live_states_ms"] = (
+                    after_live_states - rebuild_start
+                ) * 1000.0
+                timing_breakdown["rebuild_state_setup_ms"] = 0.0
+                timing_breakdown["rebuild_scheduler_loop_ms"] = 0.0
+            return
+
+        future_history: List[UserEvent] = []
+        self.anticipated_future_events = []
+        for state in live_states:
+            timeline = state.tracked.alternate_history_timeline
+            if not timeline.history:
+                timeline.history = [
+                    RequestStartEvent(
+                        req_id=state.tracked.req.rid,
+                        end_timestamp=state.arrival_timestamp,
+                    )
+                ]
+            has_real_prefill_in_history = any(
+                isinstance(history_event, RequestPrefillEvent)
+                for history_event in timeline.history
+            )
+            if not state.realized_prefill_done or not has_real_prefill_in_history:
+                state.prefill_done = False
+                state.simulated_decode_count = 0
+            else:
+                state.prefill_done = True
+                state.simulated_decode_count = min(
+                    state.simulated_decode_count,
+                    state.realized_decode_count,
+                )
+            timeline.anticipated_future_events = []
+            state.anticipated_recorded = False
+        after_state_setup = time.perf_counter()
+
+        waiting_states = [state for state in live_states if not state.prefill_done]
+        active_states: List[_SimRequestState] = [
+            state for state in live_states if state.prefill_done
+        ]
+
+        while True:
+            if all(state.anticipated_recorded for state in live_states):
                 break
-            sim_time = next_arrival
+            if not self._advance_scheduler_step(
+                waiting_states, active_states, future_history
+            ):
+                break
+        self.anticipated_future_events = future_history
+        after_scheduler_loop = time.perf_counter()
+        if timing_breakdown is not None:
+            timing_breakdown["rebuild_live_states_ms"] = (
+                after_live_states - rebuild_start
+            ) * 1000.0
+            timing_breakdown["rebuild_state_setup_ms"] = (
+                after_state_setup - after_live_states
+            ) * 1000.0
+            timing_breakdown["rebuild_scheduler_loop_ms"] = (
+                after_scheduler_loop - after_state_setup
+            ) * 1000.0
 
 
 @dataclass
@@ -536,12 +645,11 @@ class AlternateHistorySimulator:
         tracked.user_timeline = user_timeline
         user_timeline.request_timelines[req.rid] = tracked
 
-    def sync_fair_user_tracking(
+    def sync_live_user_tracking(
         self,
         running_batch: Optional[ScheduleBatch],
         waiting_queue: List[Req],
         *,
-        user_is_fair: Callable[[str, Optional[ScheduleBatch]], bool],
         deltas_in_microseconds: Optional[Dict[str, int]] = None,
     ) -> List[str]:
         running_reqs = list(running_batch.reqs) if running_batch is not None else []
@@ -551,16 +659,12 @@ class AlternateHistorySimulator:
         for req in running_reqs:
             live_by_user.setdefault(req.uid, []).append(req)
 
-        fair_users = sorted(
+        live_user_ids = sorted(
             set(self.users)
-            | {
-                uid
-                for uid in set(live_by_user)
-                if user_is_fair(uid, running_batch)
-            }
+            | set(live_by_user)
         )
 
-        for uid in fair_users:
+        for uid in live_user_ids:
             user_timeline = self.users.get(uid)
             if user_timeline is None:
                 user_timeline = self._make_user_timeline(uid)
@@ -572,7 +676,7 @@ class AlternateHistorySimulator:
 
         for uid in list(self.users.keys()):
             user_timeline = self.users[uid]
-            if uid in fair_users and user_timeline.request_timelines:
+            if uid in live_user_ids and user_timeline.request_timelines:
                 continue
             self.users.pop(uid, None)
             for rid, tracked in list(self.requests.items()):
@@ -580,32 +684,30 @@ class AlternateHistorySimulator:
                     self.requests.pop(rid, None)
                     self.most_recent_event_real.pop(rid, None)
 
-        return fair_users
+        return live_user_ids
 
     def start_of_pass(
         self,
         running_batch: Optional[ScheduleBatch],
         waiting_queue: List[Req],
         *,
-        user_is_fair: Callable[[str, Optional[ScheduleBatch]], bool],
         deltas_in_microseconds: Optional[Dict[str, int]] = None,
         timing_breakdown: Optional[Dict[str, float]] = None,
     ) -> List[str]:
         pass_start = time.perf_counter()
-        fair_users = self.sync_fair_user_tracking(
+        live_user_ids = self.sync_live_user_tracking(
             running_batch,
             waiting_queue,
-            user_is_fair=user_is_fair,
             deltas_in_microseconds=deltas_in_microseconds,
         )
         after_sync = time.perf_counter()
-        for uid in fair_users:
-            user_timeline = self.users.get(uid)
-            if user_timeline is not None:
-                user_timeline.rebuild_from_real_state(self.most_recent_event_real)
+        self.rebuild_all_tracked_requests(
+            live_user_ids,
+            timing_breakdown=timing_breakdown,
+        )
         after_rebuild = time.perf_counter()
         if timing_breakdown is not None:
-            timing_breakdown["sync_fair_user_tracking_ms"] = (
+            timing_breakdown["sync_live_user_tracking_ms"] = (
                 after_sync - pass_start
             ) * 1000.0
             timing_breakdown["rebuild_from_real_state_ms"] = (
@@ -614,7 +716,38 @@ class AlternateHistorySimulator:
             timing_breakdown["simulator_start_of_pass_ms"] = (
                 after_rebuild - pass_start
             ) * 1000.0
-        return fair_users
+        return live_user_ids
+
+    def rebuild_all_tracked_requests(
+        self,
+        user_ids: Optional[List[str]] = None,
+        *,
+        timing_breakdown: Optional[Dict[str, float]] = None,
+    ) -> None:
+        rebuild_live_states_ms = 0.0
+        rebuild_state_setup_ms = 0.0
+        rebuild_scheduler_loop_ms = 0.0
+        for uid in (user_ids if user_ids is not None else list(self.users.keys())):
+            user_timeline = self.users.get(uid)
+            if user_timeline is not None:
+                rebuild_breakdown: Dict[str, float] = {}
+                user_timeline.rebuild_from_real_state(
+                    self.most_recent_event_real,
+                    timing_breakdown=rebuild_breakdown,
+                )
+                rebuild_live_states_ms += rebuild_breakdown.get(
+                    "rebuild_live_states_ms", 0.0
+                )
+                rebuild_state_setup_ms += rebuild_breakdown.get(
+                    "rebuild_state_setup_ms", 0.0
+                )
+                rebuild_scheduler_loop_ms += rebuild_breakdown.get(
+                    "rebuild_scheduler_loop_ms", 0.0
+                )
+        if timing_breakdown is not None:
+            timing_breakdown["rebuild_live_states_ms"] = rebuild_live_states_ms
+            timing_breakdown["rebuild_state_setup_ms"] = rebuild_state_setup_ms
+            timing_breakdown["rebuild_scheduler_loop_ms"] = rebuild_scheduler_loop_ms
 
     def build_deadline_candidates(
         self,
