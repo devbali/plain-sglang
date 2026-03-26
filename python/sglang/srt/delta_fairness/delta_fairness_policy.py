@@ -35,10 +35,53 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         super().__init__(tree_cache=tree_cache)
         self.delta_fairness_n = delta_fairness_n
         self.max_running_requests = max_running_requests
+        self._fair_limit_reject_cache: Dict[tuple[str, int, bool], bool] = {}
 
     def _has_delta_limit(self) -> bool:
         tree_cache = self.tree_cache
         return tree_cache is not None and getattr(tree_cache, "fairinf_max_per_user", None) is not None
+
+    def _reset_pass_caches(self) -> None:
+        self._fair_limit_reject_cache.clear()
+
+    def start_of_pass(
+        self,
+        running_batch: Optional["ScheduleBatch"],
+        waiting_queue: List["Req"],
+        *,
+        new_token_ratio: float = 0.0,
+        max_running_requests: Optional[int] = None,
+    ):
+        self._reset_pass_caches()
+        return super().start_of_pass(
+            running_batch,
+            waiting_queue,
+            new_token_ratio=new_token_ratio,
+            max_running_requests=max_running_requests,
+        )
+
+    def _reject_based_on_computed_fair_limit(
+        self,
+        user_id: str,
+        num_tokens: int,
+        *,
+        unfair: bool = False,
+    ) -> bool:
+        tree_cache = self.tree_cache
+        if tree_cache is None or self.delta_fairness_n is None:
+            return False
+        key = (str(user_id), int(num_tokens), bool(unfair))
+        cached = self._fair_limit_reject_cache.get(key)
+        if cached is not None:
+            return cached
+        expandable_size = tree_cache.calculate_real_expandable_size_for_user_fairinf(
+            user_id,
+            [],
+            self_unfair=unfair,
+        )
+        rejected = expandable_size < num_tokens
+        self._fair_limit_reject_cache[key] = rejected
+        return rejected
 
     def _global_protected_tokens(self) -> int:
         tree_cache = self.tree_cache
@@ -230,18 +273,20 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         if rejected is not None or not self._has_delta_limit():
             return rejected
 
-        tree_cache = self.tree_cache
-        assert tree_cache is not None
         if fair:
-            if tree_cache.reject_based_on_computed_fair_limit(req.uid, req.extend_input_len + extra_tokens):
+            if self._reject_based_on_computed_fair_limit(
+                req.uid, req.extend_input_len + extra_tokens
+            ):
                 return "rejected"
         else:
             if self._reject_unfair_prefill_due_to_global_headroom(
                 req, extra_tokens=extra_tokens
             ):
                 return "rejected"
-            if tree_cache.reject_based_on_computed_fair_limit_unfair(
-                req.uid, req.extend_input_len + extra_tokens
+            if self._reject_based_on_computed_fair_limit(
+                req.uid,
+                req.extend_input_len + extra_tokens,
+                unfair=True,
             ):
                 return "rejected"
         return None
@@ -263,13 +308,13 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         if rejected is not None or not self._has_delta_limit():
             return rejected
 
-        tree_cache = self.tree_cache
-        assert tree_cache is not None
         if self._reject_unfair_prefill_due_to_global_headroom(
             req, extra_tokens=extra_tokens
         ):
             return "rejected"
-        if tree_cache.reject_based_on_computed_fair_limit(req.uid, req.extend_input_len + extra_tokens):
+        if self._reject_based_on_computed_fair_limit(
+            req.uid, req.extend_input_len + extra_tokens
+        ):
             return "rejected"
         return None
 
@@ -713,6 +758,9 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         extra_space = 0
         last_evicted: Optional[List["Req"]] = None
         waiting_snapshot = list(waiting_queue)
+        pending_prefill_by_user = {
+            user_id: sum(tokens) for user_id, tokens in token_counters_by_user.items()
+        }
 
         for req in waiting_snapshot:
             if not self.fairinf_force_prefill(
@@ -807,7 +855,7 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             #     continue
 
             user_tokens = token_counters_by_user.setdefault(req.uid, [])
-            extra_for_user = sum(user_tokens)
+            extra_for_user = pending_prefill_by_user.get(req.uid, 0)
             res = req.init_next_round_input(
                 None if prefix_computed else tree_cache,
                 fairness_policy=self,
@@ -863,10 +911,13 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
                     )
                     continue
 
+            new_extra_for_user = extra_for_user + req.extend_input_len
             user_tokens.append(req.extend_input_len)
-            add_res = adder.add_one_req(req, sum(user_tokens))
+            pending_prefill_by_user[req.uid] = new_extra_for_user
+            add_res = adder.add_one_req(req, new_extra_for_user)
             if add_res == "rejected":
                 user_tokens.pop()
+                pending_prefill_by_user[req.uid] = extra_for_user
                 logger.info(
                     "Forced prefill skipped for uid=%s rid=%s: "
                     "adder rejected after reservation checks.",
@@ -933,6 +984,9 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
 
         tree_cache = self.tree_cache
         target_tree_cache = None if prefix_computed else tree_cache
+        pending_prefill_by_user = {
+            user_id: sum(tokens) for user_id, tokens in token_counters_by_user.items()
+        }
 
         for req in self.sorted_waiting_queue(waiting_queue):
             if max_input_size is not None and adder.log_input_tokens > max_input_size:
@@ -943,7 +997,7 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             if req in adder.can_run_list:
                 continue
 
-            extra_tokens = sum(token_counters_by_user.get(req.uid, []))
+            extra_tokens = pending_prefill_by_user.get(req.uid, 0)
             res = req.init_next_round_input(
                 target_tree_cache,
                 fairness_policy=self,
@@ -977,6 +1031,7 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             #     continue
 
             token_counters_by_user.setdefault(req.uid, []).append(req.extend_input_len)
+            pending_prefill_by_user[req.uid] = extra_tokens + req.extend_input_len
 
             if (
                 not add_res

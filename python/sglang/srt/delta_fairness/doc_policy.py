@@ -67,6 +67,7 @@ class DocPolicy(DeltaFairnessPolicy):
         self._waiting_prefill_start_deadline_by_rid: Dict[str, float] = {}
         self._safe_waiting_queue: List[Req] = []
         self._safe_waiting_rids: set[str] = set()
+        self._forced_prefill_queue: List[Req] = []
         self._forced_prefill_rids: set[str] = set()
         self._max_safe_prefill_tokens: Optional[int] = None
         self._has_fair_waiting = False
@@ -188,6 +189,7 @@ class DocPolicy(DeltaFairnessPolicy):
         self._safe_waiting_queue = [req for _, req in indexed]
         self._safe_waiting_rids = {req.rid for req in self._safe_waiting_queue}
         self._has_fair_waiting = bool(self._safe_waiting_queue)
+        self._forced_prefill_queue = []
         self._max_safe_prefill_tokens = None
         self._forced_prefill_rids = set()
         self._has_decode_deadline = False
@@ -226,6 +228,7 @@ class DocPolicy(DeltaFairnessPolicy):
                 safe_prompt_tokens = sum(
                     len(batch_req.origin_input_ids) for batch_req in candidate_batch
                 )
+                self._forced_prefill_queue.append(req)
                 self._forced_prefill_rids.add(req.rid)
                 continue
             break
@@ -972,9 +975,7 @@ class DocPolicy(DeltaFairnessPolicy):
         if not self._forced_prefill_rids:
             return 0, None
         prioritized_waiting = [
-            req
-            for req in self.sorted_waiting_queue(list(waiting_queue))
-            if req.rid in self._forced_prefill_rids
+            req for req in self._forced_prefill_queue if req.rid in self._forced_prefill_rids
         ]
         if not prioritized_waiting:
             return 0, None
