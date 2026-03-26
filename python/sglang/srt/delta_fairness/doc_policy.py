@@ -89,6 +89,7 @@ class DocPolicy(DeltaFairnessPolicy):
         self._async_prepare_thread: Optional[threading.Thread] = None
         self._async_prepare_exception: Optional[BaseException] = None
         self._async_prepare_result: Optional[Dict[str, object]] = None
+        self._async_prepare_request: Optional[Dict[str, object]] = None
         self._async_prepare_active = False
         self._async_pending_finished: List[Req] = []
 
@@ -348,9 +349,7 @@ class DocPolicy(DeltaFairnessPolicy):
         cloned.origin_input_ids = list(req.origin_input_ids)
         cloned.output_ids = _LengthOnlyTokens(len(req.output_ids) + output_delta)
         cloned.fill_ids = (
-            None
-            if req.fill_ids is None
-            else _LengthOnlyTokens(len(req.fill_ids))
+            None if req.fill_ids is None else _LengthOnlyTokens(len(req.fill_ids))
         )
         return cloned
 
@@ -452,6 +451,8 @@ class DocPolicy(DeltaFairnessPolicy):
         except BaseException as exc:
             with self._async_prepare_lock:
                 self._async_prepare_exception = exc
+        finally:
+            self._async_prepare_request = None
 
     def launch_async_decode_epoch_prepare(
         self,
@@ -473,26 +474,27 @@ class DocPolicy(DeltaFairnessPolicy):
             self._async_prepare_exception = None
         self._async_prepare_active = True
         self._async_pending_finished = []
+        self._async_prepare_request = {
+            "running_batch": SimpleNamespace(
+                reqs=[
+                    self._async_snapshot_req(
+                        req,
+                        output_delta=(
+                            decode_steps
+                            if selected_rids is None or req.rid in selected_rids
+                            else 0
+                        ),
+                    )
+                    for req in running_batch.reqs
+                ]
+            ),
+            "waiting_queue": [self._async_snapshot_req(req) for req in waiting_queue],
+            "selected_rids": selected_rids,
+            "decode_steps": decode_steps,
+        }
         self._async_prepare_thread = threading.Thread(
             target=self._async_prepare_decode_epoch,
-            kwargs={
-                "running_batch": SimpleNamespace(
-                    reqs=[
-                        self._async_snapshot_req(
-                            req,
-                            output_delta=(
-                                decode_steps
-                                if selected_rids is None or req.rid in selected_rids
-                                else 0
-                            ),
-                        )
-                        for req in running_batch.reqs
-                    ]
-                ),
-                "waiting_queue": [self._async_snapshot_req(req) for req in waiting_queue],
-                "selected_rids": selected_rids,
-                "decode_steps": decode_steps,
-            },
+            kwargs=self._async_prepare_request,
             name="doc-policy-prepare-epoch",
             daemon=True,
         )

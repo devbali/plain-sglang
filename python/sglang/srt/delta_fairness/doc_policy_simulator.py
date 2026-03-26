@@ -108,19 +108,64 @@ class TrackedRequest:
         default_factory=lambda: {"prefill": 0, "first_decode": 0, "decode": 0}
     )
     alternate_history_timeline: RequestTimeline = field(default_factory=RequestTimeline)
+    persistent_prefill_done: bool = False
+    persistent_prefill_event: Optional[RequestPrefillEvent] = None
+    persistent_decode_count: int = 0
+    persistent_decode_events: Dict[int, RequestDecodeEvent] = field(default_factory=dict)
 
     def most_recent_event(self) -> Optional[RequestEvent]:
+        if self.persistent_decode_count > 0:
+            return self.persistent_decode_events.get(self.persistent_decode_count)
+        if self.persistent_prefill_event is not None:
+            return self.persistent_prefill_event
         if not self.alternate_history_timeline.history:
             return None
         return self.alternate_history_timeline.history[-1]
 
+    def reset_history_to_start(self) -> None:
+        start_event = RequestStartEvent(
+            req_id=self.req.rid,
+            end_timestamp=self.arrival_timestamp,
+        )
+        self.alternate_history_timeline.history = [start_event]
+        self.persistent_prefill_done = False
+        self.persistent_prefill_event = None
+        self.persistent_decode_count = 0
+        self.persistent_decode_events = {}
+
+    def append_persistent_event(self, event: RequestEvent) -> None:
+        self.alternate_history_timeline.history.append(event)
+        if isinstance(event, RequestPrefillEvent):
+            self.persistent_prefill_done = True
+            self.persistent_prefill_event = event
+        elif isinstance(event, RequestDecodeEvent):
+            self.persistent_prefill_done = True
+            self.persistent_decode_count = max(
+                self.persistent_decode_count, event.completion_number
+            )
+            self.persistent_decode_events[event.completion_number] = event
+
     def earliest_events_after_real_time(
         self, real_event: RequestEvent
     ) -> Optional[List[RequestEvent]]:
-        events = self.alternate_history_timeline.events_after(real_event)
-        if not events:
-            return None
-        return [events[0]]
+        anticipated = self.alternate_history_timeline.anticipated_future_events
+        if isinstance(real_event, RequestStartEvent):
+            if self.persistent_prefill_event is not None:
+                return [self.persistent_prefill_event]
+            return anticipated[:1] or None
+        if isinstance(real_event, RequestPrefillEvent):
+            next_decode = self.persistent_decode_events.get(1)
+            if next_decode is not None:
+                return [next_decode]
+            return anticipated[:1] or None
+        if isinstance(real_event, RequestDecodeEvent):
+            next_decode = self.persistent_decode_events.get(
+                real_event.completion_number + 1
+            )
+            if next_decode is not None:
+                return [next_decode]
+            return anticipated[:1] or None
+        return anticipated[:1] or None
 
 @dataclass
 class _SimRequestState:
@@ -189,27 +234,14 @@ class UserTimeline:
             self.finished_request_timelines[req_id] = tracked
 
     def _persistent_request_state(self, tracked: TrackedRequest) -> Tuple[bool, int]:
-        prefill_done = False
-        decode_count = 0
-        for event in tracked.alternate_history_timeline.history:
-            if isinstance(event, RequestPrefillEvent):
-                prefill_done = True
-            elif isinstance(event, RequestDecodeEvent):
-                prefill_done = True
-                decode_count = max(decode_count, event.completion_number)
-        return prefill_done, decode_count
+        return tracked.persistent_prefill_done, tracked.persistent_decode_count
 
     def _merge_real_event_into_request_history(
         self, tracked: TrackedRequest, real_event: Optional[RequestEvent]
     ) -> None:
         timeline = tracked.alternate_history_timeline
         if not timeline.history:
-            timeline.history = [
-                RequestStartEvent(
-                    req_id=tracked.req.rid,
-                    end_timestamp=tracked.arrival_timestamp,
-                )
-            ]
+            tracked.reset_history_to_start()
 
     def _target_state_for_request(
         self, tracked: TrackedRequest, real_event: Optional[RequestEvent]
@@ -399,12 +431,8 @@ class UserTimeline:
                     end_timestamp=current_time,
                 )
                 if persist_batch:
-                    has_prior_prefill = any(
-                        isinstance(history_event, RequestPrefillEvent)
-                        for history_event in state.tracked.alternate_history_timeline.history
-                    )
-                    if not has_prior_prefill:
-                        state.tracked.alternate_history_timeline.history.append(event)
+                    if not state.tracked.persistent_prefill_done:
+                        state.tracked.append_persistent_event(event)
                         TIMELINE_WRITER.mark_isolated_prefill_done(
                             state.tracked.req.rid,
                             state.tracked.req.uid,
@@ -500,7 +528,7 @@ class UserTimeline:
                         end_timestamp=realized_ts,
                         completion_number=state.realized_decode_count,
                     )
-                    state.tracked.alternate_history_timeline.history.append(realized_event)
+                    state.tracked.append_persistent_event(realized_event)
                     TIMELINE_WRITER.mark_isolated_decode_done(
                         state.tracked.req.rid,
                         state.tracked.req.uid,
@@ -556,9 +584,7 @@ class UserTimeline:
             return
 
         live_rids = tuple(state.tracked.req.rid for state in live_states)
-        reuse_cached_frontier = (
-            live_rids == self.cached_live_rids and bool(self.cached_state_by_rid)
-        )
+        reuse_cached_frontier = bool(self.cached_state_by_rid)
         future_history: List[UserEvent] = []
         if (
             reuse_cached_frontier
@@ -578,16 +604,13 @@ class UserTimeline:
         for state in live_states:
             timeline = state.tracked.alternate_history_timeline
             if not timeline.history:
-                timeline.history = [
-                    RequestStartEvent(
-                        req_id=state.tracked.req.rid,
-                        end_timestamp=state.arrival_timestamp,
-                    )
-                ]
+                state.tracked.reset_history_to_start()
             cached_prefill_done = False
             cached_simulated_decode_count = 0
             cached_anticipated_event = None
-            if reuse_cached_frontier:
+            has_cached_state = False
+            if reuse_cached_frontier and state.tracked.req.rid in self.cached_state_by_rid:
+                has_cached_state = True
                 cached_prefill_done, cached_simulated_decode_count = (
                     self.cached_state_by_rid.get(
                         state.tracked.req.rid,
@@ -602,11 +625,15 @@ class UserTimeline:
                 state.set_simulated_decode_count(0)
             else:
                 state.prefill_done = True
-                seeded_decode_count = min(
-                    state.simulated_decode_count,
-                    state.realized_decode_count,
+                seeded_decode_count = (
+                    state.realized_decode_count
+                    if not has_cached_state
+                    else min(
+                        state.simulated_decode_count,
+                        state.realized_decode_count,
+                    )
                 )
-                if cached_prefill_done:
+                if has_cached_state and cached_prefill_done:
                     seeded_decode_count = max(
                         seeded_decode_count,
                         min(

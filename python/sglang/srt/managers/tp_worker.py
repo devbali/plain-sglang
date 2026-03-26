@@ -674,7 +674,8 @@ class ModelTpServer:
                         ),
                     )
                     end.record()
-                    torch.cuda.synchronize()
+                    if not end.query():
+                        end.synchronize()
                     elapsed_time_ms = start.elapsed_time(end)
                     wall_time_ms = (time.perf_counter() - wall_start) * 1000.0
                     self.fairness_policy.finished_decode(self.running_batch)
@@ -1789,7 +1790,8 @@ class ModelTpServer:
                 prepare_pass_state=prepare_pass_state,
             )
             fairness_prepare_end = time.perf_counter()
-            torch.cuda.synchronize()
+            if not model_forward_end.query():
+                model_forward_end.synchronize()
             after_sync = time.perf_counter()
             self.last_model_forward_elapsed_ms = model_forward_start.elapsed_time(
                 model_forward_end
