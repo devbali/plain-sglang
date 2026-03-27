@@ -157,7 +157,8 @@ class NoFairnessPolicy:
     def alloc_decode_output_slots(self, batch: "ScheduleBatch"):
         return self.alloc_token_slots(batch.token_to_kv_pool, batch.batch_size())
 
-    def finished_decode (self, batch: "ScheduleBatch"):
+    def finished_decode(self, batch: "ScheduleBatch", decode_rounds: int = 1):
+        del decode_rounds
         for req in batch.reqs:
             TIMELINE_WRITER.mark_request_event(req.rid, req.uid, event_type="decode")
 
@@ -199,6 +200,7 @@ class NoFairnessPolicy:
         scheduled_batch: Optional["ScheduleBatch"] = None,
         selected_rids: Optional[set[str]] = None,
         prepare_pass_state: bool = True,
+        decode_steps: int = 1,
     ) -> None:
         del (
             event_type,
@@ -207,6 +209,7 @@ class NoFairnessPolicy:
             scheduled_batch,
             selected_rids,
             prepare_pass_state,
+            decode_steps,
         )
 
     def consume_prepared_next_pass(self) -> bool:

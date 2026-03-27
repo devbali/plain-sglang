@@ -18,6 +18,51 @@ def _mk_req(uid: str, rid: str, prompt_tokens: int) -> Req:
 
 
 class TestDocPolicyCurrentPassUnit(unittest.TestCase):
+    def test_pending_new_request_merge_adds_waiting_deadline(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(doc_policy_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            doc_policy_mod, "pooled_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            doc_policy_mod, "pooled_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            sim_mod, "isolated_decode_time_estimation", return_value=3.0
+        ):
+            running_req = _mk_req("user_19", "rid_running", 4)
+            waiting_req = _mk_req("user_1", "rid_waiting", 4)
+            policy = DocPolicy(delta_fairness_n=4, max_running_requests=256)
+
+            policy.process_new_request(running_req)
+            now["t"] = 11.0
+            policy.finished_prefill(SimpleNamespace(reqs=[running_req]))
+            running_req.output_ids = [42]
+            now["t"] = 12.0
+            policy.finished_decode(SimpleNamespace(reqs=[running_req]))
+
+            running_batch = SimpleNamespace(reqs=[running_req])
+            now["t"] = 100.0
+            policy.start_of_pass(running_batch, [])
+
+            now["t"] = 101.0
+            policy.process_new_request(waiting_req)
+            policy._ensure_current_pass_state(
+                [waiting_req],
+                running_batch=running_batch,
+                delta_fairness_deltas_microseconds=policy._deltas_us,
+            )
+
+            self.assertIn(
+                waiting_req.rid,
+                policy._waiting_prefill_start_deadline_by_rid,
+            )
+
     def test_prepare_built_decode_state_is_consumed_before_merging_new_waiting(self):
         now = {"t": 10.0}
 
@@ -42,11 +87,16 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             policy.process_new_request(running_req)
             now["t"] = 11.0
             policy.finished_prefill(SimpleNamespace(reqs=[running_req]))
-            running_req.output_ids = [42]
-            now["t"] = 12.0
-            policy.finished_decode(SimpleNamespace(reqs=[running_req]))
-
             running_batch = SimpleNamespace(reqs=[running_req])
+            now["t"] = 12.0
+            policy.prepare_during_gpu_execution(
+                running_batch=running_batch,
+                waiting_queue=[],
+                event_type="decode",
+                prepare_pass_state=False,
+                decode_steps=1,
+            )
+            running_req.output_ids = [42]
             now["t"] = 100.0
             policy.start_of_pass(running_batch, [])
             self.assertEqual(policy._deadline_queue[0].event.completion_number, 2)
@@ -63,7 +113,13 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
 
             running_req.output_ids = [42, 43]
             now["t"] = 101.0
-            policy.finished_decode(SimpleNamespace(reqs=[running_req]))
+            policy.prepare_during_gpu_execution(
+                running_batch=running_batch,
+                waiting_queue=[],
+                event_type="decode",
+                prepare_pass_state=False,
+                decode_steps=1,
+            )
             policy.process_new_request(waiting_req)
 
             policy._ensure_current_pass_state(
@@ -78,7 +134,7 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
                 if candidate.event_type == "decode" and candidate.req.rid == running_req.rid
             ]
             self.assertEqual(len(decode_candidates), 1)
-            self.assertEqual(decode_candidates[0].event.completion_number, 3)
+            self.assertEqual(decode_candidates[0].event.completion_number, 4)
             self.assertEqual(policy._last_pass_state_source, "ensure_merge_pending")
 
     def test_decode_prepare_should_not_need_full_rebuild_on_simple_steady_state(self):
@@ -175,6 +231,59 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
                     event_type="decode",
                     prepare_pass_state=True,
                 )
+
+    def test_decode_prepare_advances_and_reseeds_next_decode_deadline(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(doc_policy_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            doc_policy_mod, "pooled_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            doc_policy_mod, "pooled_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            sim_mod, "isolated_decode_time_estimation", return_value=3.0
+        ):
+            req = _mk_req("user_19", "rid_running", 4)
+            policy = DocPolicy(delta_fairness_n=4, max_running_requests=256)
+
+            policy.process_new_request(req)
+            now["t"] = 11.0
+            policy.finished_prefill(SimpleNamespace(reqs=[req]))
+            running_batch = SimpleNamespace(reqs=[req])
+
+            now["t"] = 12.0
+            policy.prepare_during_gpu_execution(
+                running_batch=running_batch,
+                waiting_queue=[],
+                event_type="decode",
+                prepare_pass_state=False,
+                decode_steps=1,
+            )
+            tracked = policy.simulator.requests[req.rid]
+            anticipated = tracked.alternate_history_timeline.anticipated_future_events
+            self.assertEqual(len(anticipated), 1)
+            self.assertEqual(anticipated[0].completion_number, 2)
+            first_next_deadline = anticipated[0].end_timestamp
+
+            req.output_ids = [42]
+            now["t"] = 13.0
+            policy.prepare_during_gpu_execution(
+                running_batch=running_batch,
+                waiting_queue=[],
+                event_type="decode",
+                prepare_pass_state=False,
+                decode_steps=1,
+            )
+            anticipated = tracked.alternate_history_timeline.anticipated_future_events
+            self.assertEqual(len(anticipated), 1)
+            self.assertEqual(anticipated[0].completion_number, 3)
+            self.assertGreater(anticipated[0].end_timestamp, first_next_deadline)
 
     def test_long_decode_stall_should_not_create_large_positive_prefill_slack(self):
         now = {"t": 10.0}
@@ -287,6 +396,73 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
                 if candidate.event_type == "decode"
             }
             self.assertIn(prefilling_req.rid, decode_rids)
+
+    def test_prefill_prepare_then_finished_prefill_keeps_waiting_deadlines_subset(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(doc_policy_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            doc_policy_mod, "pooled_prefill_time_estimation", return_value=0.035579429910760005
+        ), patch.object(
+            doc_policy_mod, "pooled_decode_time_estimation", return_value=0.0139532681806768
+        ), patch.object(
+            sim_mod, "isolated_prefill_time_estimation", return_value=0.03
+        ), patch.object(
+            sim_mod, "isolated_decode_time_estimation", return_value=0.04
+        ):
+            policy = DocPolicy(delta_fairness_n=2, max_running_requests=256)
+
+            running = [_mk_req("19", f"run{i}", 101) for i in range(5)]
+            for req in running:
+                policy.process_new_request(req)
+
+            now["t"] = 11.0
+            running_batch = SimpleNamespace(reqs=running)
+            policy.finished_prefill(running_batch)
+            for req in running:
+                req.output_ids = [0] * 100
+
+            now["t"] = 12.0
+            policy.finished_decode(running_batch)
+
+            waiting = [_mk_req("1", f"wait{i}", 101) for i in range(20)]
+            for req in waiting:
+                policy.process_new_request(req)
+
+            now["t"] = 100.0
+            policy.start_of_pass(running_batch, waiting)
+
+            scheduled_batch = SimpleNamespace(reqs=waiting[:2])
+            policy.note_scheduled_prefill_batch(scheduled_batch)
+            policy.prepare_during_gpu_execution(
+                event_type="prefill",
+                running_batch=running_batch,
+                waiting_queue=waiting,
+                scheduled_batch=scheduled_batch,
+                prepare_pass_state=True,
+            )
+
+            now["t"] = 100.03
+            policy.finished_prefill(scheduled_batch)
+            next_running = SimpleNamespace(reqs=running + waiting[:2])
+            remaining_waiting = waiting[2:]
+            policy._ensure_current_pass_state(
+                remaining_waiting,
+                running_batch=next_running,
+                delta_fairness_deltas_microseconds=policy._deltas_us,
+            )
+
+            remaining_rids = {req.rid for req in remaining_waiting}
+            waiting_deadline_rids = set(policy._waiting_prefill_start_deadline_by_rid)
+            self.assertLessEqual(
+                len(waiting_deadline_rids),
+                len(remaining_waiting),
+            )
+            self.assertTrue(waiting_deadline_rids.issubset(remaining_rids))
 
 
 if __name__ == "__main__":

@@ -152,20 +152,20 @@ class TrackedRequest:
         if isinstance(real_event, RequestStartEvent):
             if self.persistent_prefill_event is not None:
                 return [self.persistent_prefill_event]
-            return anticipated[:1] or None
+            return list(anticipated) or None
         if isinstance(real_event, RequestPrefillEvent):
             next_decode = self.persistent_decode_events.get(1)
             if next_decode is not None:
                 return [next_decode]
-            return anticipated[:1] or None
+            return list(anticipated) or None
         if isinstance(real_event, RequestDecodeEvent):
             next_decode = self.persistent_decode_events.get(
                 real_event.completion_number + 1
             )
             if next_decode is not None:
                 return [next_decode]
-            return anticipated[:1] or None
-        return anticipated[:1] or None
+            return list(anticipated) or None
+        return list(anticipated) or None
 
 @dataclass
 class _SimRequestState:
@@ -242,6 +242,79 @@ class UserTimeline:
         timeline = tracked.alternate_history_timeline
         if not timeline.history:
             tracked.reset_history_to_start()
+        if real_event is None:
+            return
+
+        if (
+            isinstance(real_event, (RequestPrefillEvent, RequestDecodeEvent))
+            and not tracked.persistent_prefill_done
+        ):
+            prefill_event = next(
+                (
+                    event
+                    for event in timeline.anticipated_future_events
+                    if isinstance(event, RequestPrefillEvent)
+                ),
+                None,
+            )
+            if prefill_event is None:
+                start_ts = timeline.history[-1].end_timestamp
+                context_tokens = len(tracked.req.origin_input_ids)
+                prefill_duration = isolated_prefill_time_estimation(
+                    context_tokens,
+                    context_tokens,
+                    1,
+                    self.fairinf_n,
+                )
+                prefill_event = RequestPrefillEvent(
+                    req_id=tracked.req.rid,
+                    duration=prefill_duration,
+                    end_timestamp=start_ts + prefill_duration,
+                )
+            tracked.append_persistent_event(prefill_event)
+            timeline.anticipated_future_events = [
+                event
+                for event in timeline.anticipated_future_events
+                if not isinstance(event, RequestPrefillEvent)
+            ]
+
+        if not isinstance(real_event, RequestDecodeEvent):
+            return
+
+        while tracked.persistent_decode_count < real_event.completion_number:
+            next_completion = tracked.persistent_decode_count + 1
+            decode_event = next(
+                (
+                    event
+                    for event in timeline.anticipated_future_events
+                    if isinstance(event, RequestDecodeEvent)
+                    and event.completion_number == next_completion
+                ),
+                None,
+            )
+            if decode_event is None:
+                context_tokens = len(tracked.req.origin_input_ids) + next_completion
+                decode_duration = isolated_decode_time_estimation(
+                    context_tokens,
+                    context_tokens,
+                    1,
+                    self.fairinf_n,
+                )
+                decode_event = RequestDecodeEvent(
+                    req_id=tracked.req.rid,
+                    duration=decode_duration,
+                    end_timestamp=tracked.most_recent_event().end_timestamp + decode_duration,
+                    completion_number=next_completion,
+                )
+            tracked.append_persistent_event(decode_event)
+            timeline.anticipated_future_events = [
+                event
+                for event in timeline.anticipated_future_events
+                if not (
+                    isinstance(event, RequestDecodeEvent)
+                    and event.completion_number == next_completion
+                )
+            ]
 
     def _target_state_for_request(
         self, tracked: TrackedRequest, real_event: Optional[RequestEvent]
@@ -339,6 +412,17 @@ class UserTimeline:
             return future_history[-1].end_timestamp
         if self.history:
             return self.history[-1].end_timestamp
+        persistent_event_times = [
+            state.tracked.most_recent_event().end_timestamp
+            for state in waiting_states + active_states
+            if state.tracked.most_recent_event() is not None
+            and (
+                state.tracked.persistent_prefill_done
+                or state.tracked.persistent_decode_count > 0
+            )
+        ]
+        if persistent_event_times:
+            return max(persistent_event_times)
         return min(
             state.arrival_timestamp for state in waiting_states + active_states
         )
@@ -488,7 +572,7 @@ class UserTimeline:
             if not milestone_rounds:
                 return None
 
-            rounds = max(1, min(milestone_rounds))
+            rounds = 1
             persist_batch = persist_rounds > 0
             if persist_batch:
                 rounds = min(rounds, persist_rounds)
@@ -514,27 +598,28 @@ class UserTimeline:
                 prev_decode_count = state.simulated_decode_count
                 state.advance_simulated_decode_count(rounds)
 
-                if (
-                    persist_batch
-                    and
-                    prev_decode_count < state.realized_decode_count
-                    <= state.simulated_decode_count
-                ):
-                    realized_round = state.realized_decode_count - prev_decode_count
-                    realized_ts = chunk_start + realized_round * duration
-                    realized_event = RequestDecodeEvent(
-                        req_id=state.tracked.req.rid,
-                        duration=duration,
-                        end_timestamp=realized_ts,
-                        completion_number=state.realized_decode_count,
+                if persist_batch:
+                    realized_upper = min(
+                        state.realized_decode_count, state.simulated_decode_count
                     )
-                    state.tracked.append_persistent_event(realized_event)
-                    TIMELINE_WRITER.mark_isolated_decode_done(
-                        state.tracked.req.rid,
-                        state.tracked.req.uid,
-                        timestamp_iso=_iso_ts(realized_ts),
-                        completion_number=state.realized_decode_count,
-                    )
+                    for completion_number in range(
+                        prev_decode_count + 1, realized_upper + 1
+                    ):
+                        realized_round = completion_number - prev_decode_count
+                        realized_ts = chunk_start + realized_round * duration
+                        realized_event = RequestDecodeEvent(
+                            req_id=state.tracked.req.rid,
+                            duration=duration,
+                            end_timestamp=realized_ts,
+                            completion_number=completion_number,
+                        )
+                        state.tracked.append_persistent_event(realized_event)
+                        TIMELINE_WRITER.mark_isolated_decode_done(
+                            state.tracked.req.rid,
+                            state.tracked.req.uid,
+                            timestamp_iso=_iso_ts(realized_ts),
+                            completion_number=completion_number,
+                        )
 
                 anticipated_completion = state.realized_decode_count + 1
                 if (
@@ -775,6 +860,35 @@ class AlternateHistorySimulator:
         tracked.user_timeline = user_timeline
         user_timeline.request_timelines[req.rid] = tracked
 
+    def _seed_waiting_prefill_future_event(
+        self,
+        tracked: TrackedRequest,
+        *,
+        now: float,
+    ) -> None:
+        req = tracked.req
+        context_tokens = (
+            len(req.fill_ids)
+            if req.fill_ids is not None
+            else len(req.origin_input_ids) + len(req.output_ids)
+        )
+        prefill_duration = isolated_prefill_time_estimation(
+            context_tokens,
+            context_tokens,
+            1,
+            self.fairinf_n,
+        )
+        tracked.alternate_history_timeline.history = [
+            RequestStartEvent(req_id=req.rid, end_timestamp=now)
+        ]
+        tracked.alternate_history_timeline.anticipated_future_events = [
+            RequestPrefillEvent(
+                req_id=req.rid,
+                duration=prefill_duration,
+                end_timestamp=now + prefill_duration,
+            )
+        ]
+
     def sync_live_user_tracking(
         self,
         running_batch: Optional[ScheduleBatch],
@@ -997,6 +1111,7 @@ class AlternateHistorySimulator:
             tracked.req = req
             if deltas_in_microseconds is not None:
                 tracked.deltas_in_microseconds = dict(deltas_in_microseconds)
+        self._seed_waiting_prefill_future_event(tracked, now=now)
 
     def finished_prefill(self, batch: ScheduleBatch) -> None:
         now = time.time()
@@ -1006,14 +1121,69 @@ class AlternateHistorySimulator:
                 end_timestamp=now,
             )
 
-    def finished_decode(self, batch: ScheduleBatch) -> None:
+    def finished_decode(self, batch: ScheduleBatch, decode_rounds: int = 1) -> None:
         now = time.time()
         for req in batch.reqs:
+            final_completion_number = len(req.output_ids)
             self.most_recent_event_real[req.rid] = RequestDecodeEvent(
                 req_id=req.rid,
                 end_timestamp=now,
-                completion_number=len(req.output_ids),
+                completion_number=final_completion_number,
             )
+            tracked = self.requests.get(req.rid)
+            if tracked is None:
+                continue
+            timeline = tracked.alternate_history_timeline
+            if tracked.persistent_decode_count > 0:
+                next_completion_number = tracked.persistent_decode_count + 1
+                current_end_timestamp = tracked.persistent_decode_events[
+                    tracked.persistent_decode_count
+                ].end_timestamp
+            elif tracked.persistent_prefill_event is not None:
+                next_completion_number = 1
+                current_end_timestamp = tracked.persistent_prefill_event.end_timestamp
+            else:
+                prefill_event = next(
+                    (
+                        event
+                        for event in timeline.anticipated_future_events
+                        if isinstance(event, RequestPrefillEvent)
+                    ),
+                    None,
+                )
+                if prefill_event is None:
+                    prefill_duration = isolated_prefill_time_estimation(
+                        len(req.origin_input_ids),
+                        len(req.origin_input_ids),
+                        1,
+                        self.fairinf_n,
+                    )
+                    current_end_timestamp = tracked.arrival_timestamp + prefill_duration
+                else:
+                    current_end_timestamp = prefill_event.end_timestamp
+                next_completion_number = 1
+
+            decode_events = []
+            for completion_number in range(
+                next_completion_number, final_completion_number + 1
+            ):
+                context_tokens = len(req.origin_input_ids) + completion_number
+                decode_duration = isolated_decode_time_estimation(
+                    context_tokens,
+                    context_tokens,
+                    1,
+                    self.fairinf_n,
+                )
+                current_end_timestamp += decode_duration
+                decode_events.append(
+                    RequestDecodeEvent(
+                        req_id=req.rid,
+                        duration=decode_duration,
+                        end_timestamp=current_end_timestamp,
+                        completion_number=completion_number,
+                    )
+                )
+            timeline.anticipated_future_events = decode_events
 
     def mark_request_finished(self, req: Req) -> None:
         user_timeline = self.users.get(req.uid)

@@ -24,6 +24,7 @@ import time
 import threading
 import warnings
 import json
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Union
 
 import torch
@@ -441,7 +442,8 @@ class ModelTpServer:
             "prefill_waiting_queue_prefills_ms,prefill_build_batch_ms,"
             "doc_forced_prefill_count,doc_safe_waiting_count,doc_deadline_queue_len,"
             "doc_has_decode_deadline,doc_max_safe_prefill_tokens,doc_waiting_deadline_count,"
-            "doc_earliest_decode_start_deadline,doc_safe_prefix_now,doc_decode_deadline_slack_ms\n",
+            "doc_earliest_decode_start_deadline,doc_safe_prefix_now,doc_decode_deadline_slack_ms,"
+            "doc_first_waiting_rid,doc_first_waiting_prompt_tokens,doc_first_candidate_prefill_ms,doc_first_candidate_residual_slack_ms\n",
         )
         self._doc_policy_snapshot_threshold_ms = float(
             os.environ.get("DOC_POLICY_SNAPSHOT_THRESHOLD_MS", "200")
@@ -560,6 +562,7 @@ class ModelTpServer:
             # Force prefill is checked first
             if isinstance(self.fairness_policy, DocPolicy):
                 force_prefill = bool(self.fairness_policy._forced_prefill_rids)
+                max_prefill_size = self.fairness_policy._max_safe_prefill_tokens
                 decision_timer.parts["force_prefill_check_ms"] = 0.0
             else:
                 force_prefill = force_prefill_func()
@@ -661,6 +664,8 @@ class ModelTpServer:
                     decode_steps=global_config.num_continue_decode_steps,
                 )
                 # Run a few decode batches continuously for reducing overhead
+                decoded_reqs_by_rid = {}
+                decode_steps_run = 0
                 for decode_step_idx in range(global_config.num_continue_decode_steps):
                     selected_rids = (
                         self.fairness_policy.fairinf_overdue_decode_subset_rids(
@@ -691,13 +696,17 @@ class ModelTpServer:
                             (decode_step_idx == global_config.num_continue_decode_steps - 1)
                             and not async_prepare_launched
                         ),
+                        decode_steps=1,
                     )
                     end.record()
                     if not end.query():
                         end.synchronize()
                     elapsed_time_ms = start.elapsed_time(end)
                     wall_time_ms = (time.perf_counter() - wall_start) * 1000.0
-                    self.fairness_policy.finished_decode(self.running_batch)
+                    for req in self.running_batch.reqs:
+                        if selected_rids is None or req.rid in selected_rids:
+                            decoded_reqs_by_rid[req.rid] = req
+                    decode_steps_run += 1
 
                     # Print stats
                     self.print_stats(
@@ -709,6 +718,11 @@ class ModelTpServer:
                     if self.running_batch.is_empty():
                         self.running_batch = None
                         break
+                if decoded_reqs_by_rid:
+                    self.fairness_policy.finished_decode(
+                        SimpleNamespace(reqs=list(decoded_reqs_by_rid.values())),
+                        decode_rounds=decode_steps_run,
+                    )
                 self._last_prepare_async_wait_ms = (
                     self.fairness_policy.wait_for_async_prepare()
                     if async_prepare_launched
@@ -885,6 +899,10 @@ class ModelTpServer:
         doc_earliest_decode_start_deadline = ""
         doc_safe_prefix_now = ""
         doc_decode_deadline_slack_ms = ""
+        doc_first_waiting_rid = ""
+        doc_first_waiting_prompt_tokens = ""
+        doc_first_candidate_prefill_ms = ""
+        doc_first_candidate_residual_slack_ms = ""
         if isinstance(self.fairness_policy, DocPolicy):
             doc_forced_prefill_count = len(
                 getattr(self.fairness_policy, "_forced_prefill_rids", ())
@@ -921,6 +939,27 @@ class ModelTpServer:
                 doc_safe_prefix_now = safe_now
             if earliest is not None and safe_now is not None:
                 doc_decode_deadline_slack_ms = (earliest - safe_now) * 1000.0
+            doc_first_waiting_rid = getattr(
+                self.fairness_policy, "_debug_first_waiting_rid", ""
+            ) or ""
+            first_prompt = getattr(
+                self.fairness_policy, "_debug_first_waiting_prompt_tokens", None
+            )
+            doc_first_waiting_prompt_tokens = (
+                "" if first_prompt is None else int(first_prompt)
+            )
+            first_prefill_ms = getattr(
+                self.fairness_policy, "_debug_first_candidate_prefill_ms", None
+            )
+            doc_first_candidate_prefill_ms = (
+                "" if first_prefill_ms is None else float(first_prefill_ms)
+            )
+            first_residual = getattr(
+                self.fairness_policy, "_debug_first_candidate_residual_slack_ms", None
+            )
+            doc_first_candidate_residual_slack_ms = (
+                "" if first_residual is None else float(first_residual)
+            )
 
         self._scheduler_pass_csv_logger.log(
             f"{time.time()},"
@@ -944,7 +983,8 @@ class ModelTpServer:
             f"{prefill_parts.get('build_batch_ms', 0.0)},"
             f"{doc_forced_prefill_count},{doc_safe_waiting_count},{doc_deadline_queue_len},"
             f"{doc_has_decode_deadline},{doc_max_safe_prefill_tokens},{doc_waiting_deadline_count},"
-            f"{doc_earliest_decode_start_deadline},{doc_safe_prefix_now},{doc_decode_deadline_slack_ms}\n"
+            f"{doc_earliest_decode_start_deadline},{doc_safe_prefix_now},{doc_decode_deadline_slack_ms},"
+            f"{doc_first_waiting_rid},{doc_first_waiting_prompt_tokens},{doc_first_candidate_prefill_ms},{doc_first_candidate_residual_slack_ms}\n"
         )
 
     def _serialize_doc_policy_req(self, req: Req) -> Dict[str, Any]:
@@ -1618,6 +1658,7 @@ class ModelTpServer:
         *,
         selected_rids: Optional[set[str]] = None,
         prepare_pass_state: bool = True,
+        decode_steps: int = 1,
     ):
         self.last_model_forward_elapsed_ms = None
         self.last_decode_step_breakdown = None
@@ -1823,6 +1864,7 @@ class ModelTpServer:
                 scheduled_batch=None,
                 selected_rids=selected_rids,
                 prepare_pass_state=prepare_pass_state,
+                decode_steps=decode_steps,
             )
             fairness_prepare_end = time.perf_counter()
             if not model_forward_end.query():

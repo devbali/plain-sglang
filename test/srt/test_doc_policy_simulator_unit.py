@@ -19,6 +19,77 @@ def _mk_req(uid: str, rid: str, n_tokens: int) -> Req:
 
 
 class TestDocPolicySimulatorUnit(unittest.TestCase):
+    def test_grouped_finished_decode_replays_each_decode_round(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(sim_mod.time, "time", side_effect=fake_time):
+            with patch.object(
+                sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+            ), patch.object(
+                sim_mod, "isolated_decode_time_estimation", return_value=3.0
+            ):
+                simulator = AlternateHistorySimulator(
+                    max_kv_tokens_per_user=100,
+                    fairinf_n=2,
+                )
+
+                req = _mk_req("user_19", "rid_running", 4)
+                simulator.process_new_request(req)
+                now["t"] = 11.0
+                simulator.finished_prefill(SimpleNamespace(reqs=[req]))
+                req.output_ids = list(range(10))
+                now["t"] = 12.0
+                simulator.finished_decode(SimpleNamespace(reqs=[req]), decode_rounds=10)
+
+                now["t"] = 100.0
+                simulator.start_of_pass(
+                    SimpleNamespace(reqs=[req]),
+                    [],
+                )
+
+                candidates, _ = simulator.build_deadline_candidates(
+                    [],
+                    SimpleNamespace(reqs=[req]),
+                    req_is_fair_prefill=lambda req, rb: True,
+                    req_is_fair_decode=lambda req, rb: True,
+                    event_delta_seconds=lambda tracked, event: 0.0,
+                    pooled_prefill_estimate_seconds=lambda req: 2.0,
+                    pooled_decode_estimate_seconds=lambda req, rb: 3.0,
+                )
+
+                tracked = simulator.requests[req.rid]
+                decode_events = [
+                    event
+                    for event in tracked.alternate_history_timeline.history
+                    if isinstance(event, RequestDecodeEvent)
+                ]
+                anticipated_decode_events = [
+                    event
+                    for event in tracked.alternate_history_timeline.anticipated_future_events
+                    if isinstance(event, RequestDecodeEvent)
+                ]
+                self.assertEqual(
+                    [event.completion_number for event in decode_events],
+                    list(range(1, 11)),
+                )
+                self.assertEqual(
+                    [event.end_timestamp for event in decode_events],
+                    [15.0 + 3.0 * i for i in range(10)],
+                )
+                self.assertEqual(
+                    [event.completion_number for event in anticipated_decode_events],
+                    [11],
+                )
+                decode_candidates = [
+                    candidate for candidate in candidates if candidate.event_type == "decode"
+                ]
+                self.assertEqual(len(decode_candidates), 1)
+                self.assertEqual(decode_candidates[0].event.completion_number, 11)
+                self.assertEqual(decode_candidates[0].deadline, 45.0)
+
     def test_waiting_prefill_deadlines_follow_isolated_arrival_order_not_pass_time(self):
         now = {"t": 10.0}
 
@@ -47,7 +118,6 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                 simulator.start_of_pass(
                     SimpleNamespace(reqs=[]),
                     [req1, req2],
-                    user_is_fair=lambda uid, rb: True,
                 )
 
                 candidates, waiting_deadlines = simulator.build_deadline_candidates(
@@ -56,10 +126,12 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                     req_is_fair_prefill=lambda req, rb: True,
                     req_is_fair_decode=lambda req, rb: True,
                     event_delta_seconds=lambda tracked, event: 0.0,
+                    pooled_prefill_estimate_seconds=lambda req: 2.0,
+                    pooled_decode_estimate_seconds=lambda req, rb: 3.0,
                 )
 
-                self.assertEqual(waiting_deadlines[req1.rid], 12.0)
-                self.assertEqual(waiting_deadlines[req2.rid], 14.0)
+                self.assertEqual(waiting_deadlines[req1.rid], 10.0)
+                self.assertEqual(waiting_deadlines[req2.rid], 12.0)
                 self.assertEqual(
                     [candidate.req.rid for candidate in candidates if candidate.event_type == "prefill"],
                     [req1.rid, req2.rid],
@@ -107,7 +179,6 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                 simulator.start_of_pass(
                     SimpleNamespace(reqs=[req]),
                     [],
-                    user_is_fair=lambda uid, rb: True,
                 )
 
                 candidates, _ = simulator.build_deadline_candidates(
@@ -116,6 +187,8 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                     req_is_fair_prefill=lambda req, rb: True,
                     req_is_fair_decode=lambda req, rb: True,
                     event_delta_seconds=lambda tracked, event: 0.0,
+                    pooled_prefill_estimate_seconds=lambda req: 2.0,
+                    pooled_decode_estimate_seconds=lambda req, rb: 3.0,
                 )
 
                 decode_candidates = [

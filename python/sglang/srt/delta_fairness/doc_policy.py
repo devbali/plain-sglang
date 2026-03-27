@@ -68,6 +68,10 @@ class DocPolicy(DeltaFairnessPolicy):
         self._simulator_rebuild_prepared = False
         self._earliest_decode_start_deadline: Optional[float] = None
         self._safe_prefix_now: Optional[float] = None
+        self._debug_first_waiting_rid: Optional[str] = None
+        self._debug_first_waiting_prompt_tokens: Optional[int] = None
+        self._debug_first_candidate_prefill_ms: Optional[float] = None
+        self._debug_first_candidate_residual_slack_ms: Optional[float] = None
         self._prepared_deadline_queue = []
         self._prepared_waiting_prefill_start_deadline_by_rid: Dict[str, float] = {}
         self._prepared_safe_waiting_queue: List[Req] = []
@@ -228,6 +232,10 @@ class DocPolicy(DeltaFairnessPolicy):
         self._has_decode_deadline = False
         self._earliest_decode_start_deadline = None
         self._safe_prefix_now = None
+        self._debug_first_waiting_rid = None
+        self._debug_first_waiting_prompt_tokens = None
+        self._debug_first_candidate_prefill_ms = None
+        self._debug_first_candidate_residual_slack_ms = None
 
         earliest_decode_deadline = min(
             (
@@ -257,6 +265,13 @@ class DocPolicy(DeltaFairnessPolicy):
         for req in self._safe_waiting_queue:
             candidate_batch.append(req)
             pooled_prefill_s = self._pooled_prefill_seconds(candidate_batch)
+            if len(candidate_batch) == 1:
+                self._debug_first_waiting_rid = req.rid
+                self._debug_first_waiting_prompt_tokens = len(req.origin_input_ids)
+                self._debug_first_candidate_prefill_ms = pooled_prefill_s * 1000.0
+                self._debug_first_candidate_residual_slack_ms = (
+                    earliest_decode_deadline - (now + pooled_prefill_s)
+                ) * 1000.0
             if now + pooled_prefill_s <= earliest_decode_deadline:
                 safe_prompt_tokens = sum(
                     len(batch_req.origin_input_ids) for batch_req in candidate_batch
@@ -762,6 +777,7 @@ class DocPolicy(DeltaFairnessPolicy):
                 self._deltas_us,
                 timing_breakdown=breakdown,
             )
+            self._clear_pending_mutations()
             self._last_pass_state_source = "start_of_pass_initial_build"
 
         after_simulator = time.perf_counter()
@@ -825,11 +841,17 @@ class DocPolicy(DeltaFairnessPolicy):
         decode_steps: int,
     ) -> None:
         chosen = selected_rids
-        for step in range(1, decode_steps + 1):
-            for req in running_batch.reqs:
-                if chosen is not None and req.rid not in chosen:
-                    continue
-                completion_number = len(req.output_ids) - decode_steps + step
+        for req in running_batch.reqs:
+            if chosen is not None and req.rid not in chosen:
+                continue
+            tracked = simulator.requests.get(req.rid)
+            if tracked is None:
+                continue
+            final_logical_ts = None
+            start_completion_number = len(req.output_ids) + 1
+            for completion_number in range(
+                start_completion_number, start_completion_number + decode_steps
+            ):
                 logical_ts = self._logical_next_event_timestamp(
                     req,
                     event_type="decode",
@@ -841,6 +863,25 @@ class DocPolicy(DeltaFairnessPolicy):
                     end_timestamp=logical_ts,
                     completion_number=completion_number,
                 )
+                final_logical_ts = logical_ts
+            if final_logical_ts is None:
+                continue
+            next_completion_number = start_completion_number + decode_steps
+            context_tokens = len(req.origin_input_ids) + next_completion_number
+            decode_duration = isolated_decode_time_estimation(
+                context_tokens,
+                context_tokens,
+                1,
+                max(int(self.delta_fairness_n or 1), 1),
+            )
+            tracked.alternate_history_timeline.anticipated_future_events = [
+                RequestDecodeEvent(
+                    req_id=req.rid,
+                    duration=decode_duration,
+                    end_timestamp=final_logical_ts + decode_duration,
+                    completion_number=next_completion_number,
+                )
+            ]
 
     def _predicted_running_batch(
         self,
@@ -863,9 +904,20 @@ class DocPolicy(DeltaFairnessPolicy):
         scheduled_batch: Optional[ScheduleBatch] = None,
         selected_rids: Optional[set[str]] = None,
         prepare_pass_state: bool = True,
+        decode_steps: int = 1,
     ) -> None:
-        del selected_rids
         if not prepare_pass_state:
+            if event_type == "decode" and running_batch is not None and decode_steps > 0:
+                self._apply_logical_decode_updates(
+                    self.simulator,
+                    running_batch,
+                    selected_rids=selected_rids,
+                    decode_steps=decode_steps,
+                )
+                chosen = selected_rids
+                for req in running_batch.reqs:
+                    if chosen is None or req.rid in chosen:
+                        self._pending_decoded_reqs[req.rid] = req
             self._invalidate_prepared_state()
             self._last_prepare_breakdown_ms = {
                 "sync_live_user_tracking_ms": 0.0,
@@ -877,6 +929,17 @@ class DocPolicy(DeltaFairnessPolicy):
             return
 
         if event_type == "decode" and not waiting_queue:
+            if running_batch is not None and decode_steps > 0:
+                self._apply_logical_decode_updates(
+                    self.simulator,
+                    running_batch,
+                    selected_rids=selected_rids,
+                    decode_steps=decode_steps,
+                )
+                chosen = selected_rids
+                for req in running_batch.reqs:
+                    if chosen is None or req.rid in chosen:
+                        self._pending_decoded_reqs[req.rid] = req
             self._invalidate_prepared_state()
             self._last_prepare_breakdown_ms = {
                 "sync_live_user_tracking_ms": 0.0,
@@ -888,6 +951,19 @@ class DocPolicy(DeltaFairnessPolicy):
             return
 
         phase_start = time.perf_counter()
+        logical_update_start = phase_start
+        if event_type == "decode" and running_batch is not None and decode_steps > 0:
+            self._apply_logical_decode_updates(
+                self.simulator,
+                running_batch,
+                selected_rids=selected_rids,
+                decode_steps=decode_steps,
+            )
+            chosen = selected_rids
+            for req in running_batch.reqs:
+                if chosen is None or req.rid in chosen:
+                    self._pending_decoded_reqs[req.rid] = req
+        logical_update_end = time.perf_counter()
         if event_type == "prefill" and scheduled_batch is not None:
             scheduled_rids = {req.rid for req in scheduled_batch.reqs}
             predicted_waiting = [
@@ -901,13 +977,17 @@ class DocPolicy(DeltaFairnessPolicy):
             predicted_running = running_batch
 
         self._prepare_deadline_state(predicted_waiting, predicted_running)
+        if event_type == "decode":
+            self._pending_decoded_reqs.clear()
         self._simulator_rebuild_prepared = True
         elapsed_ms = (time.perf_counter() - phase_start) * 1000.0
         self._last_prepare_breakdown_ms = {
             "sync_live_user_tracking_ms": 0.0,
-            "logical_event_update_ms": 0.0,
+            "logical_event_update_ms": (logical_update_end - logical_update_start) * 1000.0,
             "rebuild_from_real_state_ms": 0.0,
-            "build_deadline_candidates_ms": elapsed_ms,
+            "build_deadline_candidates_ms": max(
+                0.0, elapsed_ms - ((logical_update_end - logical_update_start) * 1000.0)
+            ),
             "prepare_during_gpu_execution_total_ms": elapsed_ms,
         }
 
@@ -1091,20 +1171,9 @@ class DocPolicy(DeltaFairnessPolicy):
             self._pending_scheduled_prefill_reqs.pop(req.rid, None)
         self._invalidate_prepared_state()
 
-    def finished_decode(self, batch: ScheduleBatch) -> None:
-        super().finished_decode(batch)
-        now = time.time()
-        for req in batch.reqs:
-            self._mark_violation_if_executed_after_deadline(
-                req,
-                event_type="decode",
-                completion_number=len(req.output_ids),
-                now=now,
-            )
-        self.simulator.finished_decode(batch)
-        for req in batch.reqs:
-            self._pending_decoded_reqs[req.rid] = req
-        self._invalidate_prepared_state()
+    def finished_decode(self, batch: ScheduleBatch, decode_rounds: int = 1) -> None:
+        super().finished_decode(batch, decode_rounds=decode_rounds)
+        del batch, decode_rounds
 
     def mark_request_finished(self, req: Req) -> None:
         super().mark_request_finished(req)
