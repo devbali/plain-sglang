@@ -443,6 +443,7 @@ class ModelTpServer:
             "doc_forced_prefill_count,doc_safe_waiting_count,doc_deadline_queue_len,"
             "doc_has_decode_deadline,doc_max_safe_prefill_tokens,doc_waiting_deadline_count,"
             "doc_earliest_decode_start_deadline,doc_safe_prefix_now,doc_decode_deadline_slack_ms,"
+            "doc_earliest_decode_rid,doc_earliest_decode_uid,"
             "doc_first_waiting_rid,doc_first_waiting_prompt_tokens,doc_first_candidate_prefill_ms,doc_first_candidate_residual_slack_ms\n",
         )
         self._doc_policy_snapshot_threshold_ms = float(
@@ -899,6 +900,8 @@ class ModelTpServer:
         doc_earliest_decode_start_deadline = ""
         doc_safe_prefix_now = ""
         doc_decode_deadline_slack_ms = ""
+        doc_earliest_decode_rid = ""
+        doc_earliest_decode_uid = ""
         doc_first_waiting_rid = ""
         doc_first_waiting_prompt_tokens = ""
         doc_first_candidate_prefill_ms = ""
@@ -939,6 +942,12 @@ class ModelTpServer:
                 doc_safe_prefix_now = safe_now
             if earliest is not None and safe_now is not None:
                 doc_decode_deadline_slack_ms = (earliest - safe_now) * 1000.0
+            doc_earliest_decode_rid = getattr(
+                self.fairness_policy, "_debug_earliest_decode_rid", ""
+            ) or ""
+            doc_earliest_decode_uid = getattr(
+                self.fairness_policy, "_debug_earliest_decode_uid", ""
+            ) or ""
             doc_first_waiting_rid = getattr(
                 self.fairness_policy, "_debug_first_waiting_rid", ""
             ) or ""
@@ -984,6 +993,7 @@ class ModelTpServer:
             f"{doc_forced_prefill_count},{doc_safe_waiting_count},{doc_deadline_queue_len},"
             f"{doc_has_decode_deadline},{doc_max_safe_prefill_tokens},{doc_waiting_deadline_count},"
             f"{doc_earliest_decode_start_deadline},{doc_safe_prefix_now},{doc_decode_deadline_slack_ms},"
+            f"{doc_earliest_decode_rid},{doc_earliest_decode_uid},"
             f"{doc_first_waiting_rid},{doc_first_waiting_prompt_tokens},{doc_first_candidate_prefill_ms},{doc_first_candidate_residual_slack_ms}\n"
         )
 
@@ -1176,13 +1186,17 @@ class ModelTpServer:
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
         available_req_slots = len(self.req_to_token_pool.free_slots)
+        allow_force_prefill_retraction = (
+            isinstance(self.fairness_policy, DocPolicy)
+            and bool(getattr(self.fairness_policy, "_forced_prefill_rids", None))
+        )
         if not self.waiting_queue and self.current_inflight_req is None:
             telemetry["reason"] = "no_waiting_or_inflight"
             return None
-        if running_bs >= self.max_running_requests:
+        if running_bs >= self.max_running_requests and not allow_force_prefill_retraction:
             telemetry["reason"] = "running_batch_full"
             return None
-        if available_req_slots <= 0:
+        if available_req_slots <= 0 and not allow_force_prefill_retraction:
             telemetry["reason"] = "no_req_slots"
             return None
         if (

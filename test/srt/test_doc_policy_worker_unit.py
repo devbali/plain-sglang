@@ -1,9 +1,10 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import sglang.srt.managers.tp_worker as tp_worker_mod
 from sglang.global_config import global_config
+from sglang.srt.delta_fairness.doc_policy import DocPolicy
 from sglang.srt.managers.tp_worker import ModelTpServer
 
 
@@ -82,6 +83,300 @@ class TestDocPolicyWorkerUnit(unittest.TestCase):
 
         self.assertEqual(captured["max_prefill_size"], 101)
         self.assertEqual(captured["log_scheduler"]["max_prefill_size"], 101)
+
+    def test_get_new_prefill_batch_should_not_return_early_when_force_prefill_can_retract_for_slots(self):
+        force_reservation_called = {"called": False}
+        server_holder = {}
+
+        class _FakeDocPolicyForBatch:
+            def __init__(self):
+                self._forced_prefill_rids = {"rid_waiting"}
+                self._last_pass_breakdown_ms = {}
+
+            def start_of_pass(self, running_batch, waiting_queue, *, new_token_ratio=0.0, max_running_requests=None):
+                del running_batch, waiting_queue, new_token_ratio, max_running_requests
+
+            def force_prefill_reservations(
+                self,
+                waiting_queue,
+                *,
+                token_counters_by_user,
+                adder,
+                token_to_kv_pool=None,
+                running_batch=None,
+                delta_fairness_deltas_microseconds=None,
+                max_input_size=None,
+                prefix_computed=False,
+                max_running_requests=None,
+            ):
+                del (
+                    waiting_queue,
+                    token_counters_by_user,
+                    token_to_kv_pool,
+                    running_batch,
+                    delta_fairness_deltas_microseconds,
+                    max_input_size,
+                    prefix_computed,
+                    max_running_requests,
+                )
+                force_reservation_called["called"] = True
+                server_holder["server"].running_batch.reqs = []
+                adder.can_run_list.append(server_holder["server"].waiting_queue[0])
+                return 101, [SimpleNamespace(rid="rid_evicted")]
+
+            def process_waiting_queue_prefills(
+                self,
+                waiting_queue,
+                *,
+                adder,
+                token_counters_by_user,
+                prefix_computed,
+                running_batch,
+                running_batch_size,
+                max_running_requests,
+                available_req_slots,
+                max_input_size,
+            ):
+                del (
+                    waiting_queue,
+                    token_counters_by_user,
+                    prefix_computed,
+                    running_batch,
+                    running_batch_size,
+                    max_running_requests,
+                    available_req_slots,
+                    max_input_size,
+                )
+                adder.can_run_list.append(SimpleNamespace(reqs=[]))
+
+        class _FakePrefillAdder:
+            def __init__(self, *args, **kwargs):
+                del args, kwargs
+                self.can_run_list = []
+                self.new_inflight_req = None
+                self.log_input_tokens = 0
+                self.rem_input_tokens = 10_000
+                self.rem_total_tokens = 10_000
+
+            def remove_running_tokens(self, running_batch, new_token_ratio):
+                del running_batch, new_token_ratio
+
+        class FakeServer:
+            pass
+
+        server = FakeServer()
+        server_holder["server"] = server
+        server._capture_doc_policy_pass_snapshot_state = lambda: None
+        server.running_batch = SimpleNamespace(reqs=[SimpleNamespace(rid="rid_running")] * 1)
+        server.max_running_requests = 1
+        server.req_to_token_pool = SimpleNamespace(free_slots=[1])
+        server.waiting_queue = [SimpleNamespace(rid="rid_waiting", uid="1")]
+        server.current_inflight_req = None
+        server.fairness_policy = _FakeDocPolicyForBatch()
+        server.scheduler = SimpleNamespace(calc_priority=lambda waiting_queue: False)
+        server.is_mixed_chunk = False
+        server.max_prefill_tokens = 5000
+        server.chunked_prefill_size = 5000
+        server.tree_cache = SimpleNamespace(evictable_size=lambda: 0)
+        server.token_to_kv_pool = SimpleNamespace(available_size=lambda: 0)
+        server.new_token_ratio = 0.0
+        server.delta_fairness_deltas_microseconds = {"decode": 0}
+        server.delta_fairness_n = 2
+        server._maybe_dump_doc_policy_pass_snapshot = lambda *args, **kwargs: None
+        server.tp_rank = 1
+
+        with patch.object(tp_worker_mod, "PrefillAdder", _FakePrefillAdder), patch.object(
+            tp_worker_mod.ScheduleBatch, "init_new", return_value=SimpleNamespace(reqs=[])
+        ), patch.object(tp_worker_mod, "DocPolicy", _FakeDocPolicyForBatch):
+            batch = ModelTpServer.get_new_prefill_batch(server, max_prefill_token_size=101, telemetry={})
+
+        self.assertTrue(force_reservation_called["called"])
+        self.assertIsNotNone(batch)
+
+    def test_force_prefill_reservation_retracts_running_decode_when_capacity_is_full(self):
+        policy = DocPolicy(delta_fairness_n=2, max_running_requests=256)
+
+        class _TreeCache:
+            fairinf_max_per_user = 1
+
+            def evictable_size(self):
+                return 0
+
+        class _TokenPool:
+            def __init__(self):
+                self.available = 0
+
+            def available_size(self):
+                return self.available
+
+        class _Adder:
+            def __init__(self):
+                self.rem_total_tokens = 0
+                self.rem_input_tokens = 10_000
+                self.log_input_tokens = 0
+                self.can_run_list = []
+
+            def expand_capacity(self, delta):
+                self.rem_total_tokens += delta
+
+            def add_one_req(self, req, new_extra_for_user):
+                self.can_run_list.append((req.rid, new_extra_for_user))
+                return "ok"
+
+        pool = _TokenPool()
+        adder = _Adder()
+
+        waiting_req = SimpleNamespace(
+            rid="rid_waiting_fair",
+            uid="1",
+            origin_input_ids=[1] * 101,
+            extend_input_len=101,
+            sampling_params=SimpleNamespace(max_new_tokens=50),
+            waiting_time_in_decodes=0,
+        )
+        waiting_req.init_next_round_input = Mock(return_value="ok")
+        waiting_req.get_estimated_prefill_impact = Mock(return_value=101)
+
+        evicted_req = SimpleNamespace(rid="rid_running_unfair", uid="19")
+
+        def retract_decode(required_tokens):
+            del required_tokens
+            pool.available = 512
+            return [evicted_req], 1.0
+
+        running_batch = SimpleNamespace(
+            batch_size=lambda: 1,
+            retract_decode=Mock(side_effect=retract_decode),
+            retract_decode_for_slots=Mock(return_value=([], 1.0)),
+        )
+
+        policy.tree_cache = _TreeCache()
+        policy._forced_prefill_rids = {waiting_req.rid}
+        policy._forced_prefill_queue = [waiting_req]
+        policy._ensure_current_pass_state = Mock()
+        policy.note_retracted_reqs = Mock()
+        policy.req_is_fair_prefill = Mock(return_value=True)
+        policy._force_prefill_within_user_headroom = Mock(return_value=True)
+
+        extra_space, last_evicted = policy.force_prefill_reservations(
+            [waiting_req],
+            token_counters_by_user={},
+            adder=adder,
+            token_to_kv_pool=pool,
+            running_batch=running_batch,
+            delta_fairness_deltas_microseconds=policy._deltas_us,
+            max_input_size=None,
+            prefix_computed=True,
+            max_running_requests=256,
+        )
+
+        self.assertGreater(extra_space, 0)
+        self.assertEqual(last_evicted, [evicted_req])
+        running_batch.retract_decode.assert_called()
+        policy.note_retracted_reqs.assert_called_once_with([evicted_req])
+        self.assertEqual(adder.can_run_list, [(waiting_req.rid, waiting_req.extend_input_len)])
+        waiting_req.init_next_round_input.assert_called_once()
+
+    def test_force_prefill_reservations_only_admits_deadline_safe_fair_prefix_under_memory_pressure(self):
+        policy = DocPolicy(delta_fairness_n=2, max_running_requests=256)
+
+        class _TreeCache:
+            fairinf_max_per_user = 1
+
+            def evictable_size(self):
+                return 0
+
+        class _TokenPool:
+            def __init__(self):
+                self.available = 0
+
+            def available_size(self):
+                return self.available
+
+        class _Adder:
+            def __init__(self):
+                self.rem_total_tokens = 0
+                self.rem_input_tokens = 10_000
+                self.log_input_tokens = 0
+                self.can_run_list = []
+
+            def expand_capacity(self, delta):
+                self.rem_total_tokens += delta
+
+            def add_one_req(self, req, new_extra_for_user):
+                self.can_run_list.append((req.rid, new_extra_for_user))
+                return "ok"
+
+        pool = _TokenPool()
+        adder = _Adder()
+
+        fair_waiting = SimpleNamespace(
+            rid="rid_waiting_fair",
+            uid="1",
+            origin_input_ids=[1] * 101,
+            extend_input_len=101,
+            sampling_params=SimpleNamespace(max_new_tokens=50),
+            waiting_time_in_decodes=0,
+        )
+        fair_waiting.init_next_round_input = Mock(return_value="ok")
+        fair_waiting.get_estimated_prefill_impact = Mock(return_value=101)
+
+        unfair_waiting = SimpleNamespace(
+            rid="rid_waiting_unfair",
+            uid="19",
+            origin_input_ids=[1] * 101,
+            extend_input_len=101,
+            sampling_params=SimpleNamespace(max_new_tokens=50),
+            waiting_time_in_decodes=0,
+        )
+        unfair_waiting.init_next_round_input = Mock(return_value="ok")
+        unfair_waiting.get_estimated_prefill_impact = Mock(return_value=101)
+
+        evicted_req = SimpleNamespace(rid="rid_running_unfair", uid="19")
+
+        def retract_decode(required_tokens):
+            del required_tokens
+            # Enough room for multiple requests, so deadline/fair-prefix logic
+            # should be what limits admission here.
+            pool.available = 512
+            return [evicted_req], 1.0
+
+        running_batch = SimpleNamespace(
+            batch_size=lambda: 1,
+            retract_decode=Mock(side_effect=retract_decode),
+            retract_decode_for_slots=Mock(return_value=([], 1.0)),
+        )
+
+        policy.tree_cache = _TreeCache()
+        policy._forced_prefill_rids = {fair_waiting.rid, unfair_waiting.rid}
+        policy._forced_prefill_queue = [fair_waiting, unfair_waiting]
+        policy._max_safe_prefill_tokens = 101
+        policy._ensure_current_pass_state = Mock()
+        policy.note_retracted_reqs = Mock()
+        policy.req_is_fair_prefill = Mock(side_effect=lambda req, **kwargs: req.uid == "1")
+        policy._force_prefill_within_user_headroom = Mock(side_effect=lambda req, **kwargs: req.uid == "1")
+
+        extra_space, last_evicted = policy.force_prefill_reservations(
+            [fair_waiting, unfair_waiting],
+            token_counters_by_user={},
+            adder=adder,
+            token_to_kv_pool=pool,
+            running_batch=running_batch,
+            delta_fairness_deltas_microseconds=policy._deltas_us,
+            max_input_size=None,
+            prefix_computed=True,
+            max_running_requests=256,
+        )
+
+        self.assertGreater(extra_space, 0)
+        self.assertEqual(last_evicted, [evicted_req])
+        running_batch.retract_decode.assert_called_once()
+        policy.note_retracted_reqs.assert_called_once_with([evicted_req])
+        self.assertEqual(adder.can_run_list, [(fair_waiting.rid, fair_waiting.extend_input_len)])
+        fair_waiting.init_next_round_input.assert_called_once()
+        unfair_waiting.init_next_round_input.assert_not_called()
+        self.assertGreaterEqual(policy.req_is_fair_prefill.call_count, 1)
+        self.assertGreaterEqual(policy._force_prefill_within_user_headroom.call_count, 1)
 
     def test_grouped_decode_segment_reports_decode_rounds_once(self):
         decode_round_records = []

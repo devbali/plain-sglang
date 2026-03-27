@@ -69,6 +69,8 @@ class DocPolicy(DeltaFairnessPolicy):
         self._earliest_decode_start_deadline: Optional[float] = None
         self._safe_prefix_now: Optional[float] = None
         self._debug_first_waiting_rid: Optional[str] = None
+        self._debug_earliest_decode_rid: Optional[str] = None
+        self._debug_earliest_decode_uid: Optional[str] = None
         self._debug_first_waiting_prompt_tokens: Optional[int] = None
         self._debug_first_candidate_prefill_ms: Optional[float] = None
         self._debug_first_candidate_residual_slack_ms: Optional[float] = None
@@ -233,19 +235,22 @@ class DocPolicy(DeltaFairnessPolicy):
         self._earliest_decode_start_deadline = None
         self._safe_prefix_now = None
         self._debug_first_waiting_rid = None
+        self._debug_earliest_decode_rid = None
+        self._debug_earliest_decode_uid = None
         self._debug_first_waiting_prompt_tokens = None
         self._debug_first_candidate_prefill_ms = None
         self._debug_first_candidate_residual_slack_ms = None
 
-        earliest_decode_deadline = min(
+        earliest_decode_candidate = min(
             (
-                candidate.start_deadline
+                candidate
                 for candidate in self._deadline_queue
                 if candidate.event_type == "decode"
             ),
+            key=lambda candidate: candidate.start_deadline,
             default=None,
         )
-        if earliest_decode_deadline is None:
+        if earliest_decode_candidate is None:
             if timing_breakdown is not None:
                 timing_breakdown["sort_waiting_prefills_ms"] = (
                     after_waiting_sort - phase_start
@@ -256,7 +261,10 @@ class DocPolicy(DeltaFairnessPolicy):
                 ) * 1000.0
             return
         self._has_decode_deadline = True
+        earliest_decode_deadline = earliest_decode_candidate.start_deadline
         self._earliest_decode_start_deadline = earliest_decode_deadline
+        self._debug_earliest_decode_rid = earliest_decode_candidate.req.rid
+        self._debug_earliest_decode_uid = earliest_decode_candidate.req.uid
 
         now = time.time()
         self._safe_prefix_now = now
@@ -1004,6 +1012,7 @@ class DocPolicy(DeltaFairnessPolicy):
 
     def note_retracted_reqs(self, reqs) -> None:
         for req in reqs:
+            self.simulator.process_new_request(req, self._deltas_us)
             self._pending_new_requests.append(req)
         self._invalidate_prepared_state()
 
@@ -1079,9 +1088,36 @@ class DocPolicy(DeltaFairnessPolicy):
         )
         if not self._forced_prefill_rids:
             return 0, None
-        prioritized_waiting = [
-            req for req in self._forced_prefill_queue if req.rid in self._forced_prefill_rids
-        ]
+        prioritized_waiting = []
+        safe_prefill_cap = self._max_safe_prefill_tokens or 0
+        used_safe_prefill_tokens = 0
+        local_token_counters_by_user = {
+            user_id: list(tokens) for user_id, tokens in token_counters_by_user.items()
+        }
+        for req in self._forced_prefill_queue:
+            if req.rid not in self._forced_prefill_rids:
+                continue
+            req_prefill_tokens = getattr(req, "extend_input_len", len(req.origin_input_ids))
+            if safe_prefill_cap > 0 and used_safe_prefill_tokens + req_prefill_tokens > safe_prefill_cap:
+                break
+            this_users_extras = local_token_counters_by_user.get(req.uid, [])
+            extra_sum = sum(this_users_extras)
+            if not self.req_is_fair_prefill(
+                req,
+                running_batch=running_batch,
+                this_user_len=len(this_users_extras),
+                this_user_sum=extra_sum,
+            ):
+                continue
+            if not self._force_prefill_within_user_headroom(
+                req,
+                running_batch=running_batch,
+                pending_prefill_tokens=extra_sum,
+            ):
+                continue
+            prioritized_waiting.append(req)
+            used_safe_prefill_tokens += req_prefill_tokens
+            local_token_counters_by_user.setdefault(req.uid, []).append(req_prefill_tokens)
         if not prioritized_waiting:
             return 0, None
         return super().force_prefill_reservations(

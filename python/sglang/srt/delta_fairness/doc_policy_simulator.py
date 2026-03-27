@@ -17,6 +17,8 @@ from .time_estimation import (
     isolated_prefill_time_estimation,
 )
 
+RETRACTION_PENALTY_SECONDS = 0.030
+
 
 def _iso_ts(ts: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="milliseconds")
@@ -112,6 +114,8 @@ class TrackedRequest:
     persistent_prefill_event: Optional[RequestPrefillEvent] = None
     persistent_decode_count: int = 0
     persistent_decode_events: Dict[int, RequestDecodeEvent] = field(default_factory=dict)
+    live_in_running: bool = False
+    restart_pending: bool = False
 
     def most_recent_event(self) -> Optional[RequestEvent]:
         if self.persistent_decode_count > 0:
@@ -433,13 +437,13 @@ class UserTimeline:
         active_states: List[_SimRequestState],
         *,
         extra_decode_tokens: int,
-    ) -> bool:
+    ) -> Tuple[bool, bool]:
         if self.max_kv_tokens is None:
-            return True
+            return True, False
         current_kv = self._current_active_kv_tokens(active_states)
         current_required = current_kv + len(active_states) + extra_decode_tokens
         if current_required <= self.max_kv_tokens:
-            return True
+            return True, False
 
         sorted_states = list(active_states)
         sorted_states.sort(
@@ -449,6 +453,7 @@ class UserTimeline:
             ),
             reverse=True,
         )
+        retracted_any = False
 
         while sorted_states and current_required > self.max_kv_tokens:
             if len(sorted_states) == 1 and current_kv > 0:
@@ -461,11 +466,12 @@ class UserTimeline:
                 state.anticipated_recorded = False
                 state.tracked.alternate_history_timeline.anticipated_future_events = []
                 waiting_states.insert(0, state)
+                retracted_any = True
                 current_required = (
                     current_kv + len(active_states) + extra_decode_tokens
                 )
 
-        return current_required <= self.max_kv_tokens
+        return current_required <= self.max_kv_tokens, retracted_any
 
     def _advance_scheduler_step(
         self,
@@ -530,11 +536,12 @@ class UserTimeline:
             return "prefill"
 
         if active_states:
-            if not self._isolated_retract_decode(
+            can_decode, retracted_any = self._isolated_retract_decode(
                 waiting_states,
                 active_states,
                 extra_decode_tokens=0,
-            ):
+            )
+            if not can_decode:
                 return None
             if not active_states:
                 return "retract"
@@ -549,6 +556,8 @@ class UserTimeline:
                 len(token_counts),
                 self.fairinf_n,
             )
+            if retracted_any:
+                duration += RETRACTION_PENALTY_SECONDS
             if next_arrival is not None and current_time + duration > next_arrival:
                 future_history.append(
                     UserDecodeEvent(duration=0.0, end_timestamp=next_arrival)
@@ -688,6 +697,7 @@ class UserTimeline:
         self.anticipated_future_events = []
         for state in live_states:
             timeline = state.tracked.alternate_history_timeline
+            real_event = req_id_real_statuses.get(state.tracked.req.rid)
             if not timeline.history:
                 state.tracked.reset_history_to_start()
             cached_prefill_done = False
@@ -729,7 +739,52 @@ class UserTimeline:
                 state.set_simulated_decode_count(seeded_decode_count)
             timeline.anticipated_future_events = []
             state.anticipated_recorded = False
-            if cached_anticipated_event is not None:
+            if (
+                not state.tracked.live_in_running
+                and isinstance(real_event, RequestStartEvent)
+                and state.tracked.restart_pending
+            ):
+                req = state.tracked.req
+                context_tokens = (
+                    len(req.fill_ids)
+                    if req.fill_ids is not None
+                    else len(req.origin_input_ids) + len(req.output_ids)
+                )
+                prefill_duration = isolated_prefill_time_estimation(
+                    context_tokens,
+                    context_tokens,
+                    1,
+                    self.fairinf_n,
+                )
+                timeline.anticipated_future_events = [
+                    RequestPrefillEvent(
+                        req_id=req.rid,
+                        duration=prefill_duration,
+                        end_timestamp=state.arrival_timestamp + prefill_duration,
+                    )
+                ]
+                state.anticipated_recorded = True
+                state.tracked.restart_pending = False
+            elif not state.tracked.live_in_running and state.realized_prefill_done:
+                state.prefill_done = False
+                state.set_simulated_decode_count(state.realized_decode_count)
+                req = state.tracked.req
+                context_tokens = len(req.origin_input_ids) + len(req.output_ids)
+                prefill_duration = isolated_prefill_time_estimation(
+                    context_tokens,
+                    context_tokens,
+                    1,
+                    self.fairinf_n,
+                )
+                timeline.anticipated_future_events = [
+                    RequestPrefillEvent(
+                        req_id=req.rid,
+                        duration=prefill_duration,
+                        end_timestamp=time.time() + prefill_duration,
+                    )
+                ]
+                state.anticipated_recorded = True
+            elif cached_anticipated_event is not None:
                 if (
                     isinstance(cached_anticipated_event, RequestPrefillEvent)
                     and not state.realized_prefill_done
@@ -878,9 +933,33 @@ class AlternateHistorySimulator:
             1,
             self.fairinf_n,
         )
+        tracked.arrival_timestamp = now
+        tracked.reset_history_to_start()
         tracked.alternate_history_timeline.history = [
             RequestStartEvent(req_id=req.rid, end_timestamp=now)
         ]
+        tracked.alternate_history_timeline.anticipated_future_events = [
+            RequestPrefillEvent(
+                req_id=req.rid,
+                duration=prefill_duration,
+                end_timestamp=now + prefill_duration,
+            )
+        ]
+
+    def _seed_waiting_reprefill_future_event(
+        self,
+        tracked: TrackedRequest,
+        *,
+        now: float,
+    ) -> None:
+        req = tracked.req
+        context_tokens = len(req.origin_input_ids) + len(req.output_ids)
+        prefill_duration = isolated_prefill_time_estimation(
+            context_tokens,
+            context_tokens,
+            1,
+            self.fairinf_n,
+        )
         tracked.alternate_history_timeline.anticipated_future_events = [
             RequestPrefillEvent(
                 req_id=req.rid,
@@ -897,6 +976,7 @@ class AlternateHistorySimulator:
         deltas_in_microseconds: Optional[Dict[str, int]] = None,
     ) -> List[str]:
         running_reqs = list(running_batch.reqs) if running_batch is not None else []
+        running_rids = {req.rid for req in running_reqs}
         live_by_user: Dict[str, List[Req]] = {}
         for req in waiting_queue:
             live_by_user.setdefault(req.uid, []).append(req)
@@ -916,6 +996,7 @@ class AlternateHistorySimulator:
 
             for req in live_by_user.get(uid, []):
                 tracked = self._ensure_tracked_request(req, deltas_in_microseconds)
+                tracked.live_in_running = req.rid in running_rids
                 self._track_request(req, tracked, user_timeline)
 
             live_rids = {req.rid for req in live_by_user.get(uid, [])}
@@ -1091,6 +1172,7 @@ class AlternateHistorySimulator:
         self, req: Req, deltas_in_microseconds: Optional[Dict[str, int]] = None
     ) -> None:
         now = time.time()
+        previous_real_event = self.most_recent_event_real.get(req.rid)
         self.most_recent_event_real[req.rid] = RequestStartEvent(
             req_id=req.rid,
             end_timestamp=now,
@@ -1107,8 +1189,14 @@ class AlternateHistorySimulator:
             )
             self.requests[req.rid] = tracked
         else:
+            had_progress = (
+                tracked.persistent_prefill_done
+                or tracked.persistent_decode_count > 0
+                or isinstance(previous_real_event, (RequestPrefillEvent, RequestDecodeEvent))
+            )
             tracked.arrival_timestamp = now
             tracked.req = req
+            tracked.restart_pending = had_progress
             if deltas_in_microseconds is not None:
                 tracked.deltas_in_microseconds = dict(deltas_in_microseconds)
         self._seed_waiting_prefill_future_event(tracked, now=now)

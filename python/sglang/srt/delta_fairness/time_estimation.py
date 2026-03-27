@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 # p95 overheads
-DECODE_CONST_PER_STEP_OVERHEAD =  0
-DECODE_CONST_PER_SCHEDULING_PASS_OVERHEAD = 0.020
+DECODE_CONST_PER_STEP_OVERHEAD =  0.002
+DECODE_CONST_PER_SCHEDULING_PASS_OVERHEAD = 0.030
 PREFILL_CONST_PER_STEP_OVERHEAD = 0.007
-PREFILL_CONST_PER_SCHEDULING_PASS_OVERHEAD = 0.025
+PREFILL_CONST_PER_SCHEDULING_PASS_OVERHEAD = 0.035
 
 CONST_INTERVAL_DECODE = DECODE_CONST_PER_SCHEDULING_PASS_OVERHEAD / 10 + DECODE_CONST_PER_STEP_OVERHEAD
 CONST_INTERVAL_PREFILL = PREFILL_CONST_PER_STEP_OVERHEAD + PREFILL_CONST_PER_SCHEDULING_PASS_OVERHEAD
-TBT_DELTA = 0.015
+
+# microbenchmark allows this to be anything above 10 ms technically/theoretically
+TBT_DELTA = 0.020
 
 PREFILL_PIECEWISE_BOUND_TOTAL_BATCH_SUM = 4064.0
 
@@ -63,8 +65,8 @@ def pooled_cache_prefill_time_estimation(
     return pooled_prefill_time_estimation(total_batch_sum, max_token_size, batch_length, n) - CONST_INTERVAL_PREFILL
 
 # shouldnt be hard coded but need to choose something
-MAX_POOLED_DECODE_LATENCY = pooled_decode_time_estimation(328784, 8192, 256, 1) + TBT_DELTA
-print(f"MAX_POOLED_DECODE_LATENCY={MAX_POOLED_DECODE_LATENCY}")
+MAX_POOLED_DECODE_LATENCY = pooled_decode_time_estimation(328784, 8192, 256, 1)
+print(f"MAX_POOLED_DECODE_LATENCY={MAX_POOLED_DECODE_LATENCY}, interval={CONST_INTERVAL_DECODE}, tbt delta = {TBT_DELTA}, total = {CONST_INTERVAL_DECODE +MAX_POOLED_DECODE_LATENCY + TBT_DELTA}")
 
 
 def isolated_decode_time_estimation(
@@ -76,7 +78,7 @@ def isolated_decode_time_estimation(
         + 6.81862494e-08*n*total_batch_sum
         + 2.62872519e-07*n*max_token_size
         + 5.65921863e-05*n*batch_length
-    )
+    ) + TBT_DELTA
 
 
 def isolated_prefill_time_estimation_old(
