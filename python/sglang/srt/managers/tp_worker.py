@@ -541,13 +541,6 @@ class ModelTpServer:
         new_batch = None
         force_prefill = False
 
-        if isinstance(self.fairness_policy, DocPolicy):
-            self.fairness_policy._ensure_current_pass_state(
-                self.waiting_queue,
-                self.running_batch,
-                self.delta_fairness_deltas_microseconds,
-            )
-
         force_prefill_func = lambda: self.fairness_policy.fairinf_force_prefill_any_waiting(
                 self.waiting_queue,
                 delta_fairness_deltas_microseconds=self.delta_fairness_deltas_microseconds,
@@ -560,8 +553,12 @@ class ModelTpServer:
                 )
         
         if self.fairness_policy.fairinf_prioritize_force_prefill():
-            # Force prefill is checked first
+            # Force prefill is checked first.
             if isinstance(self.fairness_policy, DocPolicy):
+                self.fairness_policy.refresh_decode_hot_path_state(
+                    self.waiting_queue,
+                    self.running_batch,
+                )
                 force_prefill = bool(self.fairness_policy._forced_prefill_rids)
                 max_prefill_size = self.fairness_policy._max_safe_prefill_tokens
                 decision_timer.parts["force_prefill_check_ms"] = 0.0

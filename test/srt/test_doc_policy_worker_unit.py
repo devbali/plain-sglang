@@ -13,8 +13,8 @@ class _FakeDocPolicy:
         self._forced_prefill_rids = {"rid_waiting"}
         self._max_safe_prefill_tokens = 101
 
-    def _ensure_current_pass_state(self, waiting_queue, running_batch, deltas):
-        self.ensure_args = (list(waiting_queue), running_batch, deltas)
+    def refresh_decode_hot_path_state(self, waiting_queue, running_batch):
+        self.hot_path_args = (list(waiting_queue), running_batch)
 
     def fairinf_prioritize_force_prefill(self):
         return True
@@ -83,6 +83,7 @@ class TestDocPolicyWorkerUnit(unittest.TestCase):
 
         self.assertEqual(captured["max_prefill_size"], 101)
         self.assertEqual(captured["log_scheduler"]["max_prefill_size"], 101)
+        self.assertEqual(fake_policy.hot_path_args[0][0].rid, "rid_waiting")
 
     def test_get_new_prefill_batch_should_not_return_early_when_force_prefill_can_retract_for_slots(self):
         force_reservation_called = {"called": False}

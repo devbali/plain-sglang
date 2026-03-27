@@ -579,6 +579,11 @@ class UserTimeline:
                 if not state.anticipated_recorded
             ]
             if not milestone_rounds:
+                if next_arrival is not None:
+                    future_history.append(
+                        UserDecodeEvent(duration=0.0, end_timestamp=next_arrival)
+                    )
+                    return "arrival"
                 return None
 
             rounds = 1

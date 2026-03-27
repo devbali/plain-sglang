@@ -464,6 +464,199 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             )
             self.assertTrue(waiting_deadline_rids.issubset(remaining_rids))
 
+    def test_decode_prepare_with_waiting_advances_running_deadline_across_passes(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(doc_policy_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            doc_policy_mod, "pooled_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            doc_policy_mod, "pooled_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            sim_mod, "isolated_decode_time_estimation", return_value=3.0
+        ):
+            running_req = _mk_req("user_19", "rid_running", 4)
+            waiting_req = _mk_req("user_1", "rid_waiting", 4)
+            policy = DocPolicy(delta_fairness_n=4, max_running_requests=256)
+
+            policy.process_new_request(running_req)
+            now["t"] = 11.0
+            policy.finished_prefill(SimpleNamespace(reqs=[running_req]))
+            running_req.output_ids = [42]
+            now["t"] = 12.0
+            policy.finished_decode(SimpleNamespace(reqs=[running_req]))
+
+            running_batch = SimpleNamespace(reqs=[running_req])
+            waiting_queue = [waiting_req]
+            now["t"] = 100.0
+            policy.start_of_pass(running_batch, waiting_queue)
+
+            def running_decode_candidate():
+                return next(
+                    candidate
+                    for candidate in policy._deadline_queue
+                    if candidate.event_type == "decode"
+                    and candidate.req.rid == running_req.rid
+                )
+
+            first = running_decode_candidate()
+            self.assertGreaterEqual(first.event.completion_number, 2)
+
+            running_req.output_ids = [42, 43]
+            now["t"] = 101.0
+            policy.prepare_during_gpu_execution(
+                running_batch=running_batch,
+                waiting_queue=waiting_queue,
+                event_type="decode",
+                prepare_pass_state=True,
+                decode_steps=1,
+            )
+            policy._ensure_current_pass_state(
+                waiting_queue,
+                running_batch=running_batch,
+                delta_fairness_deltas_microseconds=policy._deltas_us,
+            )
+            second = running_decode_candidate()
+
+            running_req.output_ids = [42, 43, 44]
+            now["t"] = 102.0
+            policy.prepare_during_gpu_execution(
+                running_batch=running_batch,
+                waiting_queue=waiting_queue,
+                event_type="decode",
+                prepare_pass_state=True,
+                decode_steps=1,
+            )
+            policy._ensure_current_pass_state(
+                waiting_queue,
+                running_batch=running_batch,
+                delta_fairness_deltas_microseconds=policy._deltas_us,
+            )
+            third = running_decode_candidate()
+
+            self.assertGreater(second.event.completion_number, first.event.completion_number)
+            self.assertGreater(third.event.completion_number, second.event.completion_number)
+            self.assertGreater(second.deadline, first.deadline)
+            self.assertGreater(third.deadline, second.deadline)
+
+    def test_retracted_bad_request_in_waiting_does_not_remain_decode_blocker(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(doc_policy_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            doc_policy_mod, "pooled_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            doc_policy_mod, "pooled_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            sim_mod, "isolated_decode_time_estimation", return_value=3.0
+        ):
+            good_running = _mk_req("user_1", "rid_good_running", 4)
+            bad_retracted = _mk_req("user_19", "rid_bad_retracted", 4)
+            good_waiting = _mk_req("user_1", "rid_good_waiting", 4)
+            policy = DocPolicy(delta_fairness_n=4, max_running_requests=256)
+
+            for req in (good_running, bad_retracted):
+                policy.process_new_request(req)
+            now["t"] = 11.0
+            policy.finished_prefill(SimpleNamespace(reqs=[good_running, bad_retracted]))
+            good_running.output_ids = [1]
+            bad_retracted.output_ids = [1]
+            now["t"] = 12.0
+            policy.finished_decode(SimpleNamespace(reqs=[good_running, bad_retracted]))
+
+            now["t"] = 30.0
+            policy.note_retracted_reqs([bad_retracted])
+            policy.process_new_request(good_waiting)
+
+            running_batch = SimpleNamespace(reqs=[good_running])
+            waiting_queue = [bad_retracted, good_waiting]
+            now["t"] = 100.0
+            policy.start_of_pass(running_batch, waiting_queue)
+            policy._ensure_current_pass_state(
+                waiting_queue,
+                running_batch=running_batch,
+                delta_fairness_deltas_microseconds=policy._deltas_us,
+            )
+
+            decode_rids = {
+                candidate.req.rid
+                for candidate in policy._deadline_queue
+                if candidate.event_type == "decode"
+            }
+            waiting_rids = set(policy._waiting_prefill_start_deadline_by_rid)
+
+            self.assertNotIn(bad_retracted.rid, decode_rids)
+            self.assertIn(bad_retracted.rid, waiting_rids)
+            self.assertIn(good_waiting.rid, waiting_rids)
+
+    def test_pending_merge_drops_decode_candidate_for_request_not_in_live_sets(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(doc_policy_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            doc_policy_mod, "pooled_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            doc_policy_mod, "pooled_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            sim_mod, "isolated_decode_time_estimation", return_value=3.0
+        ):
+            bad_running = _mk_req("user_19", "rid_bad_running", 4)
+            good_waiting = _mk_req("user_1", "rid_good_waiting", 4)
+            policy = DocPolicy(delta_fairness_n=4, max_running_requests=256)
+
+            policy.process_new_request(bad_running)
+            now["t"] = 11.0
+            policy.finished_prefill(SimpleNamespace(reqs=[bad_running]))
+            bad_running.output_ids = [1]
+            now["t"] = 12.0
+            policy.finished_decode(SimpleNamespace(reqs=[bad_running]))
+
+            running_batch = SimpleNamespace(reqs=[bad_running])
+            now["t"] = 20.0
+            policy.start_of_pass(running_batch, [])
+
+            decode_rids = {
+                candidate.req.rid
+                for candidate in policy._deadline_queue
+                if candidate.event_type == "decode"
+            }
+            self.assertIn(bad_running.rid, decode_rids)
+
+            now["t"] = 21.0
+            policy.process_new_request(good_waiting)
+            policy._merge_pending_pass_state_mutations(
+                [good_waiting],
+                running_batch=None,
+            )
+
+            decode_rids = {
+                candidate.req.rid
+                for candidate in policy._deadline_queue
+                if candidate.event_type == "decode"
+            }
+            waiting_rids = set(policy._waiting_prefill_start_deadline_by_rid)
+
+            self.assertNotIn(bad_running.rid, decode_rids)
+            self.assertIn(good_waiting.rid, waiting_rids)
+
 
 if __name__ == "__main__":
     unittest.main()
