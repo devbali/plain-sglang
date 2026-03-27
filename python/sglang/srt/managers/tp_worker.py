@@ -1114,10 +1114,28 @@ class ModelTpServer:
         if not self.waiting_queue and self.current_inflight_req is None:
             telemetry["reason"] = "no_waiting_or_inflight"
             return None
+        if running_bs >= self.max_running_requests:
+            telemetry["reason"] = "running_batch_full"
+            return None
+        if available_req_slots <= 0:
+            telemetry["reason"] = "no_req_slots"
+            return None
+        if (
+            self.running_batch is not None
+            and max_prefill_token_size is not None
+            and max_prefill_token_size <= 0
+        ):
+            telemetry["reason"] = "prefill_capped_to_zero_by_force_decode"
+            return None
 
-        # Get priority queue
-        prefix_computed = self.scheduler.calc_priority(self.waiting_queue)
-        telemetry["calc_priority_ms"] = step_timer.mark("calc_priority_ms")
+        # DocPolicy determines waiting-order itself and we only use it with FCFS,
+        # so global scheduler priority work is unnecessary on this path.
+        if isinstance(self.fairness_policy, DocPolicy):
+            prefix_computed = False
+            telemetry["calc_priority_ms"] = 0.0
+        else:
+            prefix_computed = self.scheduler.calc_priority(self.waiting_queue)
+            telemetry["calc_priority_ms"] = step_timer.mark("calc_priority_ms")
 
         num_mixed_running = running_bs if self.is_mixed_chunk else 0
         max_input_size = (
@@ -1190,18 +1208,6 @@ class ModelTpServer:
         self._maybe_dump_doc_policy_pass_snapshot(
             telemetry["fairness_start_of_pass_ms"], pre_pass_snapshot
         )
-
-        # Some fairness policies, notably doc_policy, compute a hard fair-prefill cap
-        # for the pass. If it is already zero, do not spin through prefill-side
-        # reservation and queue scanning only to reject everything again. Hand control
-        # back to forward_step so it can run decode immediately.
-        if (
-            self.running_batch is not None
-            and max_prefill_token_size is not None
-            and max_prefill_token_size <= 0
-        ):
-            telemetry["reason"] = "prefill_capped_to_zero_by_force_decode"
-            return None
 
         has_inflight = self.current_inflight_req is not None
         token_counters_by_user: Dict[str, List[int]] = {}
