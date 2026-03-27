@@ -66,7 +66,7 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             policy.finished_decode(SimpleNamespace(reqs=[running_req]))
             policy.process_new_request(waiting_req)
 
-            policy.fairinf_force_prefill_any_waiting(
+            policy._ensure_current_pass_state(
                 [waiting_req],
                 running_batch=running_batch,
                 delta_fairness_deltas_microseconds=policy._deltas_us,
@@ -212,6 +212,11 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             # isolated progression updates; the overdue decode should stay overdue.
             now["t"] = 400.0
             policy.process_new_request(waiting_req)
+            policy._ensure_current_pass_state(
+                [waiting_req],
+                running_batch=running_batch,
+                delta_fairness_deltas_microseconds=policy._deltas_us,
+            )
             force_prefill = policy.fairinf_force_prefill_any_waiting(
                 [waiting_req],
                 running_batch=running_batch,
@@ -259,7 +264,7 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
 
             scheduled_batch = SimpleNamespace(reqs=[prefilling_req])
             policy.note_scheduled_prefill_batch(scheduled_batch)
-            policy.fairinf_force_prefill_any_waiting(
+            policy._ensure_current_pass_state(
                 [prefilling_req],
                 running_batch=initial_running,
                 delta_fairness_deltas_microseconds=policy._deltas_us,
@@ -270,7 +275,7 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             policy.process_new_request(waiting_req)
 
             next_running = SimpleNamespace(reqs=[running_req, prefilling_req])
-            policy.fairinf_force_prefill_any_waiting(
+            policy._ensure_current_pass_state(
                 [waiting_req],
                 running_batch=next_running,
                 delta_fairness_deltas_microseconds=policy._deltas_us,

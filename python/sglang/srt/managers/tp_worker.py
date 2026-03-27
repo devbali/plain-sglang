@@ -422,6 +422,7 @@ class ModelTpServer:
             "get_new_prefill_batch_ms,calc_priority_ms,prefill_adder_init_ms,"
             "remove_running_tokens_ms,fairness_start_of_pass_ms,inflight_ms,"
             "force_prefill_reservations_ms,waiting_queue_prefills_ms,build_batch_ms,"
+            "controller_send_queue_ms,controller_recv_requests_ms,request_handling_ms,"
             "doc_sync_live_user_tracking_ms,doc_rebuild_from_real_state_ms,"
             "doc_build_deadline_candidates_ms,doc_sort_waiting_prefills_ms,"
             "doc_safe_prefix_scan_ms,doc_build_pass_state_ms,doc_start_of_pass_total_ms\n",
@@ -450,6 +451,9 @@ class ModelTpServer:
         )
         self._doc_policy_snapshot_count = 0
         self._last_event_snapshot = None
+        self._last_controller_send_queue_ms = 0.0
+        self._last_controller_recv_requests_ms = 0.0
+        self._last_request_handling_ms = 0.0
 
         # Chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
@@ -495,6 +499,7 @@ class ModelTpServer:
     def exposed_step(self, recv_reqs: List):
         try:
             # Recv requests
+            request_handling_start = time.perf_counter()
             for recv_req in recv_reqs:
                 if isinstance(
                     recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
@@ -509,6 +514,9 @@ class ModelTpServer:
                     self.out_pyobjs.append(UpdateWeightReqOutput(success, message))
                 else:
                     raise ValueError(f"Invalid request: {recv_req}")
+            self._last_request_handling_ms = (
+                time.perf_counter() - request_handling_start
+            ) * 1000.0
 
             # Forward
             self.forward_step()
@@ -530,6 +538,13 @@ class ModelTpServer:
         new_batch = None
         force_prefill = False
 
+        if isinstance(self.fairness_policy, DocPolicy):
+            self.fairness_policy._ensure_current_pass_state(
+                self.waiting_queue,
+                self.running_batch,
+                self.delta_fairness_deltas_microseconds,
+            )
+
         force_prefill_func = lambda: self.fairness_policy.fairinf_force_prefill_any_waiting(
                 self.waiting_queue,
                 delta_fairness_deltas_microseconds=self.delta_fairness_deltas_microseconds,
@@ -543,8 +558,12 @@ class ModelTpServer:
         
         if self.fairness_policy.fairinf_prioritize_force_prefill():
             # Force prefill is checked first
-            force_prefill = force_prefill_func()
-            decision_timer.mark("force_prefill_check_ms")
+            if isinstance(self.fairness_policy, DocPolicy):
+                force_prefill = bool(self.fairness_policy._forced_prefill_rids)
+                decision_timer.parts["force_prefill_check_ms"] = 0.0
+            else:
+                force_prefill = force_prefill_func()
+                decision_timer.mark("force_prefill_check_ms")
 
             if not force_prefill:
                 force_decode, max_prefill_size = force_decode_func()
@@ -820,6 +839,9 @@ class ModelTpServer:
             f"{prefill_parts.get('force_prefill_reservations_ms', 0.0)},"
             f"{prefill_parts.get('waiting_queue_prefills_ms', 0.0)},"
             f"{prefill_parts.get('build_batch_ms', 0.0)},"
+            f"{self._last_controller_send_queue_ms},"
+            f"{self._last_controller_recv_requests_ms},"
+            f"{self._last_request_handling_ms},"
             f"{prefill_parts.get('doc_sync_live_user_tracking_ms', 0.0)},"
             f"{prefill_parts.get('doc_rebuild_from_real_state_ms', 0.0)},"
             f"{prefill_parts.get('doc_build_deadline_candidates_ms', 0.0)},"
@@ -829,6 +851,9 @@ class ModelTpServer:
             f"{prefill_parts.get('doc_start_of_pass_total_ms', 0.0)}\n"
         )
         self._last_prepare_async_wait_ms = 0.0
+        self._last_controller_send_queue_ms = 0.0
+        self._last_controller_recv_requests_ms = 0.0
+        self._last_request_handling_ms = 0.0
 
     def _log_scheduler_pass(
         self,

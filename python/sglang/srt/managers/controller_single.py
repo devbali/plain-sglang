@@ -19,6 +19,7 @@ import logging
 import multiprocessing
 import queue
 import threading
+import time
 from typing import List
 
 import zmq
@@ -107,18 +108,26 @@ class ControllerSingle:
 
     def loop_for_forward(self):
         while True:
+            recv_start = time.perf_counter()
             if not self.is_dp_worker:
                 recv_reqs = self.recv_requests_from_zmq()
             else:
                 recv_reqs = self.recv_requests_from_mp_queue()
+            self.tp_server._last_controller_recv_requests_ms = (
+                time.perf_counter() - recv_start
+            ) * 1000.0
 
             if self.tp_size > 1:
                 broadcast_recv_input(recv_reqs, 0, self.tp_cpu_group)
 
             out_pyobjs = self.tp_server.exposed_step(recv_reqs)
 
+            send_start = time.perf_counter()
             for obj in out_pyobjs:
                 self.send_queue.put(obj)
+            self.tp_server._last_controller_send_queue_ms = (
+                time.perf_counter() - send_start
+            ) * 1000.0
 
     def recv_requests_from_zmq(self):
         recv_reqs = []

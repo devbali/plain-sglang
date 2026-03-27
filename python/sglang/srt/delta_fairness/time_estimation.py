@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-CONST_INTERVAL_DECODE = 0.001
-CONST_INTERVAL_PREFILL = 0.005
+CONST_INTERVAL_DECODE = 0.003
+CONST_INTERVAL_PREFILL = 0.030
+TBT_DELTA = 0.015
+
 PREFILL_PIECEWISE_BOUND_TOTAL_BATCH_SUM = 4064.0
 
 def pooled_decode_time_estimation(
@@ -55,7 +57,6 @@ def pooled_cache_prefill_time_estimation(
     return pooled_prefill_time_estimation(total_batch_sum, max_token_size, batch_length, n) - CONST_INTERVAL_PREFILL
 
 # shouldnt be hard coded but need to choose something
-TBT_DELTA = 0.005
 MAX_POOLED_DECODE_LATENCY = pooled_decode_time_estimation(328784, 8192, 256, 1) + TBT_DELTA
 print(f"MAX_POOLED_DECODE_LATENCY={MAX_POOLED_DECODE_LATENCY}")
 

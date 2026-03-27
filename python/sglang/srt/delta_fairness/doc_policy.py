@@ -962,11 +962,7 @@ class DocPolicy(DeltaFairnessPolicy):
         delta_fairness_deltas_microseconds: Optional[Dict[str, int]] = None,
         running_batch: Optional[ScheduleBatch] = None,
     ) -> bool:
-        self._ensure_current_pass_state(
-            waiting_queue,
-            running_batch,
-            delta_fairness_deltas_microseconds,
-        )
+        del waiting_queue, delta_fairness_deltas_microseconds, running_batch
         return bool(self._forced_prefill_rids)
 
     def fairinf_force_decode(
@@ -1018,6 +1014,7 @@ class DocPolicy(DeltaFairnessPolicy):
             max_input_size=max_input_size,
             prefix_computed=prefix_computed,
             max_running_requests=max_running_requests,
+            exact_forced_prefills=True,
         )
 
     def fairinf_overdue_decode_subset_rids(

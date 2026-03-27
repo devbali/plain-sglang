@@ -742,6 +742,7 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         max_input_size: Optional[int] = None,
         prefix_computed: bool = False,
         max_running_requests: Optional[int] = None,
+        exact_forced_prefills: bool = False,
     ) -> Tuple[int, Optional[List["Req"]]]:
         """ 
         Make space for the forced prefill requests
@@ -761,15 +762,43 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         pending_prefill_by_user = {
             user_id: sum(tokens) for user_id, tokens in token_counters_by_user.items()
         }
+        fair_users: Dict[str, bool] = {}
+
+        if not exact_forced_prefills:
+            for req in waiting_snapshot:
+                if req.uid in fair_users:
+                    continue
+                extra_sum = pending_prefill_by_user.get(req.uid, 0)
+                fair_users[req.uid] = self.user_is_fair_prefill(
+                    req.uid,
+                    running_batch=running_batch,
+                    this_user_len=len(token_counters_by_user.get(req.uid, [])),
+                    this_user_sum=extra_sum,
+                )
 
         for req in waiting_snapshot:
-            if not self.fairinf_force_prefill(
-                req,
-                token_counters_by_user,
-                delta_fairness_deltas_microseconds=delta_fairness_deltas_microseconds,
-                running_batch=running_batch,
-            ):
-                continue
+            extra_sum = pending_prefill_by_user.get(req.uid, 0)
+            if not exact_forced_prefills:
+                if (
+                    not fair_users.get(req.uid, False)
+                    or not delta_fairness_deltas_microseconds
+                ):
+                    continue
+
+                prefill_wait_in_decodes = (
+                    delta_fairness_deltas_microseconds.get("prefill_running_batch", 0)
+                    // DECODE_TIME_US
+                    if DECODE_TIME_US > 0
+                    else 0
+                )
+                if req.waiting_time_in_decodes + 1 < prefill_wait_in_decodes:
+                    continue
+                if not self._force_prefill_within_user_headroom(
+                    req,
+                    running_batch=running_batch,
+                    pending_prefill_tokens=extra_sum,
+                ):
+                    continue
 
             logger.info("Prefill request forced in by user %s", req.uid)
             total_tokens = len(req.origin_input_ids) + min(
