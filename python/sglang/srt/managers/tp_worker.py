@@ -1326,6 +1326,8 @@ class ModelTpServer:
         )
         new_batch.max_running_requests = self.max_running_requests
         new_batch.delta_fairness_n = self.delta_fairness_n
+        if hasattr(self.fairness_policy, "note_scheduled_prefill_batch"):
+            self.fairness_policy.note_scheduled_prefill_batch(new_batch)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
         telemetry["build_batch_ms"] = step_timer.mark("build_batch_ms")
         telemetry["reason"] = "built_prefill_batch"
@@ -1738,6 +1740,7 @@ class ModelTpServer:
                     self.waiting_queue = list(retracted_reqs) + self.waiting_queue
                 else:
                     self.waiting_queue.extend(retracted_reqs)
+                self.fairness_policy.note_retracted_reqs(retracted_reqs)
                 restore_state = apply_restricted_decode_subset()
             else:
                 self.new_token_ratio = max(
@@ -1750,6 +1753,7 @@ class ModelTpServer:
                 # Check for jump-forward
                 jump_forward_reqs = batch.check_for_jump_forward(self.model_runner)
                 self.waiting_queue.extend(jump_forward_reqs)
+                self.fairness_policy.note_retracted_reqs(jump_forward_reqs)
                 if batch.is_empty():
                     self.last_decode_step_breakdown = {
                         "check_mem_ms": (after_check_mem - decode_step_start) * 1000.0,

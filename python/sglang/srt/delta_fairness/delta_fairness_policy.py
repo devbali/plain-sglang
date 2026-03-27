@@ -807,6 +807,7 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
                     )
                     continue
                 waiting_queue.extend(last_evicted)
+                self.note_retracted_reqs(last_evicted)
                 sz = new_sz = token_to_kv_pool.available_size() + tree_cache.evictable_size()
             while adder.rem_total_tokens < total_tokens:
                 if running_batch is None:
@@ -837,6 +838,7 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
                     )
                     break
                 waiting_queue.extend(last_evicted)
+                self.note_retracted_reqs(last_evicted)
                 new_sz = token_to_kv_pool.available_size() + tree_cache.evictable_size()
                 adder.expand_capacity(new_sz - sz)
                 if max_input_size is not None:
@@ -894,6 +896,7 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
                     if not last_evicted:
                         break
                     waiting_queue.extend(last_evicted)
+                    self.note_retracted_reqs(last_evicted)
                     new_sz = token_to_kv_pool.available_size() + tree_cache.evictable_size()
                     adder.expand_capacity(new_sz - sz)
                     sz = new_sz

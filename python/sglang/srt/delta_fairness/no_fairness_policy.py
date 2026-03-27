@@ -168,6 +168,12 @@ class NoFairnessPolicy:
     
     def process_new_request (self, req: "Req"):
         TIMELINE_WRITER.mark_queue_enter(req.rid, req.uid)
+
+    def note_scheduled_prefill_batch(self, batch: "ScheduleBatch") -> None:
+        del batch
+
+    def note_retracted_reqs(self, reqs: Sequence["Req"]) -> None:
+        del reqs
     
     def start_of_pass(
         self,
