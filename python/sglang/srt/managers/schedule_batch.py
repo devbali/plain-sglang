@@ -180,6 +180,46 @@ class Req:
     def get_estimated_prefill_impact(self) -> int:
         return len(self.origin_input_ids) + 2
 
+    def to_prepare_dict(self) -> dict:
+        def _plain_int_list(values):
+            return [int(v) for v in values]
+
+        max_new_tokens = None
+        if self.sampling_params is not None:
+            max_new_tokens = self.sampling_params.max_new_tokens
+        return {
+            "uid": self.uid,
+            "rid": self.rid,
+            "origin_input_text": self.origin_input_text,
+            "origin_input_ids": _plain_int_list(self.origin_input_ids),
+            "output_ids": _plain_int_list(self.output_ids),
+            "fill_ids": None if self.fill_ids is None else _plain_int_list(self.fill_ids),
+            "extend_input_len": int(self.extend_input_len),
+            "prefix_indices": _plain_int_list(self.prefix_indices),
+            "waiting_time_in_decodes": int(self.waiting_time_in_decodes),
+            "first_time_in_waiting_queue": bool(self.first_time_in_waiting_queue),
+            "max_new_tokens": max_new_tokens,
+        }
+
+    def to_prepare_snapshot(self) -> dict:
+        max_new_tokens = 0
+        if self.sampling_params is not None:
+            max_new_tokens = int(self.sampling_params.max_new_tokens or 0)
+        return {
+            "uid": self.uid,
+            "rid": self.rid,
+            "prompt_len": int(len(self.origin_input_ids)),
+            "output_len": int(len(self.output_ids)),
+            "fill_len": (
+                None if self.fill_ids is None else int(len(self.fill_ids))
+            ),
+            "prefix_len": int(len(self.prefix_indices)),
+            "extend_input_len": int(self.extend_input_len),
+            "waiting_time_in_decodes": int(self.waiting_time_in_decodes),
+            "first_time_in_waiting_queue": bool(self.first_time_in_waiting_queue),
+            "max_new_tokens": max_new_tokens,
+        }
+
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,

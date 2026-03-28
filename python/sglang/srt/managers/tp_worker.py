@@ -420,7 +420,7 @@ class ModelTpServer:
             "timestamp,after_event_type,next_event_type,"
             "after_running_reqs,after_num_tokens,after_queue_reqs,"
             "current_running_reqs,current_num_tokens,current_queue_reqs,"
-            "gap_total_ms,decision_overhead_ms,prepare_async_wait_ms,force_prefill_check_ms,force_decode_check_ms,"
+            "gap_total_ms,decision_overhead_ms,prepare_async_wait_ms,prepare_mutation_queue_backpressure_wait_ms,prepare_task_queue_backpressure_wait_ms,prepare_mutation_queue_drain_wait_ms,prepare_duplicate_state_wait_ms,force_prefill_check_ms,force_decode_check_ms,"
             "get_new_prefill_batch_ms,calc_priority_ms,prefill_adder_init_ms,"
             "remove_running_tokens_ms,fairness_start_of_pass_ms,inflight_ms,"
             "force_prefill_reservations_ms,waiting_queue_prefills_ms,build_batch_ms,"
@@ -444,7 +444,8 @@ class ModelTpServer:
             "doc_forced_prefill_count,doc_safe_waiting_count,doc_deadline_queue_len,"
             "doc_has_decode_deadline,doc_max_safe_prefill_tokens,doc_waiting_deadline_count,"
             "doc_earliest_decode_start_deadline,doc_safe_prefix_now,doc_decode_deadline_slack_ms,"
-            "doc_earliest_decode_rid,doc_earliest_decode_uid,"
+            "doc_earliest_decode_rid,doc_earliest_decode_uid,doc_earliest_decode_completion_number,"
+            "doc_earliest_decode_deadline,doc_earliest_decode_event_end_timestamp,"
             "doc_first_waiting_rid,doc_first_waiting_prompt_tokens,doc_first_candidate_prefill_ms,doc_first_candidate_residual_slack_ms\n",
         )
         self._doc_policy_snapshot_threshold_ms = float(
@@ -664,6 +665,7 @@ class ModelTpServer:
                 )
                 # Run a few decode batches continuously for reducing overhead
                 decoded_reqs_by_rid = {}
+                decoded_steps_by_rid = {}
                 decode_steps_run = 0
                 for decode_step_idx in range(global_config.num_continue_decode_steps):
                     selected_rids = (
@@ -691,11 +693,8 @@ class ModelTpServer:
                     self.forward_decode_batch(
                         self.running_batch,
                         selected_rids=selected_rids,
-                        prepare_pass_state=(
-                            (decode_step_idx == global_config.num_continue_decode_steps - 1)
-                            and not async_prepare_launched
-                        ),
-                        decode_steps=1,
+                        prepare_pass_state=False,
+                        decode_steps=0,
                     )
                     end.record()
                     if not end.query():
@@ -705,6 +704,9 @@ class ModelTpServer:
                     for req in self.running_batch.reqs:
                         if selected_rids is None or req.rid in selected_rids:
                             decoded_reqs_by_rid[req.rid] = req
+                            decoded_steps_by_rid[req.rid] = (
+                                decoded_steps_by_rid.get(req.rid, 0) + 1
+                            )
                     decode_steps_run += 1
 
                     # Print stats
@@ -717,6 +719,24 @@ class ModelTpServer:
                     if self.running_batch.is_empty():
                         self.running_batch = None
                         break
+                if (
+                    decoded_steps_by_rid
+                    and self.running_batch is not None
+                    and not async_prepare_launched
+                    and hasattr(self.fairness_policy, "prepare_during_gpu_execution")
+                ):
+                    self.fairness_policy.prepare_during_gpu_execution(
+                        event_type="decode",
+                        running_batch=self.running_batch,
+                        waiting_queue=list(self.waiting_queue),
+                        scheduled_batch=None,
+                        selected_rids=set(decoded_steps_by_rid),
+                        prepare_pass_state=True,
+                        decode_steps=0,
+                        decode_steps_by_rid=dict(decoded_steps_by_rid),
+                        output_ids_already_applied=True,
+                        new_token_ratio=self.new_token_ratio,
+                    )
                 if decoded_reqs_by_rid:
                     self.fairness_policy.finished_decode(
                         SimpleNamespace(reqs=list(decoded_reqs_by_rid.values())),
@@ -834,6 +854,11 @@ class ModelTpServer:
         )
         current_queue_reqs = len(self.waiting_queue)
         current_num_tokens = self._current_num_used_tokens()
+        prepare_thread_wait_metrics = {}
+        if hasattr(self.fairness_policy, "consume_prepare_thread_wait_metrics"):
+            prepare_thread_wait_metrics = (
+                self.fairness_policy.consume_prepare_thread_wait_metrics()
+            )
         self._intermediate_gap_csv_logger.log(
             f"{time.time()},{snapshot['event_type']},{next_event_type},"
             f"{snapshot['running_reqs']},{snapshot['num_tokens']},{snapshot['queue_reqs']},"
@@ -841,6 +866,10 @@ class ModelTpServer:
             f"{gap_total_ms},"
             f"{decision_parts.get('force_prefill_check_ms', 0.0) + decision_parts.get('force_decode_check_ms', 0.0) + decision_parts.get('get_new_prefill_batch_ms', 0.0)},"
             f"{self._last_prepare_async_wait_ms},"
+            f"{prepare_thread_wait_metrics.get('prepare_mutation_queue_backpressure_wait_ms', 0.0)},"
+            f"{prepare_thread_wait_metrics.get('prepare_task_queue_backpressure_wait_ms', 0.0)},"
+            f"{prepare_thread_wait_metrics.get('prepare_mutation_queue_drain_wait_ms', 0.0)},"
+            f"{prepare_thread_wait_metrics.get('prepare_duplicate_state_wait_ms', 0.0)},"
             f"{decision_parts.get('force_prefill_check_ms', 0.0)},"
             f"{decision_parts.get('force_decode_check_ms', 0.0)},"
             f"{decision_parts.get('get_new_prefill_batch_ms', 0.0)},"
@@ -889,6 +918,8 @@ class ModelTpServer:
             if self.running_batch is not None
             else "idle"
         )
+        if chosen_event == "idle" and self.running_batch is None and not self.waiting_queue:
+            return
         doc_forced_prefill_count = 0
         doc_safe_waiting_count = 0
         doc_deadline_queue_len = 0
@@ -900,6 +931,9 @@ class ModelTpServer:
         doc_decode_deadline_slack_ms = ""
         doc_earliest_decode_rid = ""
         doc_earliest_decode_uid = ""
+        doc_earliest_decode_completion_number = ""
+        doc_earliest_decode_deadline = ""
+        doc_earliest_decode_event_end_timestamp = ""
         doc_first_waiting_rid = ""
         doc_first_waiting_prompt_tokens = ""
         doc_first_candidate_prefill_ms = ""
@@ -946,6 +980,41 @@ class ModelTpServer:
             doc_earliest_decode_uid = getattr(
                 self.fairness_policy, "_debug_earliest_decode_uid", ""
             ) or ""
+            earliest_decode_candidate = min(
+                (
+                    candidate
+                    for candidate in getattr(self.fairness_policy, "_deadline_queue", ())
+                    if getattr(candidate, "event_type", None) == "decode"
+                ),
+                key=lambda candidate: candidate.start_deadline,
+                default=None,
+            )
+            if earliest_decode_candidate is not None:
+                if not doc_earliest_decode_rid:
+                    doc_earliest_decode_rid = getattr(
+                        getattr(earliest_decode_candidate, "req", None),
+                        "rid",
+                        "",
+                    )
+                if not doc_earliest_decode_uid:
+                    doc_earliest_decode_uid = getattr(
+                        getattr(earliest_decode_candidate, "req", None),
+                        "uid",
+                        "",
+                    )
+                doc_earliest_decode_completion_number = getattr(
+                    getattr(earliest_decode_candidate, "event", None),
+                    "completion_number",
+                    "",
+                )
+                doc_earliest_decode_deadline = getattr(
+                    earliest_decode_candidate, "deadline", ""
+                )
+                doc_earliest_decode_event_end_timestamp = getattr(
+                    getattr(earliest_decode_candidate, "event", None),
+                    "end_timestamp",
+                    "",
+                )
             doc_first_waiting_rid = getattr(
                 self.fairness_policy, "_debug_first_waiting_rid", ""
             ) or ""
@@ -991,7 +1060,8 @@ class ModelTpServer:
             f"{doc_forced_prefill_count},{doc_safe_waiting_count},{doc_deadline_queue_len},"
             f"{doc_has_decode_deadline},{doc_max_safe_prefill_tokens},{doc_waiting_deadline_count},"
             f"{doc_earliest_decode_start_deadline},{doc_safe_prefix_now},{doc_decode_deadline_slack_ms},"
-            f"{doc_earliest_decode_rid},{doc_earliest_decode_uid},"
+            f"{doc_earliest_decode_rid},{doc_earliest_decode_uid},{doc_earliest_decode_completion_number},"
+            f"{doc_earliest_decode_deadline},{doc_earliest_decode_event_end_timestamp},"
             f"{doc_first_waiting_rid},{doc_first_waiting_prompt_tokens},{doc_first_candidate_prefill_ms},{doc_first_candidate_residual_slack_ms}\n"
         )
 

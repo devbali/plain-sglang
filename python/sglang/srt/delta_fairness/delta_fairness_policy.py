@@ -804,6 +804,16 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
                     pending_prefill_tokens=extra_sum,
                 ):
                     continue
+            else:
+                clipped_max_new_tokens = min(
+                    req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+                )
+                total_admission_tokens = req.extend_input_len + clipped_max_new_tokens
+                if len(adder.can_run_list) != 0:
+                    if total_admission_tokens >= adder.rem_total_tokens:
+                        break
+                    if req.extend_input_len > adder.rem_input_tokens:
+                        break
 
             logger.info("Prefill request forced in by user %s", req.uid)
             total_tokens = len(req.origin_input_ids) + min(
@@ -844,6 +854,8 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
                         req.uid,
                         req.rid,
                     )
+                    if exact_forced_prefills:
+                        break
                     continue
                 waiting_queue.extend(last_evicted)
                 self.note_retracted_reqs(last_evicted)
@@ -882,6 +894,8 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
                         req.uid,
                         req.rid,
                     )
+                    if exact_forced_prefills:
+                        break
                     break
                 waiting_queue.extend(last_evicted)
                 self.note_retracted_reqs(last_evicted)
@@ -917,6 +931,8 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
                     req.uid,
                     req.rid,
                 )
+                if exact_forced_prefills:
+                    break
                 continue
 
             if max_input_size is not None:
@@ -958,6 +974,8 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
                         req.extend_input_len,
                         remaining_input_budget,
                     )
+                    if exact_forced_prefills:
+                        break
                     continue
 
             new_extra_for_user = extra_for_user + req.extend_input_len
@@ -977,6 +995,8 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
                     req.uid,
                     req.rid,
                 )
+                if exact_forced_prefills:
+                    break
                 continue
 
         if extra_space > 0 and last_evicted:

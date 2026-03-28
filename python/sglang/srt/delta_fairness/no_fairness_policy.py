@@ -199,8 +199,12 @@ class NoFairnessPolicy:
         waiting_queue: List["Req"],
         scheduled_batch: Optional["ScheduleBatch"] = None,
         selected_rids: Optional[set[str]] = None,
+        new_token_ratio: float = 0.0,
         prepare_pass_state: bool = True,
         decode_steps: int = 1,
+        decode_steps_by_rid: Optional[Dict[str, int]] = None,
+        output_ids_already_applied: bool = False,
+        **_kwargs,
     ) -> None:
         del (
             event_type,
@@ -208,8 +212,11 @@ class NoFairnessPolicy:
             waiting_queue,
             scheduled_batch,
             selected_rids,
+            new_token_ratio,
             prepare_pass_state,
             decode_steps,
+            decode_steps_by_rid,
+            output_ids_already_applied,
         )
 
     def consume_prepared_next_pass(self) -> bool:

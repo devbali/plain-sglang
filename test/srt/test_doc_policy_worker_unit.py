@@ -2,10 +2,30 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import sglang.srt.delta_fairness.doc_policy as doc_policy_mod
+import sglang.srt.delta_fairness.doc_policy_simulator as sim_mod
 import sglang.srt.managers.tp_worker as tp_worker_mod
 from sglang.global_config import global_config
 from sglang.srt.delta_fairness.doc_policy import DocPolicy
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.tp_worker import ModelTpServer
+from sglang.srt.sampling.sampling_params import SamplingParams
+
+
+def _mk_req(uid: str, rid: str, prompt_tokens: int) -> Req:
+    req = Req(uid=uid, rid=rid, origin_input_text="", origin_input_ids=[1] * prompt_tokens)
+    req.fill_ids = list(req.origin_input_ids)
+    req.output_ids = []
+    req.sampling_params = SamplingParams(max_new_tokens=1000, min_new_tokens=0)
+    req.waiting_time_in_decodes = 0
+    return req
+
+
+def _wait_for_prepare_snapshot(policy: DocPolicy) -> None:
+    policy._prepare_worker.wait_for_snapshot(
+        min_task_seq=policy._prepare_worker._task_seq,
+        timeout_s=0.2,
+    )
 
 
 class _FakeDocPolicy:
@@ -362,7 +382,7 @@ class TestDocPolicyWorkerUnit(unittest.TestCase):
         policy._max_safe_prefill_tokens = 101
         policy._ensure_current_pass_state = Mock()
         policy.note_retracted_reqs = Mock()
-        policy.req_is_fair_prefill = Mock(side_effect=lambda req, **kwargs: req.uid == "1")
+        policy.user_is_fair_prefill = Mock(side_effect=lambda user_id, **kwargs: user_id == "1")
         policy._force_prefill_within_user_headroom = Mock(side_effect=lambda req, **kwargs: req.uid == "1")
 
         extra_space, last_evicted = policy.force_prefill_reservations(
@@ -384,7 +404,7 @@ class TestDocPolicyWorkerUnit(unittest.TestCase):
         self.assertEqual(adder.can_run_list, [(fair_waiting.rid, fair_waiting.extend_input_len)])
         fair_waiting.init_next_round_input.assert_called_once()
         unfair_waiting.init_next_round_input.assert_not_called()
-        self.assertGreaterEqual(policy.req_is_fair_prefill.call_count, 1)
+        self.assertGreaterEqual(policy.user_is_fair_prefill.call_count, 1)
         self.assertGreaterEqual(policy._force_prefill_within_user_headroom.call_count, 1)
 
     def test_force_prefill_retractions_only_make_room_for_fair_waiting_requests(self):
@@ -454,7 +474,7 @@ class TestDocPolicyWorkerUnit(unittest.TestCase):
         policy._max_safe_prefill_tokens = 202
         policy._ensure_current_pass_state = Mock()
         policy.note_retracted_reqs = Mock()
-        policy.req_is_fair_prefill = Mock(side_effect=lambda req, **kwargs: req.uid == "1")
+        policy.user_is_fair_prefill = Mock(side_effect=lambda user_id, **kwargs: user_id == "1")
         policy._force_prefill_within_user_headroom = Mock(return_value=True)
 
         extra_space, last_evicted = policy.force_prefill_reservations(
@@ -649,6 +669,109 @@ class TestDocPolicyWorkerUnit(unittest.TestCase):
         self.assertEqual(adder.can_run_list, [(good_waiting.rid, good_waiting.extend_input_len)])
         good_waiting.init_next_round_input.assert_called_once()
 
+    def test_exact_forced_prefill_stops_retracting_after_first_adder_reject(self):
+        policy = DocPolicy(delta_fairness_n=2, max_running_requests=256)
+
+        class _TreeCache:
+            fairinf_max_per_user = 1
+
+            def evictable_size(self):
+                return 0
+
+        class _TokenPool:
+            def __init__(self):
+                self.available = 0
+
+            def available_size(self):
+                return self.available
+
+        class _Adder:
+            def __init__(self, pool):
+                self.pool = pool
+                self.rem_total_tokens = 0
+                self.rem_input_tokens = 10_000
+                self.log_input_tokens = 0
+                self.can_run_list = []
+                self.calls = 0
+
+            def expand_capacity(self, delta):
+                self.rem_total_tokens += delta
+                self.pool.available += delta
+
+            def add_one_req(self, req, new_extra_for_user):
+                del new_extra_for_user
+                self.calls += 1
+                if self.calls == 1:
+                    self.can_run_list.append((req.rid, req.extend_input_len))
+                    self.pool.available = 0
+                    return "ok"
+                return "rejected"
+
+        def make_waiting(rid):
+            req = SimpleNamespace(
+                rid=rid,
+                uid="1",
+                origin_input_ids=[1] * 101,
+                extend_input_len=101,
+                sampling_params=SimpleNamespace(max_new_tokens=50),
+                waiting_time_in_decodes=0,
+            )
+            req.init_next_round_input = Mock(return_value="ok")
+            req.get_estimated_prefill_impact = Mock(return_value=101)
+            return req
+
+        waiting_1 = make_waiting("rid_waiting_1")
+        waiting_2 = make_waiting("rid_waiting_2")
+        waiting_3 = make_waiting("rid_waiting_3")
+
+        pool = _TokenPool()
+        adder = _Adder(pool)
+        evicted = [
+            SimpleNamespace(rid="rid_running_bad_1", uid="19"),
+            SimpleNamespace(rid="rid_running_bad_2", uid="19"),
+            SimpleNamespace(rid="rid_running_bad_3", uid="19"),
+        ]
+
+        def retract_decode(required_tokens):
+            del required_tokens
+            pool.available = 151
+            return [evicted[running_batch.retract_decode.call_count]], 1.0
+
+        running_batch = SimpleNamespace(
+            batch_size=lambda: 3,
+            retract_decode=Mock(side_effect=retract_decode),
+            retract_decode_for_slots=Mock(return_value=([], 1.0)),
+        )
+
+        policy.tree_cache = _TreeCache()
+        policy._forced_prefill_rids = {waiting_1.rid, waiting_2.rid, waiting_3.rid}
+        policy._forced_prefill_queue = [waiting_1, waiting_2, waiting_3]
+        policy._max_safe_prefill_tokens = 303
+        policy.note_retracted_reqs = Mock()
+        policy.user_is_fair_prefill = Mock(return_value=True)
+        policy._force_prefill_within_user_headroom = Mock(return_value=True)
+
+        extra_space, last_evicted = policy.force_prefill_reservations(
+            [waiting_1, waiting_2, waiting_3],
+            token_counters_by_user={},
+            adder=adder,
+            token_to_kv_pool=pool,
+            running_batch=running_batch,
+            delta_fairness_deltas_microseconds=policy._deltas_us,
+            max_input_size=None,
+            prefix_computed=True,
+            max_running_requests=256,
+        )
+
+        self.assertEqual(extra_space, 151)
+        self.assertEqual(running_batch.retract_decode.call_count, 1)
+        policy.note_retracted_reqs.assert_called_once()
+        self.assertEqual(last_evicted, policy.note_retracted_reqs.call_args.args[0])
+        self.assertEqual(adder.can_run_list, [(waiting_1.rid, waiting_1.extend_input_len)])
+        waiting_1.init_next_round_input.assert_called_once()
+        waiting_2.init_next_round_input.assert_not_called()
+        waiting_3.init_next_round_input.assert_not_called()
+
     def test_grouped_decode_segment_reports_decode_rounds_once(self):
         decode_round_records = []
 
@@ -733,6 +856,383 @@ class TestDocPolicyWorkerUnit(unittest.TestCase):
             global_config.num_continue_decode_steps = old_steps
 
         self.assertEqual(decode_round_records, [(10, ["rid_running"])])
+
+    def test_grouped_decode_epoch_with_real_doc_policy_advances_new_request_past_completion_two(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(doc_policy_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            tp_worker_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            doc_policy_mod, "pooled_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            doc_policy_mod, "pooled_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            sim_mod, "isolated_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            doc_policy_mod, "isolated_decode_time_estimation", return_value=3.0
+        ):
+            policy = DocPolicy(delta_fairness_n=2, max_running_requests=256)
+            old_req = _mk_req("user_1", "rid_old", 4)
+            new_req = _mk_req("user_2", "rid_new", 4)
+
+            policy.process_new_request(old_req)
+            policy.process_new_request(new_req)
+            policy.simulator.process_new_request(old_req, policy._deltas_us)
+            policy.simulator.process_new_request(new_req, policy._deltas_us)
+
+            now["t"] = 11.0
+            policy.finished_prefill(SimpleNamespace(reqs=[old_req]))
+            old_req.output_ids = [42]
+            now["t"] = 12.0
+            policy.finished_decode(SimpleNamespace(reqs=[old_req]))
+
+            now["t"] = 20.0
+            policy.finished_prefill(SimpleNamespace(reqs=[new_req]))
+
+            running_batch = SimpleNamespace(
+                reqs=[old_req, new_req],
+                max_running_requests=None,
+                delta_fairness_n=None,
+                is_empty=lambda: False,
+            )
+
+            class FakeServer:
+                pass
+
+            server = FakeServer()
+            server.fairness_policy = policy
+            server.waiting_queue = []
+            server.running_batch = running_batch
+            server.delta_fairness_deltas_microseconds = {"decode": 0}
+            server.max_running_requests = 256
+            server.delta_fairness_n = 2
+            server._last_prepare_async_wait_ms = 0.0
+            server.new_token_ratio = 0.0
+            server.num_generated_tokens = 0
+            server._log_scheduler_pass = lambda **kwargs: None
+            server._log_intermediate_gap = lambda **kwargs: None
+            server.print_stats = lambda **kwargs: None
+            server.check_memory = lambda: None
+            server.forward_prefill_batch = lambda batch: None
+            server.out_pyobjs = []
+            server.get_new_prefill_batch = lambda max_prefill_size, telemetry=None: None
+
+            def forward_decode_batch(
+                batch, selected_rids=None, prepare_pass_state=False, decode_steps=0
+            ):
+                del prepare_pass_state, decode_steps
+                chosen = selected_rids
+                now["t"] += 0.025
+                for req in batch.reqs:
+                    if chosen is None or req.rid in chosen:
+                        req.output_ids.append(0)
+                return None
+
+            server.forward_decode_batch = forward_decode_batch
+
+            class _FakeCudaEvent:
+                def __init__(self, enable_timing=True):
+                    pass
+
+                def record(self):
+                    pass
+
+                def query(self):
+                    return True
+
+                def synchronize(self):
+                    pass
+
+                def elapsed_time(self, other):
+                    return 0.0
+
+            old_steps = global_config.num_continue_decode_steps
+            global_config.num_continue_decode_steps = 10
+            try:
+                with patch.object(tp_worker_mod.torch.cuda, "Event", _FakeCudaEvent):
+                    ModelTpServer.forward_step(server)
+            finally:
+                global_config.num_continue_decode_steps = old_steps
+
+            _wait_for_prepare_snapshot(policy)
+            policy._ensure_current_pass_state(
+                [],
+                running_batch=running_batch,
+                delta_fairness_deltas_microseconds=policy._deltas_us,
+            )
+
+            decode_candidates = [
+                candidate
+                for candidate in policy._deadline_queue
+                if candidate.event_type == "decode" and candidate.req.rid == new_req.rid
+            ]
+            self.assertEqual(len(decode_candidates), 1)
+            self.assertEqual(decode_candidates[0].event.completion_number, 11)
+
+    def test_grouped_decode_epoch_with_real_doc_policy_advances_new_request_timestamp_by_epoch(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(doc_policy_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            tp_worker_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            doc_policy_mod, "pooled_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            doc_policy_mod, "pooled_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            sim_mod, "isolated_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            doc_policy_mod, "isolated_decode_time_estimation", return_value=3.0
+        ):
+            policy = DocPolicy(delta_fairness_n=2, max_running_requests=256)
+            old_req = _mk_req("user_1", "rid_old_ts", 4)
+            new_req = _mk_req("user_2", "rid_new_ts", 4)
+
+            policy.process_new_request(old_req)
+            policy.process_new_request(new_req)
+            policy.simulator.process_new_request(old_req, policy._deltas_us)
+            policy.simulator.process_new_request(new_req, policy._deltas_us)
+
+            now["t"] = 11.0
+            policy.finished_prefill(SimpleNamespace(reqs=[old_req]))
+            old_req.output_ids = [42]
+            now["t"] = 12.0
+            policy.finished_decode(SimpleNamespace(reqs=[old_req]))
+
+            now["t"] = 20.0
+            policy.finished_prefill(SimpleNamespace(reqs=[new_req]))
+            prior_candidate = policy._decode_candidate_for_req(
+                new_req, SimpleNamespace(reqs=[old_req, new_req])
+            )
+            self.assertIsNotNone(prior_candidate)
+
+            running_batch = SimpleNamespace(
+                reqs=[old_req, new_req],
+                max_running_requests=None,
+                delta_fairness_n=None,
+                is_empty=lambda: False,
+            )
+
+            class FakeServer:
+                pass
+
+            server = FakeServer()
+            server.fairness_policy = policy
+            server.waiting_queue = []
+            server.running_batch = running_batch
+            server.delta_fairness_deltas_microseconds = {"decode": 0}
+            server.max_running_requests = 256
+            server.delta_fairness_n = 2
+            server._last_prepare_async_wait_ms = 0.0
+            server.new_token_ratio = 0.0
+            server.num_generated_tokens = 0
+            server._log_scheduler_pass = lambda **kwargs: None
+            server._log_intermediate_gap = lambda **kwargs: None
+            server.print_stats = lambda **kwargs: None
+            server.check_memory = lambda: None
+            server.forward_prefill_batch = lambda batch: None
+            server.out_pyobjs = []
+            server.get_new_prefill_batch = lambda max_prefill_size, telemetry=None: None
+
+            def forward_decode_batch(
+                batch, selected_rids=None, prepare_pass_state=False, decode_steps=0
+            ):
+                del prepare_pass_state, decode_steps
+                chosen = selected_rids
+                now["t"] += 0.025
+                for req in batch.reqs:
+                    if chosen is None or req.rid in chosen:
+                        req.output_ids.append(0)
+                return None
+
+            server.forward_decode_batch = forward_decode_batch
+
+            class _FakeCudaEvent:
+                def __init__(self, enable_timing=True):
+                    pass
+
+                def record(self):
+                    pass
+
+                def query(self):
+                    return True
+
+                def synchronize(self):
+                    pass
+
+                def elapsed_time(self, other):
+                    return 0.0
+
+            old_steps = global_config.num_continue_decode_steps
+            global_config.num_continue_decode_steps = 10
+            try:
+                with patch.object(tp_worker_mod.torch.cuda, "Event", _FakeCudaEvent):
+                    ModelTpServer.forward_step(server)
+            finally:
+                global_config.num_continue_decode_steps = old_steps
+
+            _wait_for_prepare_snapshot(policy)
+            policy._ensure_current_pass_state(
+                [],
+                running_batch=running_batch,
+                delta_fairness_deltas_microseconds=policy._deltas_us,
+            )
+
+            decode_candidates = [
+                candidate
+                for candidate in policy._deadline_queue
+                if candidate.event_type == "decode" and candidate.req.rid == new_req.rid
+            ]
+            self.assertEqual(len(decode_candidates), 1)
+            self.assertGreater(
+                decode_candidates[0].event.end_timestamp - prior_candidate.event.end_timestamp,
+                25.0,
+            )
+
+    def test_grouped_decode_epoch_with_real_doc_policy_does_not_stay_stuck_at_completion_two_across_passes(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(doc_policy_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            tp_worker_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            doc_policy_mod, "pooled_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            doc_policy_mod, "pooled_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            sim_mod, "isolated_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            doc_policy_mod, "isolated_decode_time_estimation", return_value=3.0
+        ):
+            policy = DocPolicy(delta_fairness_n=2, max_running_requests=256)
+            old_req = _mk_req("user_1", "rid_old_repeat", 4)
+            new_req = _mk_req("user_2", "rid_new_repeat", 4)
+
+            policy.process_new_request(old_req)
+            policy.process_new_request(new_req)
+            policy.simulator.process_new_request(old_req, policy._deltas_us)
+            policy.simulator.process_new_request(new_req, policy._deltas_us)
+
+            now["t"] = 11.0
+            policy.finished_prefill(SimpleNamespace(reqs=[old_req]))
+            old_req.output_ids = [42]
+            now["t"] = 12.0
+            policy.finished_decode(SimpleNamespace(reqs=[old_req]))
+
+            now["t"] = 20.0
+            policy.finished_prefill(SimpleNamespace(reqs=[new_req]))
+
+            running_batch = SimpleNamespace(
+                reqs=[old_req, new_req],
+                max_running_requests=None,
+                delta_fairness_n=None,
+                is_empty=lambda: False,
+            )
+
+            class FakeServer:
+                pass
+
+            server = FakeServer()
+            server.fairness_policy = policy
+            server.waiting_queue = []
+            server.running_batch = running_batch
+            server.delta_fairness_deltas_microseconds = {"decode": 0}
+            server.max_running_requests = 256
+            server.delta_fairness_n = 2
+            server._last_prepare_async_wait_ms = 0.0
+            server.new_token_ratio = 0.0
+            server.num_generated_tokens = 0
+            server._log_scheduler_pass = lambda **kwargs: None
+            server._log_intermediate_gap = lambda **kwargs: None
+            server.print_stats = lambda **kwargs: None
+            server.check_memory = lambda: None
+            server.forward_prefill_batch = lambda batch: None
+            server.out_pyobjs = []
+            server.get_new_prefill_batch = lambda max_prefill_size, telemetry=None: None
+
+            def forward_decode_batch(
+                batch, selected_rids=None, prepare_pass_state=False, decode_steps=0
+            ):
+                del prepare_pass_state, decode_steps
+                chosen = selected_rids
+                now["t"] += 0.025
+                for req in batch.reqs:
+                    if chosen is None or req.rid in chosen:
+                        req.output_ids.append(0)
+                return None
+
+            server.forward_decode_batch = forward_decode_batch
+
+            class _FakeCudaEvent:
+                def __init__(self, enable_timing=True):
+                    pass
+
+                def record(self):
+                    pass
+
+                def query(self):
+                    return True
+
+                def synchronize(self):
+                    pass
+
+                def elapsed_time(self, other):
+                    return 0.0
+
+            old_steps = global_config.num_continue_decode_steps
+            global_config.num_continue_decode_steps = 10
+            try:
+                with patch.object(tp_worker_mod.torch.cuda, "Event", _FakeCudaEvent):
+                    ModelTpServer.forward_step(server)
+                    _wait_for_prepare_snapshot(policy)
+                    policy._ensure_current_pass_state(
+                        [],
+                        running_batch=running_batch,
+                        delta_fairness_deltas_microseconds=policy._deltas_us,
+                    )
+                    first_completion = next(
+                        candidate.event.completion_number
+                        for candidate in policy._deadline_queue
+                        if candidate.event_type == "decode"
+                        and candidate.req.rid == new_req.rid
+                    )
+                    ModelTpServer.forward_step(server)
+                    _wait_for_prepare_snapshot(policy)
+                    policy._ensure_current_pass_state(
+                        [],
+                        running_batch=running_batch,
+                        delta_fairness_deltas_microseconds=policy._deltas_us,
+                    )
+                    second_completion = next(
+                        candidate.event.completion_number
+                        for candidate in policy._deadline_queue
+                        if candidate.event_type == "decode"
+                        and candidate.req.rid == new_req.rid
+                    )
+            finally:
+                global_config.num_continue_decode_steps = old_steps
+
+            self.assertGreater(first_completion, 2)
+            self.assertGreater(second_completion, first_completion)
 
     def test_get_new_prefill_batch_retraction_only_admits_exact_fair_safe_subset(self):
         class _FakeDocPolicyForBatch:

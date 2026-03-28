@@ -238,6 +238,49 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                 self.assertEqual(decode_candidates[0].event.completion_number, 11)
                 self.assertEqual(decode_candidates[0].deadline, 45.0)
 
+    def test_finished_prefill_after_long_queue_delay_should_not_leave_first_decode_in_the_past(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(sim_mod.time, "time", side_effect=fake_time):
+            with patch.object(
+                sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+            ), patch.object(
+                sim_mod, "isolated_decode_time_estimation", return_value=3.0
+            ):
+                simulator = AlternateHistorySimulator(
+                    max_kv_tokens_per_user=100,
+                    fairinf_n=2,
+                )
+
+                req = _mk_req("user_19", "rid_delayed", 4)
+                simulator.process_new_request(req)
+
+                now["t"] = 20.0
+                simulator.finished_prefill(SimpleNamespace(reqs=[req]))
+
+                candidates, _ = simulator.build_deadline_candidates(
+                    [],
+                    SimpleNamespace(reqs=[req]),
+                    req_is_fair_prefill=lambda req, rb: True,
+                    req_is_fair_decode=lambda req, rb: True,
+                    event_delta_seconds=lambda tracked, event: 0.0,
+                    pooled_prefill_estimate_seconds=lambda req: 2.0,
+                    pooled_decode_estimate_seconds=lambda req, rb: 3.0,
+                )
+
+                decode_candidates = [
+                    candidate for candidate in candidates if candidate.event_type == "decode"
+                ]
+                self.assertEqual(len(decode_candidates), 1)
+                self.assertEqual(decode_candidates[0].event.completion_number, 1)
+                self.assertGreaterEqual(
+                    decode_candidates[0].event.end_timestamp,
+                    now["t"],
+                )
+
     def test_waiting_prefill_deadlines_follow_isolated_arrival_order_not_pass_time(self):
         now = {"t": 10.0}
 

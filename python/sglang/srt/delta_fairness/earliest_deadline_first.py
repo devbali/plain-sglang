@@ -343,7 +343,8 @@ class EventQueue ():
         for user_timeline in self.users.values():
             user_timeline.complete_upto_time(current_time, self.most_recent_event_real)
 
-    def finished_decode (self, batch: ScheduleBatch):
+    def finished_decode (self, batch: ScheduleBatch, decode_rounds: int = 1):
+        del decode_rounds
         for req in batch.reqs:
             completion_tokens_done = len(req.output_ids)
             self.most_recent_event_real[req.rid] = RequestDecodeEvent(completion_tokens_done)
@@ -381,9 +382,9 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
     #     return False
 
     
-    def finished_decode (self, batch: "ScheduleBatch"):
-        super().finished_decode(batch)
-        self.event_queue.finished_decode(batch)
+    def finished_decode (self, batch: "ScheduleBatch", decode_rounds: int = 1):
+        super().finished_decode(batch, decode_rounds=decode_rounds)
+        self.event_queue.finished_decode(batch, decode_rounds=decode_rounds)
 
     def finished_prefill (self, batch: "ScheduleBatch"):
         super().finished_prefill(batch)
@@ -392,7 +393,15 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
     def mark_request_finished (self, req):
         self.event_queue.mark_request_finished(req)
 
-    def start_of_pass (self, running_batch, waiting_queue):
+    def start_of_pass (
+        self,
+        running_batch,
+        waiting_queue,
+        *,
+        new_token_ratio: float = 0.0,
+        max_running_requests: Optional[int] = None,
+    ):
+        del new_token_ratio, max_running_requests
         reqs = [*running_batch.reqs, *waiting_queue]
         users = [r.uid for r in reqs]
         fair_users = [self.user_is_fair_prefill(user, running_batch=running_batch) for user in users]
@@ -1155,6 +1164,7 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
         now: float,
         *,
         waiting: bool,
+        preserve_waiting_real_event: bool = False,
     ):
         target = (
             user_timeline.waiting_request_timelines
@@ -1176,7 +1186,7 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             # Preserve the original waiting-start timestamp while a request remains queued.
             # Resetting it every sync pass keeps pushing the prefill deadline forward and
             # prevents fair waiting requests from ever becoming force-prefill candidates.
-            if not isinstance(real_e, RequestStartEvent):
+            if not preserve_waiting_real_event and not isinstance(real_e, RequestStartEvent):
                 self.event_queue.most_recent_event_real[req.rid] = RequestStartEvent(req.rid, 0, now)
         elif isinstance(real_e, RequestDecodeEvent):
             self.event_queue.most_recent_event_real[req.rid] = RequestDecodeEvent(
@@ -1217,7 +1227,23 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
                 self.event_queue.users[uid] = user_timeline
 
             live_waiting = {req.rid: req for req in waiting_by_user.get(uid, [])}
-            live_running = {req.rid: req for req in running_by_user.get(uid, [])}
+            running_reqs_for_user = list(running_by_user.get(uid, []))
+
+            def tracked_sort_key(req: "Req"):
+                tracked = self.event_queue.requests.get(req.rid)
+                most_recent = tracked.most_recent_event() if tracked is not None else None
+                return (
+                    most_recent.end_timestamp if most_recent is not None else now,
+                    req.rid,
+                )
+
+            running_reqs_for_user.sort(key=tracked_sort_key)
+            user_cap = USER_CONFIG["max_running_batch"]
+            active_running = running_reqs_for_user[:user_cap]
+            overflow_running = running_reqs_for_user[user_cap:]
+            live_running = {req.rid: req for req in active_running}
+            overflow_waiting = {req.rid: req for req in overflow_running}
+            live_waiting.update(overflow_waiting)
             live_rids = set(live_waiting) | set(live_running)
 
             for rid in list(user_timeline.waiting_request_timelines.keys()):
@@ -1239,6 +1265,7 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
                     user_timeline,
                     now,
                     waiting=True,
+                    preserve_waiting_real_event=req.rid in overflow_waiting,
                 )
 
             for req in live_running.values():
@@ -1356,8 +1383,8 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
                 ]
             self.event_queue.most_recent_event_real[req.rid] = RequestPrefillEvent(req.rid, 0, now)
 
-    def finished_decode (self, batch: "ScheduleBatch"):
-        super().finished_decode(batch)
+    def finished_decode (self, batch: "ScheduleBatch", decode_rounds: int = 1):
+        super().finished_decode(batch, decode_rounds=decode_rounds)
         for req in batch.reqs:
             now = time.time()
             completion_number = len(req.output_ids)

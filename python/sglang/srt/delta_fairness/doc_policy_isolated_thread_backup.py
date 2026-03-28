@@ -12,8 +12,6 @@ from dataclasses import dataclass
 from types import MappingProxyType, SimpleNamespace
 from typing import Deque, Dict, List, Optional, Tuple
 
-import torch
-
 from sglang.global_config import global_config
 from sglang.srt.request_timeline import TIMELINE_WRITER
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -35,44 +33,6 @@ from .time_estimation import (
 logger = logging.getLogger(__name__)
 
 
-class _LenOnlySeq:
-    def __init__(self, n: int):
-        self._n = int(n)
-
-    def __len__(self) -> int:
-        return self._n
-
-
-class _PrepareReq:
-    def __init__(
-        self,
-        *,
-        uid: str,
-        rid: str,
-        prompt_len: int,
-        output_len: int,
-        fill_len: Optional[int],
-        prefix_len: int,
-        extend_input_len: int,
-        waiting_time_in_decodes: int,
-        first_time_in_waiting_queue: bool,
-        max_new_tokens: int,
-    ) -> None:
-        self.uid = uid
-        self.rid = rid
-        self.origin_input_ids = _LenOnlySeq(prompt_len)
-        self.output_ids = _LenOnlySeq(output_len)
-        self.fill_ids = None if fill_len is None else _LenOnlySeq(fill_len)
-        self.extend_input_len = int(extend_input_len)
-        self.prefix_indices = _LenOnlySeq(prefix_len)
-        self.waiting_time_in_decodes = int(waiting_time_in_decodes)
-        self.first_time_in_waiting_queue = bool(first_time_in_waiting_queue)
-        self.sampling_params = SimpleNamespace(max_new_tokens=int(max_new_tokens))
-
-    def get_estimated_prefill_impact(self) -> int:
-        return len(self.origin_input_ids) + 2
-
-
 @dataclass(frozen=True)
 class _PreparedSnapshot:
     task_seq: int
@@ -89,8 +49,6 @@ class _PreparedSnapshot:
     has_fair_waiting: bool
     has_decode_deadline: bool
     earliest_decode_start_deadline: Optional[float]
-    earliest_decode_rid: Optional[str]
-    earliest_decode_uid: Optional[str]
     safe_prefix_now: Optional[float]
     breakdown_items: Tuple[Tuple[str, float], ...]
 
@@ -154,8 +112,12 @@ class _DocPolicyPrepareWorker:
         )
         self._worker_thread.start()
 
-    def snapshot_req(self, req: Req) -> dict:
-        return req.to_prepare_snapshot()
+    def snapshot_req(self, req: Req) -> Req:
+        cloned = copy(req)
+        cloned.origin_input_ids = list(req.origin_input_ids)
+        cloned.output_ids = list(req.output_ids)
+        cloned.fill_ids = None if req.fill_ids is None else list(req.fill_ids)
+        return cloned
 
     def snapshot_batch(
         self, batch: Optional[ScheduleBatch]
@@ -163,29 +125,6 @@ class _DocPolicyPrepareWorker:
         if batch is None:
             return None
         return SimpleNamespace(reqs=[self.snapshot_req(req) for req in batch.reqs])
-
-    def _restore_req(self, req_data: dict) -> _PrepareReq:
-        return _PrepareReq(
-            uid=req_data["uid"],
-            rid=req_data["rid"],
-            prompt_len=int(req_data.get("prompt_len", 0)),
-            output_len=int(req_data.get("output_len", 0)),
-            fill_len=req_data.get("fill_len"),
-            prefix_len=int(req_data.get("prefix_len", 0)),
-            extend_input_len=int(req_data.get("extend_input_len", 0)),
-            waiting_time_in_decodes=int(req_data.get("waiting_time_in_decodes", 0)),
-            first_time_in_waiting_queue=bool(
-                req_data.get("first_time_in_waiting_queue", False)
-            ),
-            max_new_tokens=int(req_data.get("max_new_tokens", 0) or 0),
-        )
-
-    def _restore_batch(
-        self, batch_data: Optional[SimpleNamespace]
-    ) -> Optional[SimpleNamespace]:
-        if batch_data is None:
-            return None
-        return SimpleNamespace(reqs=[self._restore_req(req) for req in batch_data.reqs])
 
     def raise_exception_if_any(self) -> None:
         if self._thread_exception is not None:
@@ -361,43 +300,36 @@ class _DocPolicyPrepareWorker:
         simulator = self._simulator
         if kind == "process_new_request":
             req, deltas_us = payload
-            simulator.process_new_request(self._restore_req(req), deltas_us)
+            simulator.process_new_request(req, deltas_us)
             return
         if kind == "note_retracted_reqs":
             reqs, deltas_us = payload
             for req in reqs:
-                simulator.process_new_request(self._restore_req(req), deltas_us)
+                simulator.process_new_request(req, deltas_us)
             return
         if kind == "finished_prefill":
-            simulator.finished_prefill(
-                SimpleNamespace(reqs=[self._restore_req(req) for req in payload])
-            )
+            simulator.finished_prefill(SimpleNamespace(reqs=payload))
             return
         if kind == "finished_decode":
             reqs, decode_rounds = payload
-            simulator.finished_decode(
-                SimpleNamespace(reqs=[self._restore_req(req) for req in reqs]),
-                decode_rounds=decode_rounds,
-            )
+            simulator.finished_decode(SimpleNamespace(reqs=reqs), decode_rounds=decode_rounds)
             return
         if kind == "mark_request_finished":
-            simulator.mark_request_finished(self._restore_req(payload))
+            simulator.mark_request_finished(payload)
             return
         if kind == "note_scheduled_prefill_batch":
             return
         raise ValueError(f"unknown prepare mutation kind: {kind}")
 
     def _worker_loop(self) -> None:
-        torch.set_grad_enabled(False)
         while not self._worker_stop:
             if self._thread_exception is not None:
                 return
             if self._mutation_queue:
                 self._mark_work_start()
                 try:
-                    with torch.inference_mode():
-                        kind, payload = self._mutation_queue.popleft()
-                        self._apply_mutation(kind, payload)
+                    kind, payload = self._mutation_queue.popleft()
+                    self._apply_mutation(kind, payload)
                 except BaseException as exc:
                     self._thread_exception = exc
                     logger.exception("prepare worker mutation failed")
@@ -412,74 +344,66 @@ class _DocPolicyPrepareWorker:
             self._mark_work_start()
             event_type = None
             try:
-                with torch.inference_mode():
-                    task_seq, task = self._task_queue.popleft()
-                    (
-                        event_type,
-                        running_batch,
-                        waiting_queue,
-                        scheduled_batch,
-                        selected_rids,
-                        prepare_pass_state,
-                        decode_steps,
-                        decode_steps_by_rid,
-                        output_ids_already_applied,
-                        _new_token_ratio,
-                        frozen_cache_state,
-                        frozen_inputs,
-                        _requested_mutation_seq,
-                    ) = task
-                    running_batch = self._restore_batch(running_batch)
-                    scheduled_batch = self._restore_batch(scheduled_batch)
-                    waiting_queue = [self._restore_req(req) for req in waiting_queue]
-                    if event_type == "observe":
-                        self._inflight_observe_seq = task_seq
-                    while self._mutation_queue:
-                        kind, payload = self._mutation_queue.popleft()
-                        self._apply_mutation(kind, payload)
-                        self._applied_mutation_seq += 1
-                    if (
-                        event_type == "decode"
-                        and running_batch is not None
-                        and (decode_steps > 0 or decode_steps_by_rid)
-                    ):
-                        self._owner._apply_logical_decode_updates(
-                            self._simulator,
-                            running_batch,
-                            selected_rids=selected_rids,
-                            decode_steps=decode_steps,
-                            decode_steps_by_rid=decode_steps_by_rid,
-                            output_ids_already_applied=output_ids_already_applied,
-                        )
-                    if not prepare_pass_state:
-                        continue
-                    if event_type == "prefill" and scheduled_batch is not None:
-                        scheduled_rids = {req.rid for req in scheduled_batch.reqs}
-                        predicted_waiting = [
-                            req for req in waiting_queue if req.rid not in scheduled_rids
-                        ]
-                        predicted_running = self._owner._predicted_running_batch(
-                            running_batch, scheduled_batch
-                        )
-                    else:
-                        predicted_waiting = list(waiting_queue)
-                        predicted_running = running_batch
-                    breakdown: Dict[str, float] = {
-                        "logical_event_update_ms": 0.0,
-                        "rebuild_from_real_state_ms": 0.0,
-                        "prepare_during_gpu_execution_total_ms": 0.0,
-                    }
-                    snapshot = self._owner._build_prepare_snapshot(
+                task_seq, task = self._task_queue.popleft()
+                (
+                    event_type,
+                    running_batch,
+                    waiting_queue,
+                    scheduled_batch,
+                    selected_rids,
+                    prepare_pass_state,
+                    decode_steps,
+                    _new_token_ratio,
+                    frozen_cache_state,
+                    frozen_inputs,
+                    _requested_mutation_seq,
+                ) = task
+                if event_type == "observe":
+                    self._inflight_observe_seq = task_seq
+                while self._mutation_queue:
+                    kind, payload = self._mutation_queue.popleft()
+                    self._apply_mutation(kind, payload)
+                    self._applied_mutation_seq += 1
+                if (
+                    event_type == "decode"
+                    and running_batch is not None
+                    and decode_steps > 0
+                ):
+                    self._owner._apply_logical_decode_updates(
                         self._simulator,
-                        predicted_waiting,
-                        predicted_running,
-                        task_seq=task_seq,
-                        mutation_seq=self._applied_mutation_seq,
-                        breakdown=breakdown,
-                        frozen_cache_state=frozen_cache_state,
-                        frozen_inputs=frozen_inputs,
+                        running_batch,
+                        selected_rids=selected_rids,
+                        decode_steps=decode_steps,
                     )
-                    self._publish_snapshot(snapshot)
+                if not prepare_pass_state:
+                    continue
+                if event_type == "prefill" and scheduled_batch is not None:
+                    scheduled_rids = {req.rid for req in scheduled_batch.reqs}
+                    predicted_waiting = [
+                        req for req in waiting_queue if req.rid not in scheduled_rids
+                    ]
+                    predicted_running = self._owner._predicted_running_batch(
+                        running_batch, scheduled_batch
+                    )
+                else:
+                    predicted_waiting = list(waiting_queue)
+                    predicted_running = running_batch
+                breakdown: Dict[str, float] = {
+                    "logical_event_update_ms": 0.0,
+                    "rebuild_from_real_state_ms": 0.0,
+                    "prepare_during_gpu_execution_total_ms": 0.0,
+                }
+                snapshot = self._owner._build_prepare_snapshot(
+                    self._simulator,
+                    predicted_waiting,
+                    predicted_running,
+                    task_seq=task_seq,
+                    mutation_seq=self._applied_mutation_seq,
+                    breakdown=breakdown,
+                    frozen_cache_state=frozen_cache_state,
+                    frozen_inputs=frozen_inputs,
+                )
+                self._publish_snapshot(snapshot)
             except BaseException as exc:
                 self._thread_exception = exc
                 logger.exception("prepare worker task failed")
@@ -1140,7 +1064,9 @@ class DocPolicy(DeltaFairnessPolicy):
                     running_batch=rb,
                     this_user_sum=req.get_estimated_prefill_impact(),
                 ),
-                req_is_fair_decode=lambda req, rb: True,
+                req_is_fair_decode=lambda req, rb: self.req_is_fair_decode(
+                    req, running_batch=rb
+                ),
                 event_delta_seconds=self._event_delta_seconds,
                 pooled_prefill_estimate_seconds=lambda req: pooled_prefill_time_estimation(
                     len(req.origin_input_ids),
@@ -1219,7 +1145,9 @@ class DocPolicy(DeltaFairnessPolicy):
                     running_batch=rb,
                     this_user_sum=req.get_estimated_prefill_impact(),
                 ),
-                req_is_fair_decode=lambda req, rb: True,
+                req_is_fair_decode=lambda req, rb: self.req_is_fair_decode(
+                    req, running_batch=rb
+                ),
                 event_delta_seconds=self._event_delta_seconds,
                 pooled_prefill_estimate_seconds=lambda req: pooled_prefill_time_estimation(
                     len(req.origin_input_ids),
@@ -1334,7 +1262,9 @@ class DocPolicy(DeltaFairnessPolicy):
                 this_user_sum=req.get_estimated_prefill_impact(),
                 frozen_cache_state=frozen_cache_state,
             ),
-            req_is_fair_decode=lambda req, rb: True,
+            req_is_fair_decode=lambda req, rb: self.req_is_fair_decode(
+                req, running_batch=rb
+            ),
             event_delta_seconds=lambda tracked_req, event: float(
                 (
                     tracked_req.deltas_in_microseconds
@@ -1433,8 +1363,6 @@ class DocPolicy(DeltaFairnessPolicy):
             has_fair_waiting=bool(safe_state["has_fair_waiting"]),
             has_decode_deadline=bool(safe_state["has_decode_deadline"]),
             earliest_decode_start_deadline=safe_state["earliest_decode_start_deadline"],
-            earliest_decode_rid=self._debug_earliest_decode_rid,
-            earliest_decode_uid=self._debug_earliest_decode_uid,
             safe_prefix_now=safe_state["safe_prefix_now"],
             breakdown_items=tuple(target_breakdown.items()),
         )
@@ -1529,7 +1457,9 @@ class DocPolicy(DeltaFairnessPolicy):
                     running_batch=rb,
                     this_user_sum=req.get_estimated_prefill_impact(),
                 ),
-                req_is_fair_decode=lambda req, rb: True,
+                req_is_fair_decode=lambda req, rb: self.req_is_fair_decode(
+                    req, running_batch=rb
+                ),
                 event_delta_seconds=self._event_delta_seconds,
                 pooled_prefill_estimate_seconds=lambda req: pooled_prefill_time_estimation(
                     len(req.origin_input_ids),
@@ -1620,7 +1550,9 @@ class DocPolicy(DeltaFairnessPolicy):
                         running_batch=rb,
                         this_user_sum=req.get_estimated_prefill_impact(),
                     ),
-                    req_is_fair_decode=lambda req, rb: True,
+                    req_is_fair_decode=lambda req, rb: self.req_is_fair_decode(
+                        req, running_batch=rb
+                    ),
                     event_delta_seconds=self._event_delta_seconds,
                     pooled_prefill_estimate_seconds=lambda req: pooled_prefill_time_estimation(
                         len(req.origin_input_ids),
@@ -1688,44 +1620,16 @@ class DocPolicy(DeltaFairnessPolicy):
             return False
         if snapshot.task_seq <= self._last_consumed_prepare_snapshot_seq:
             return False
-        waiting_by_rid = {req.rid: req for req in waiting_queue}
-        running_by_rid = (
-            {} if running_batch is None else {req.rid: req for req in running_batch.reqs}
-        )
-        live_req_by_rid = dict(waiting_by_rid)
-        live_req_by_rid.update(running_by_rid)
-
-        remapped_deadline_queue = []
-        for candidate in snapshot.deadline_queue:
-            live_req = live_req_by_rid.get(candidate.req.rid)
-            if live_req is None:
-                continue
-            remapped_candidate = copy(candidate)
-            remapped_candidate.req = live_req
-            remapped_deadline_queue.append(remapped_candidate)
-
-        self._deadline_queue = tuple(remapped_deadline_queue)
+        self._deadline_queue = snapshot.deadline_queue
         self._waiting_prefill_start_deadline_by_rid = snapshot.waiting_prefill_deadlines
-        self._safe_waiting_queue = tuple(
-            waiting_by_rid[req.rid]
-            for req in snapshot.safe_waiting_queue
-            if req.rid in waiting_by_rid
-        )
-        self._safe_waiting_rids = frozenset(req.rid for req in self._safe_waiting_queue)
-        self._forced_prefill_queue = tuple(
-            waiting_by_rid[req.rid]
-            for req in snapshot.forced_prefill_queue
-            if req.rid in waiting_by_rid
-        )
-        self._forced_prefill_rids = frozenset(
-            req.rid for req in self._forced_prefill_queue
-        )
+        self._safe_waiting_queue = snapshot.safe_waiting_queue
+        self._safe_waiting_rids = snapshot.safe_waiting_rids
+        self._forced_prefill_queue = snapshot.forced_prefill_queue
+        self._forced_prefill_rids = snapshot.forced_prefill_rids
         self._max_safe_prefill_tokens = snapshot.max_safe_prefill_tokens
         self._has_fair_waiting = snapshot.has_fair_waiting
         self._has_decode_deadline = snapshot.has_decode_deadline
         self._earliest_decode_start_deadline = snapshot.earliest_decode_start_deadline
-        self._debug_earliest_decode_rid = snapshot.earliest_decode_rid
-        self._debug_earliest_decode_uid = snapshot.earliest_decode_uid
         self._safe_prefix_now = snapshot.safe_prefix_now
         self._simulator_rebuild_prepared = False
         self._last_consumed_prepare_snapshot_seq = snapshot.task_seq
@@ -1882,8 +1786,6 @@ class DocPolicy(DeltaFairnessPolicy):
         *,
         selected_rids: Optional[set[str]],
         decode_steps: int,
-        decode_steps_by_rid: Optional[Dict[str, int]] = None,
-        output_ids_already_applied: bool = False,
     ) -> None:
         chosen = selected_rids
         for req in running_batch.reqs:
@@ -1892,33 +1794,39 @@ class DocPolicy(DeltaFairnessPolicy):
             tracked = simulator.requests.get(req.rid)
             if tracked is None:
                 continue
-            req_decode_steps = (
-                int(decode_steps_by_rid.get(req.rid, 0))
-                if decode_steps_by_rid is not None
-                else int(decode_steps)
-            )
-            if req_decode_steps <= 0:
-                continue
             final_logical_ts = None
-            previous_logical_ts = self._logical_event_timestamp(
-                req, simulator=simulator
-            )
-            if output_ids_already_applied:
-                start_completion_number = max(
-                    1, len(req.output_ids) - req_decode_steps + 1
+            previous_logical_ts = self._logical_event_timestamp(req, simulator=simulator)
+            most_recent_event = tracked.most_recent_event()
+            if most_recent_event is not None:
+                previous_logical_ts = max(
+                    previous_logical_ts, float(most_recent_event.end_timestamp)
                 )
-            else:
-                start_completion_number = len(req.output_ids) + 1
+            if tracked.alternate_history_timeline.anticipated_future_events:
+                previous_logical_ts = max(
+                    previous_logical_ts,
+                    max(
+                        float(event.end_timestamp)
+                        for event in tracked.alternate_history_timeline.anticipated_future_events
+                    ),
+                )
+            start_completion_number = len(req.output_ids) + 1
             for completion_number in range(
-                start_completion_number, start_completion_number + req_decode_steps
+                start_completion_number, start_completion_number + decode_steps
             ):
-                context_tokens = len(req.origin_input_ids) + completion_number
-                logical_ts = previous_logical_ts + isolated_decode_time_estimation(
-                    context_tokens,
-                    context_tokens,
-                    1,
-                    max(int(self.delta_fairness_n or 1), 1),
+                logical_ts = self._logical_next_event_timestamp(
+                    req,
+                    event_type="decode",
+                    completion_number=completion_number,
+                    simulator=simulator,
                 )
+                if logical_ts <= previous_logical_ts:
+                    context_tokens = len(req.origin_input_ids) + completion_number
+                    logical_ts = previous_logical_ts + isolated_decode_time_estimation(
+                        context_tokens,
+                        context_tokens,
+                        1,
+                        max(int(self.delta_fairness_n or 1), 1),
+                    )
                 simulator.most_recent_event_real[req.rid] = RequestDecodeEvent(
                     req_id=req.rid,
                     end_timestamp=logical_ts,
@@ -1928,7 +1836,7 @@ class DocPolicy(DeltaFairnessPolicy):
                 previous_logical_ts = logical_ts
             if final_logical_ts is None:
                 continue
-            next_completion_number = start_completion_number + req_decode_steps
+            next_completion_number = start_completion_number + decode_steps
             context_tokens = len(req.origin_input_ids) + next_completion_number
             decode_duration = isolated_decode_time_estimation(
                 context_tokens,
@@ -1967,82 +1875,53 @@ class DocPolicy(DeltaFairnessPolicy):
         selected_rids: Optional[set[str]] = None,
         prepare_pass_state: bool = True,
         decode_steps: int = 1,
-        decode_steps_by_rid: Optional[Dict[str, int]] = None,
-        output_ids_already_applied: bool = False,
         new_token_ratio: float = 0.0,
     ) -> None:
         self._raise_prepare_thread_exception_if_any()
-        with torch.inference_mode():
-            phase_start = time.perf_counter()
-            if event_type == "decode" and running_batch is not None and (
-                decode_steps > 0 or decode_steps_by_rid
-            ):
-                chosen_decode_rids = (
-                    {
-                        rid
-                        for rid, steps in (decode_steps_by_rid or {}).items()
-                        if int(steps) > 0
-                    }
-                    if decode_steps_by_rid is not None
-                    else selected_rids
-                )
-                self._apply_logical_decode_updates(
-                    self.simulator,
-                    running_batch,
-                    selected_rids=chosen_decode_rids,
-                    decode_steps=decode_steps,
-                    decode_steps_by_rid=decode_steps_by_rid,
-                    output_ids_already_applied=output_ids_already_applied,
-                )
-                chosen = chosen_decode_rids
-                for req in running_batch.reqs:
-                    if chosen is None or req.rid in chosen:
-                        self._pending_decoded_reqs[req.rid] = req
-                if not prepare_pass_state:
-                    elapsed_ms = (time.perf_counter() - phase_start) * 1000.0
-                    self._last_prepare_breakdown_ms = {
-                        "sync_live_user_tracking_ms": 0.0,
-                        "logical_event_update_ms": elapsed_ms,
-                        "rebuild_from_real_state_ms": 0.0,
-                        "build_deadline_candidates_ms": 0.0,
-                        "prepare_during_gpu_execution_total_ms": elapsed_ms,
-                    }
-                    return
-            running_snapshot = self._snapshot_batch_for_prepare(running_batch)
-            waiting_snapshot = [
-                self._snapshot_req_for_prepare(req) for req in waiting_queue
-            ]
-            scheduled_snapshot = self._snapshot_batch_for_prepare(scheduled_batch)
-            self._enqueue_prepare_task(
-                (
-                    event_type,
-                    running_snapshot,
-                    waiting_snapshot,
-                    scheduled_snapshot,
-                    None if selected_rids is None else set(selected_rids),
-                    prepare_pass_state,
-                    decode_steps,
-                    None
-                    if decode_steps_by_rid is None
-                    else dict(decode_steps_by_rid),
-                    output_ids_already_applied,
-                    new_token_ratio,
-                    self._freeze_prepare_cache_state(),
-                    self._freeze_prepare_inputs(new_token_ratio=new_token_ratio),
-                    self._prepare_worker.mutation_seq,
-                )
+        phase_start = time.perf_counter()
+        if event_type == "decode" and running_batch is not None and decode_steps > 0:
+            self._apply_logical_decode_updates(
+                self.simulator,
+                running_batch,
+                selected_rids=selected_rids,
+                decode_steps=decode_steps,
             )
-            elapsed_ms = (time.perf_counter() - phase_start) * 1000.0
-            self._last_prepare_breakdown_ms = {
-                "sync_live_user_tracking_ms": 0.0,
-                "logical_event_update_ms": 0.0,
-                "rebuild_from_real_state_ms": 0.0,
-                "build_deadline_candidates_ms": 0.0,
-                "prepare_during_gpu_execution_total_ms": elapsed_ms,
-            }
+            chosen = selected_rids
+            for req in running_batch.reqs:
+                if chosen is None or req.rid in chosen:
+                    self._pending_decoded_reqs[req.rid] = req
+        running_snapshot = self._snapshot_batch_for_prepare(running_batch)
+        waiting_snapshot = [
+            self._snapshot_req_for_prepare(req) for req in waiting_queue
+        ]
+        scheduled_snapshot = self._snapshot_batch_for_prepare(scheduled_batch)
+        self._enqueue_prepare_task(
+            (
+                event_type,
+                running_snapshot,
+                waiting_snapshot,
+                scheduled_snapshot,
+                None if selected_rids is None else set(selected_rids),
+                prepare_pass_state,
+                decode_steps,
+                new_token_ratio,
+                self._freeze_prepare_cache_state(),
+                self._freeze_prepare_inputs(new_token_ratio=new_token_ratio),
+                self._prepare_worker.mutation_seq,
+            )
+        )
+        elapsed_ms = (time.perf_counter() - phase_start) * 1000.0
+        self._last_prepare_breakdown_ms = {
+            "sync_live_user_tracking_ms": 0.0,
+            "logical_event_update_ms": 0.0,
+            "rebuild_from_real_state_ms": 0.0,
+            "build_deadline_candidates_ms": 0.0,
+            "prepare_during_gpu_execution_total_ms": elapsed_ms,
+        }
 
     def process_new_request(self, req: Req) -> None:
         super().process_new_request(req)
+        self.simulator.process_new_request(req, self._deltas_us)
         self._pending_new_requests.append(req)
         self._enqueue_prepare_mutation(
             "process_new_request",
