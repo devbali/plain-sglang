@@ -36,9 +36,11 @@ class TimelineRow:
     prefill_request_event_count: int = 0
     decode_request_event_count: int = 0
     first_decode_start_ts: str = ""
+    isolated_start_ts: str = ""
     isolated_prefill_done_ts: str = ""
     isolated_first_decode_done_ts: str = ""
     isolated_latest_decode_done_ts: str = ""
+    isolated_completed_ts: str = ""
     completed_ts: str = ""
 
 
@@ -106,9 +108,11 @@ class RequestTimelineWriter:
             "prefill_request_event_count",
             "decode_request_event_count",
             "first_decode_start_ts",
+            "isolated_start_ts",
             "isolated_prefill_done_ts",
             "isolated_first_decode_done_ts",
             "isolated_latest_decode_done_ts",
+            "isolated_completed_ts",
             "completed_ts",
         ]
         tmp_path = f"{self.csv_path}.tmp"
@@ -136,9 +140,11 @@ class RequestTimelineWriter:
                             row.prefill_request_event_count,
                             row.decode_request_event_count,
                             row.first_decode_start_ts,
+                            row.isolated_start_ts,
                             row.isolated_prefill_done_ts,
                             row.isolated_first_decode_done_ts,
                             row.isolated_latest_decode_done_ts,
+                            row.isolated_completed_ts,
                             row.completed_ts,
                         ]
                     )
@@ -217,6 +223,17 @@ class RequestTimelineWriter:
             else setattr(row, "first_decode_start_ts", now) or True,
         )
 
+    def mark_isolated_start(
+        self, request_id: str, uid: Optional[str], *, timestamp_iso: str
+    ) -> None:
+        self._update(
+            request_id,
+            uid,
+            lambda row: False
+            if row.isolated_start_ts == timestamp_iso
+            else setattr(row, "isolated_start_ts", timestamp_iso) or True,
+        )
+
     def mark_delta_violation(
         self, request_id: str, uid: Optional[str], *, event_type: str
     ) -> None:
@@ -281,6 +298,17 @@ class RequestTimelineWriter:
             return changed
 
         self._update(request_id, uid, _apply)
+
+    def mark_isolated_completed(
+        self, request_id: str, uid: Optional[str], *, timestamp_iso: str
+    ) -> None:
+        self._update(
+            request_id,
+            uid,
+            lambda row: False
+            if row.isolated_completed_ts == timestamp_iso
+            else setattr(row, "isolated_completed_ts", timestamp_iso) or True,
+        )
 
 
 TIMELINE_WRITER = RequestTimelineWriter()

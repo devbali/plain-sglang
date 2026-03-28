@@ -97,6 +97,7 @@ class DocPolicy(DeltaFairnessPolicy):
         self._pending_decoded_reqs: Dict[str, Req] = {}
         self._pending_finished_prefill_reqs: Dict[str, Req] = {}
         self._pending_scheduled_prefill_reqs: Dict[str, Req] = {}
+        self._prefill_no_retraction_token_cap: Optional[int] = None
 
     def _has_pending_mutations(self) -> bool:
         return bool(
@@ -113,23 +114,6 @@ class DocPolicy(DeltaFairnessPolicy):
         self._pending_decoded_reqs.clear()
         self._pending_finished_prefill_reqs.clear()
         self._pending_scheduled_prefill_reqs.clear()
-
-    def _invalidate_prepared_state(self) -> None:
-        self._simulator_rebuild_prepared = False
-        self._prepared_deadline_queue = []
-        self._prepared_waiting_prefill_start_deadline_by_rid = {}
-        self._prepared_safe_waiting_queue = []
-        self._prepared_safe_waiting_rids = set()
-        self._prepared_forced_prefill_queue = []
-        self._prepared_forced_prefill_rids = set()
-        self._prepared_max_safe_prefill_tokens = None
-        self._prepared_has_fair_waiting = False
-        self._prepared_has_decode_deadline = False
-        self._prepared_earliest_decode_start_deadline = None
-        self._prepared_safe_prefix_now = None
-        self._prepared_running_sig = None
-        self._prepared_waiting_sig = None
-        self._prepared_pass_state = None
 
     def _read_deltas(self, delta_fairness_deltas_microseconds: Optional[Dict[str, int]]) -> None:
         deltas = delta_fairness_deltas_microseconds or {}
@@ -176,6 +160,28 @@ class DocPolicy(DeltaFairnessPolicy):
             this_user_len=this_user_len,
             this_user_sum=this_user_sum,
         )
+
+    def _memory_pressure_active_for_prefill(self) -> bool:
+        return self._prefill_no_retraction_token_cap is not None
+
+    def _no_retraction_prefill_token_cap(
+        self, running_batch: Optional[ScheduleBatch]
+    ) -> Optional[int]:
+        del running_batch
+        return self._prefill_no_retraction_token_cap
+
+    def _prefill_deadline_waiting_queue(
+        self,
+        waiting_queue: List[Req],
+        running_batch: Optional[ScheduleBatch],
+    ) -> List[Req]:
+        if not self._memory_pressure_active_for_prefill():
+            return waiting_queue
+        return [
+            req
+            for req in waiting_queue
+            if self.req_is_fair_prefill(req, running_batch=running_batch)
+        ]
 
     def _pooled_prefill_seconds(self, reqs: List[Req]) -> float:
         if not reqs:
@@ -268,12 +274,37 @@ class DocPolicy(DeltaFairnessPolicy):
 
         now = time.time()
         self._safe_prefix_now = now
-        candidate_batch: List[Req] = []
+        selected_batch: List[Req] = []
         safe_prompt_tokens = 0
+        no_retraction_cap = self._no_retraction_prefill_token_cap(running_batch)
+        pending_prefill_sum_by_user: Dict[str, int] = {}
+        pending_prefill_len_by_user: Dict[str, int] = {}
         for req in self._safe_waiting_queue:
-            candidate_batch.append(req)
+            req_prefill_tokens = len(req.origin_input_ids)
+            next_safe_prompt_tokens = safe_prompt_tokens + req_prefill_tokens
+            beyond_no_retraction_cap = (
+                no_retraction_cap is not None
+                and next_safe_prompt_tokens > no_retraction_cap
+            )
+            if beyond_no_retraction_cap:
+                this_user_sum = pending_prefill_sum_by_user.get(req.uid, 0)
+                this_user_len = pending_prefill_len_by_user.get(req.uid, 0)
+                if not self.req_is_fair_prefill(
+                    req,
+                    running_batch=running_batch,
+                    this_user_len=this_user_len,
+                    this_user_sum=this_user_sum,
+                ):
+                    continue
+                if not self._force_prefill_within_user_headroom(
+                    req,
+                    running_batch=running_batch,
+                    pending_prefill_tokens=this_user_sum,
+                ):
+                    continue
+            candidate_batch = selected_batch + [req]
             pooled_prefill_s = self._pooled_prefill_seconds(candidate_batch)
-            if len(candidate_batch) == 1:
+            if len(selected_batch) == 0:
                 self._debug_first_waiting_rid = req.rid
                 self._debug_first_waiting_prompt_tokens = len(req.origin_input_ids)
                 self._debug_first_candidate_prefill_ms = pooled_prefill_s * 1000.0
@@ -281,11 +312,16 @@ class DocPolicy(DeltaFairnessPolicy):
                     earliest_decode_deadline - (now + pooled_prefill_s)
                 ) * 1000.0
             if now + pooled_prefill_s <= earliest_decode_deadline:
-                safe_prompt_tokens = sum(
-                    len(batch_req.origin_input_ids) for batch_req in candidate_batch
-                )
+                safe_prompt_tokens = next_safe_prompt_tokens
+                selected_batch.append(req)
                 self._forced_prefill_queue.append(req)
                 self._forced_prefill_rids.add(req.rid)
+                pending_prefill_sum_by_user[req.uid] = (
+                    pending_prefill_sum_by_user.get(req.uid, 0) + req_prefill_tokens
+                )
+                pending_prefill_len_by_user[req.uid] = (
+                    pending_prefill_len_by_user.get(req.uid, 0) + 1
+                )
                 continue
             break
 
@@ -311,9 +347,17 @@ class DocPolicy(DeltaFairnessPolicy):
     ) -> None:
         phase_start = time.perf_counter()
         self._read_deltas(delta_fairness_deltas_microseconds)
+        self.simulator.sync_live_user_tracking(
+            running_batch,
+            waiting_queue,
+            deltas_in_microseconds=self._deltas_us,
+        )
+        deadline_waiting_queue = self._prefill_deadline_waiting_queue(
+            waiting_queue, running_batch
+        )
         self._deadline_queue, self._waiting_prefill_start_deadline_by_rid = (
             self.simulator.build_deadline_candidates(
-                waiting_queue,
+                deadline_waiting_queue,
                 running_batch,
                 req_is_fair_prefill=lambda req, rb: self.req_is_fair_prefill(
                     req, running_batch=rb
@@ -347,6 +391,12 @@ class DocPolicy(DeltaFairnessPolicy):
     def _queue_sig(self, reqs: List[Req]) -> Tuple[str, ...]:
         return tuple(req.rid for req in reqs)
 
+    def _queue_sig_excluding_pending_new(self, reqs: List[Req]) -> Tuple[str, ...]:
+        pending_new_rids = {req.rid for req in self._pending_new_requests}
+        if not pending_new_rids:
+            return self._queue_sig(reqs)
+        return tuple(req.rid for req in reqs if req.rid not in pending_new_rids)
+
     def _running_sig(self, running_batch: Optional[ScheduleBatch]) -> Tuple[str, ...]:
         if running_batch is None:
             return ()
@@ -374,9 +424,17 @@ class DocPolicy(DeltaFairnessPolicy):
         simulator: Optional[AlternateHistorySimulator] = None,
     ) -> None:
         target_simulator = self.simulator if simulator is None else simulator
+        target_simulator.sync_live_user_tracking(
+            running_batch,
+            waiting_queue,
+            deltas_in_microseconds=self._deltas_us,
+        )
+        deadline_waiting_queue = self._prefill_deadline_waiting_queue(
+            waiting_queue, running_batch
+        )
         self._prepared_deadline_queue, self._prepared_waiting_prefill_start_deadline_by_rid = (
             target_simulator.build_deadline_candidates(
-                waiting_queue,
+                deadline_waiting_queue,
                 running_batch,
                 req_is_fair_prefill=lambda req, rb: self.req_is_fair_prefill(
                     req, running_batch=rb
@@ -451,18 +509,24 @@ class DocPolicy(DeltaFairnessPolicy):
             return None
         if not isinstance(real_event, (RequestPrefillEvent, RequestDecodeEvent)):
             return None
-        token_count = len(req.origin_input_ids) + max(1, len(req.output_ids))
-        event = RequestDecodeEvent(
-            req_id=req.rid,
-            end_timestamp=real_event.end_timestamp
-            + isolated_decode_time_estimation(
-                token_count,
-                token_count,
-                1,
-                max(int(self.delta_fairness_n or 1), 1),
-            ),
-            completion_number=len(req.output_ids) + 1,
-        )
+        event = None
+        for upcoming in tracked.earliest_events_after_real_time(real_event) or []:
+            if isinstance(upcoming, RequestDecodeEvent):
+                event = upcoming
+                break
+        if event is None:
+            token_count = len(req.origin_input_ids) + max(1, len(req.output_ids))
+            event = RequestDecodeEvent(
+                req_id=req.rid,
+                end_timestamp=real_event.end_timestamp
+                + isolated_decode_time_estimation(
+                    token_count,
+                    token_count,
+                    1,
+                    max(int(self.delta_fairness_n or 1), 1),
+                ),
+                completion_number=len(req.output_ids) + 1,
+            )
         deadline = event.end_timestamp + self._event_delta_seconds(tracked, event)
         return SimpleNamespace(
             deadline=deadline,
@@ -599,11 +663,6 @@ class DocPolicy(DeltaFairnessPolicy):
                 selected_rids=selected_rids,
                 decode_steps=decode_steps,
             )
-            rebuild_breakdown: Dict[str, float] = {}
-            self.simulator.rebuild_all_tracked_requests(
-                affected_user_ids,
-                timing_breakdown=rebuild_breakdown,
-            )
             deadline_start = time.perf_counter()
             deadline_queue, waiting_prefill_start_deadline_by_rid = (
                 self.simulator.build_deadline_candidates(
@@ -636,29 +695,13 @@ class DocPolicy(DeltaFairnessPolicy):
                 "breakdown": {
                     "sync_live_user_tracking_ms": 0.0,
                     "logical_event_update_ms": 0.0,
-                    "rebuild_from_real_state_ms": rebuild_breakdown.get(
-                        "rebuild_scheduler_loop_ms", 0.0
-                    )
-                    + rebuild_breakdown.get("rebuild_live_states_ms", 0.0)
-                    + rebuild_breakdown.get("rebuild_state_setup_ms", 0.0),
-                    "rebuild_live_states_ms": rebuild_breakdown.get(
-                        "rebuild_live_states_ms", 0.0
-                    ),
-                    "rebuild_state_setup_ms": rebuild_breakdown.get(
-                        "rebuild_state_setup_ms", 0.0
-                    ),
-                    "rebuild_scheduler_loop_ms": rebuild_breakdown.get(
-                        "rebuild_scheduler_loop_ms", 0.0
-                    ),
-                    "rebuild_scheduler_step_count": rebuild_breakdown.get(
-                        "rebuild_scheduler_step_count", 0
-                    ),
-                    "rebuild_prefill_step_count": rebuild_breakdown.get(
-                        "rebuild_prefill_step_count", 0
-                    ),
-                    "rebuild_decode_step_count": rebuild_breakdown.get(
-                        "rebuild_decode_step_count", 0
-                    ),
+                    "rebuild_from_real_state_ms": 0.0,
+                    "rebuild_live_states_ms": 0.0,
+                    "rebuild_state_setup_ms": 0.0,
+                    "rebuild_scheduler_loop_ms": 0.0,
+                    "rebuild_scheduler_step_count": 0,
+                    "rebuild_prefill_step_count": 0,
+                    "rebuild_decode_step_count": 0,
                     "build_deadline_candidates_ms": deadline_elapsed_ms,
                 },
             }
@@ -692,12 +735,17 @@ class DocPolicy(DeltaFairnessPolicy):
     ) -> bool:
         if not self._simulator_rebuild_prepared:
             return False
-        if self._prepared_waiting_sig != self._queue_sig(waiting_queue):
+        current_running_sig = self._running_sig(running_batch)
+        if self._prepared_running_sig != current_running_sig:
             self._simulator_rebuild_prepared = False
             return False
-        if self._prepared_running_sig != self._running_sig(running_batch):
-            self._simulator_rebuild_prepared = False
-            return False
+        current_waiting_sig = self._queue_sig(waiting_queue)
+        if self._prepared_waiting_sig != current_waiting_sig:
+            if self._prepared_waiting_sig != self._queue_sig_excluding_pending_new(
+                waiting_queue
+            ):
+                self._simulator_rebuild_prepared = False
+                return False
         self._deadline_queue = list(self._prepared_deadline_queue)
         self._waiting_prefill_start_deadline_by_rid = dict(
             self._prepared_waiting_prefill_start_deadline_by_rid
@@ -815,12 +863,6 @@ class DocPolicy(DeltaFairnessPolicy):
             self._merge_pending_pass_state_mutations(waiting_queue, running_batch)
             self._last_pass_state_source = "start_of_pass_merge_pending"
         else:
-            self.simulator.start_of_pass(
-                running_batch,
-                waiting_queue,
-                deltas_in_microseconds=self._deltas_us,
-                timing_breakdown=breakdown,
-            )
             self._build_pass_state(
                 waiting_queue,
                 running_batch,
@@ -828,7 +870,7 @@ class DocPolicy(DeltaFairnessPolicy):
                 timing_breakdown=breakdown,
             )
             self._clear_pending_mutations()
-            self._last_pass_state_source = "start_of_pass_initial_build"
+            self._last_pass_state_source = "start_of_pass_build_from_mutations"
 
         after_simulator = time.perf_counter()
         self._current_pass_waiting_sig = waiting_sig
@@ -978,7 +1020,9 @@ class DocPolicy(DeltaFairnessPolicy):
         selected_rids: Optional[set[str]] = None,
         prepare_pass_state: bool = True,
         decode_steps: int = 1,
+        new_token_ratio: float = 0.0,
     ) -> None:
+        del new_token_ratio
         if not prepare_pass_state:
             if event_type == "decode" and running_batch is not None and decode_steps > 0:
                 self._apply_logical_decode_updates(
@@ -991,7 +1035,6 @@ class DocPolicy(DeltaFairnessPolicy):
                 for req in running_batch.reqs:
                     if chosen is None or req.rid in chosen:
                         self._pending_decoded_reqs[req.rid] = req
-            self._invalidate_prepared_state()
             self._last_prepare_breakdown_ms = {
                 "sync_live_user_tracking_ms": 0.0,
                 "logical_event_update_ms": 0.0,
@@ -1013,7 +1056,6 @@ class DocPolicy(DeltaFairnessPolicy):
                 for req in running_batch.reqs:
                     if chosen is None or req.rid in chosen:
                         self._pending_decoded_reqs[req.rid] = req
-            self._invalidate_prepared_state()
             self._last_prepare_breakdown_ms = {
                 "sync_live_user_tracking_ms": 0.0,
                 "logical_event_update_ms": 0.0,
@@ -1049,17 +1091,24 @@ class DocPolicy(DeltaFairnessPolicy):
             predicted_waiting = list(waiting_queue)
             predicted_running = running_batch
 
-        self._prepare_deadline_state(predicted_waiting, predicted_running)
-        if event_type == "decode":
-            self._pending_decoded_reqs.clear()
+        prepare_breakdown: Dict[str, float] = {}
+        self._prepare_deadline_state(
+            predicted_waiting,
+            predicted_running,
+        )
+        self._clear_pending_mutations()
         self._simulator_rebuild_prepared = True
         elapsed_ms = (time.perf_counter() - phase_start) * 1000.0
         self._last_prepare_breakdown_ms = {
-            "sync_live_user_tracking_ms": 0.0,
+            "sync_live_user_tracking_ms": prepare_breakdown.get(
+                "sync_live_user_tracking_ms", 0.0
+            ),
             "logical_event_update_ms": (logical_update_end - logical_update_start) * 1000.0,
-            "rebuild_from_real_state_ms": 0.0,
-            "build_deadline_candidates_ms": max(
-                0.0, elapsed_ms - ((logical_update_end - logical_update_start) * 1000.0)
+            "rebuild_from_real_state_ms": prepare_breakdown.get(
+                "rebuild_from_real_state_ms", 0.0
+            ),
+            "build_deadline_candidates_ms": prepare_breakdown.get(
+                "build_deadline_candidates_ms", 0.0
             ),
             "prepare_during_gpu_execution_total_ms": elapsed_ms,
         }
@@ -1067,19 +1116,16 @@ class DocPolicy(DeltaFairnessPolicy):
     def process_new_request(self, req: Req) -> None:
         super().process_new_request(req)
         self.simulator.process_new_request(req, self._deltas_us)
-        self._invalidate_prepared_state()
         self._pending_new_requests.append(req)
 
     def note_scheduled_prefill_batch(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
             self._pending_scheduled_prefill_reqs[req.rid] = req
-        self._invalidate_prepared_state()
 
     def note_retracted_reqs(self, reqs) -> None:
         for req in reqs:
             self.simulator.process_new_request(req, self._deltas_us)
             self._pending_new_requests.append(req)
-        self._invalidate_prepared_state()
 
     def fairinf_force_prefill(
         self,
@@ -1146,11 +1192,6 @@ class DocPolicy(DeltaFairnessPolicy):
         prefix_computed: bool = False,
         max_running_requests: Optional[int] = None,
     ) -> Tuple[int, Optional[List[Req]]]:
-        self._ensure_current_pass_state(
-            list(waiting_queue),
-            running_batch,
-            delta_fairness_deltas_microseconds,
-        )
         if not self._forced_prefill_rids:
             return 0, None
         prioritized_waiting = []
@@ -1163,7 +1204,10 @@ class DocPolicy(DeltaFairnessPolicy):
             if req.rid not in self._forced_prefill_rids:
                 continue
             req_prefill_tokens = getattr(req, "extend_input_len", len(req.origin_input_ids))
-            if safe_prefill_cap > 0 and used_safe_prefill_tokens + req_prefill_tokens > safe_prefill_cap:
+            if (
+                safe_prefill_cap > 0
+                and used_safe_prefill_tokens + req_prefill_tokens > safe_prefill_cap
+            ):
                 break
             this_users_extras = local_token_counters_by_user.get(req.uid, [])
             extra_sum = sum(this_users_extras)
@@ -1178,7 +1222,7 @@ class DocPolicy(DeltaFairnessPolicy):
                 req,
                 running_batch=running_batch,
                 pending_prefill_tokens=extra_sum,
-            ):
+                ):
                 continue
             prioritized_waiting.append(req)
             used_safe_prefill_tokens += req_prefill_tokens
@@ -1196,6 +1240,7 @@ class DocPolicy(DeltaFairnessPolicy):
             prefix_computed=prefix_computed,
             max_running_requests=max_running_requests,
             exact_forced_prefills=True,
+            reservation_token_cap=used_safe_prefill_tokens,
         )
 
     def fairinf_overdue_decode_subset_rids(
@@ -1270,7 +1315,6 @@ class DocPolicy(DeltaFairnessPolicy):
         for req in batch.reqs:
             self._pending_finished_prefill_reqs[req.rid] = req
             self._pending_scheduled_prefill_reqs.pop(req.rid, None)
-        self._invalidate_prepared_state()
 
     def finished_decode(self, batch: ScheduleBatch, decode_rounds: int = 1) -> None:
         super().finished_decode(batch, decode_rounds=decode_rounds)
@@ -1287,7 +1331,6 @@ class DocPolicy(DeltaFairnessPolicy):
                 SimpleNamespace(reqs=needs_simulator_update),
                 decode_rounds=decode_rounds,
             )
-            self._invalidate_prepared_state()
 
     def mark_request_finished(self, req: Req) -> None:
         super().mark_request_finished(req)
@@ -1296,4 +1339,3 @@ class DocPolicy(DeltaFairnessPolicy):
         self._pending_decoded_reqs.pop(req.rid, None)
         self._pending_finished_prefill_reqs.pop(req.rid, None)
         self._pending_scheduled_prefill_reqs.pop(req.rid, None)
-        self._invalidate_prepared_state()

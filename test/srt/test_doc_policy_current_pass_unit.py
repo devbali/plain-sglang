@@ -232,6 +232,88 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
                     prepare_pass_state=True,
                 )
 
+    def test_prefill_prepare_should_not_invoke_full_rebuild(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(doc_policy_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            doc_policy_mod, "pooled_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            doc_policy_mod, "pooled_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            sim_mod, "isolated_decode_time_estimation", return_value=3.0
+        ):
+            running_req = _mk_req("user_19", "rid_running", 4)
+            waiting_req = _mk_req("user_1", "rid_waiting", 4)
+            policy = DocPolicy(delta_fairness_n=4, max_running_requests=256)
+
+            policy.process_new_request(running_req)
+            now["t"] = 11.0
+            policy.finished_prefill(SimpleNamespace(reqs=[running_req]))
+            running_batch = SimpleNamespace(reqs=[running_req])
+            scheduled_batch = SimpleNamespace(reqs=[waiting_req])
+
+            now["t"] = 100.0
+            with patch.object(
+                policy.simulator,
+                "rebuild_all_tracked_requests",
+                side_effect=AssertionError(
+                    "prefill prepare unexpectedly invoked full simulator rebuild"
+                ),
+            ):
+                policy.prepare_during_gpu_execution(
+                    running_batch=running_batch,
+                    waiting_queue=[waiting_req],
+                    scheduled_batch=scheduled_batch,
+                    event_type="prefill",
+                    prepare_pass_state=True,
+                )
+
+    def test_start_of_pass_should_not_invoke_full_rebuild(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(doc_policy_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            doc_policy_mod, "pooled_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            doc_policy_mod, "pooled_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            sim_mod, "isolated_decode_time_estimation", return_value=3.0
+        ):
+            running_req = _mk_req("user_19", "rid_running", 4)
+            waiting_req = _mk_req("user_1", "rid_waiting", 4)
+            policy = DocPolicy(delta_fairness_n=4, max_running_requests=256)
+
+            policy.process_new_request(running_req)
+            now["t"] = 11.0
+            policy.finished_prefill(SimpleNamespace(reqs=[running_req]))
+            running_req.output_ids = [42]
+            now["t"] = 12.0
+            policy.finished_decode(SimpleNamespace(reqs=[running_req]))
+
+            running_batch = SimpleNamespace(reqs=[running_req])
+            now["t"] = 100.0
+            with patch.object(
+                policy.simulator,
+                "start_of_pass",
+                side_effect=AssertionError(
+                    "start_of_pass unexpectedly invoked full simulator rebuild"
+                ),
+            ):
+                policy.start_of_pass(running_batch, [waiting_req])
+
     def test_decode_prepare_advances_and_reseeds_next_decode_deadline(self):
         now = {"t": 10.0}
 
@@ -657,6 +739,128 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             self.assertNotIn(bad_running.rid, decode_rids)
             self.assertIn(good_waiting.rid, waiting_rids)
 
+    def test_memory_pressure_filters_unfair_waiting_users_from_prefill_deadlines(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(doc_policy_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            doc_policy_mod, "pooled_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            doc_policy_mod, "pooled_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            sim_mod, "isolated_decode_time_estimation", return_value=3.0
+        ):
+            running_req = _mk_req("user_19", "rid_running", 4)
+            fair_waiting = _mk_req("user_1", "rid_waiting_fair", 4)
+            unfair_waiting = _mk_req("user_20", "rid_waiting_unfair", 4)
+            policy = DocPolicy(delta_fairness_n=4, max_running_requests=256)
+
+            policy.process_new_request(running_req)
+            now["t"] = 11.0
+            policy.finished_prefill(SimpleNamespace(reqs=[running_req]))
+            running_req.output_ids = [42]
+            now["t"] = 12.0
+            policy.finished_decode(SimpleNamespace(reqs=[running_req]))
+            policy.process_new_request(fair_waiting)
+            policy.process_new_request(unfair_waiting)
+
+            running_batch = SimpleNamespace(reqs=[running_req])
+            now["t"] = 100.0
+            with patch.object(policy, "_memory_pressure_active_for_prefill", return_value=True, create=True), patch.object(
+                policy,
+                "req_is_fair_prefill",
+                side_effect=lambda req, **kwargs: req.uid == "user_1",
+            ):
+                policy._build_pass_state(
+                    [fair_waiting, unfair_waiting],
+                    running_batch,
+                    policy._deltas_us,
+                )
+
+            self.assertIn(fair_waiting.rid, policy._waiting_prefill_start_deadline_by_rid)
+            self.assertNotIn(unfair_waiting.rid, policy._waiting_prefill_start_deadline_by_rid)
+
+    def test_safe_prefix_allows_unfair_before_pressure_then_fair_only_after(self):
+        now = {"t": 100.0}
+
+        def fake_time():
+            return now["t"]
+
+        def fake_pooled_prefill(total_prompt_tokens, max_prompt_tokens, batch_size, fairinf_n):
+            del total_prompt_tokens, max_prompt_tokens, fairinf_n
+            return 0.01 * batch_size
+
+        with patch.object(doc_policy_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod.time, "time", side_effect=fake_time
+        ), patch.object(
+            doc_policy_mod, "pooled_prefill_time_estimation", side_effect=fake_pooled_prefill
+        ), patch.object(
+            doc_policy_mod, "pooled_decode_time_estimation", return_value=0.01
+        ):
+            bad_before_pressure = _mk_req("user_19", "rid_bad_1", 101)
+            bad_after_pressure = _mk_req("user_20", "rid_bad_2", 101)
+            good_after_pressure_1 = _mk_req("user_1", "rid_good_1", 101)
+            good_after_pressure_2 = _mk_req("user_2", "rid_good_2", 101)
+            running_req = _mk_req("user_30", "rid_running", 16)
+            policy = DocPolicy(delta_fairness_n=4, max_running_requests=256)
+
+            decode_candidate = SimpleNamespace(
+                event_type="decode",
+                start_deadline=100.035,
+                req=running_req,
+                event=SimpleNamespace(completion_number=1),
+            )
+            waiting_deadlines = {
+                bad_before_pressure.rid: 100.0,
+                bad_after_pressure.rid: 100.0,
+                good_after_pressure_1.rid: 100.0,
+                good_after_pressure_2.rid: 100.0,
+            }
+
+            with patch.object(
+                policy.simulator,
+                "build_deadline_candidates",
+                return_value=([decode_candidate], waiting_deadlines),
+            ), patch.object(
+                policy,
+                "_no_retraction_prefill_token_cap",
+                return_value=101,
+                create=True,
+            ), patch.object(
+                policy,
+                "req_is_fair_prefill",
+                side_effect=lambda req, **kwargs: req.uid in {"user_1", "user_2"},
+            ), patch.object(
+                policy,
+                "_force_prefill_within_user_headroom",
+                return_value=True,
+            ):
+                policy._build_pass_state(
+                    [
+                        bad_before_pressure,
+                        bad_after_pressure,
+                        good_after_pressure_1,
+                        good_after_pressure_2,
+                    ],
+                    SimpleNamespace(reqs=[running_req]),
+                    policy._deltas_us,
+                )
+
+            self.assertEqual(
+                [req.rid for req in policy._forced_prefill_queue],
+                [
+                    bad_before_pressure.rid,
+                    good_after_pressure_1.rid,
+                    good_after_pressure_2.rid,
+                ],
+            )
+            self.assertEqual(policy._max_safe_prefill_tokens, 303)
 
 if __name__ == "__main__":
     unittest.main()

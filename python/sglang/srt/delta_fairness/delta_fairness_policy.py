@@ -36,10 +36,14 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         self.delta_fairness_n = delta_fairness_n
         self.max_running_requests = max_running_requests
         self._fair_limit_reject_cache: Dict[tuple[str, int, bool], bool] = {}
+        self._ignore_global_prefill_budget = False
 
     def _has_delta_limit(self) -> bool:
         tree_cache = self.tree_cache
         return tree_cache is not None and getattr(tree_cache, "fairinf_max_per_user", None) is not None
+
+    def ignore_global_prefill_token_budget(self) -> bool:
+        return self._ignore_global_prefill_budget
 
     def _reset_pass_caches(self) -> None:
         self._fair_limit_reject_cache.clear()
@@ -743,6 +747,7 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         prefix_computed: bool = False,
         max_running_requests: Optional[int] = None,
         exact_forced_prefills: bool = False,
+        reservation_token_cap: Optional[int] = None,
     ) -> Tuple[int, Optional[List["Req"]]]:
         """ 
         Make space for the forced prefill requests
@@ -805,6 +810,11 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
                 req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
             )
             extra_space += total_tokens
+            target_extra_space = (
+                min(extra_space, reservation_token_cap)
+                if reservation_token_cap is not None
+                else extra_space
+            )
             sz = new_sz = token_to_kv_pool.available_size() + tree_cache.evictable_size()
             if (
                 running_batch is not None
@@ -838,14 +848,21 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
                 waiting_queue.extend(last_evicted)
                 self.note_retracted_reqs(last_evicted)
                 sz = new_sz = token_to_kv_pool.available_size() + tree_cache.evictable_size()
-            while adder.rem_total_tokens < total_tokens:
+            while (
+                token_to_kv_pool.available_size() + tree_cache.evictable_size()
+                < total_tokens
+            ):
                 if running_batch is None:
                     raise RuntimeError(
                         "Delta fairness reservation requires a running batch to retract."
                     )
                 try:
+                    current_capacity = (
+                        token_to_kv_pool.available_size() + tree_cache.evictable_size()
+                    )
+                    needed_capacity = max(0, total_tokens - current_capacity)
                     last_evicted, _ = running_batch.retract_decode(
-                        extra_space + sz - adder.rem_total_tokens
+                        max(target_extra_space, needed_capacity)
                     )
                 except RuntimeError as exc:
                     if "Delta fairness retraction blocked" in str(exc):
@@ -946,7 +963,11 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             new_extra_for_user = extra_for_user + req.extend_input_len
             user_tokens.append(req.extend_input_len)
             pending_prefill_by_user[req.uid] = new_extra_for_user
-            add_res = adder.add_one_req(req, new_extra_for_user)
+            self._ignore_global_prefill_budget = True
+            try:
+                add_res = adder.add_one_req(req, new_extra_for_user)
+            finally:
+                self._ignore_global_prefill_budget = False
             if add_res == "rejected":
                 user_tokens.pop()
                 pending_prefill_by_user[req.uid] = extra_for_user

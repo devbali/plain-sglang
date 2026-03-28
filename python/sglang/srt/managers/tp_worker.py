@@ -383,6 +383,7 @@ class ModelTpServer:
         self.scheduler = PolicyScheduler(self.schedule_policy, self.tree_cache)
         self.req_to_token_pool = self.model_runner.req_to_token_pool
         self.token_to_kv_pool = self.model_runner.token_to_kv_pool
+        self.fairness_policy.token_to_kv_pool = self.token_to_kv_pool
 
         # Init running status
         self.waiting_queue: List[Req] = []
@@ -1178,7 +1179,7 @@ class ModelTpServer:
         step_timer = StepTimer()
         telemetry = telemetry if telemetry is not None else {}
         telemetry["reason"] = ""
-        pre_pass_snapshot = self._capture_doc_policy_pass_snapshot_state()
+        pre_pass_snapshot = None
         running_bs = (
             len(self.running_batch.reqs) if self.running_batch is not None else 0
         )
@@ -1236,12 +1237,18 @@ class ModelTpServer:
             "remove_running_tokens_ms"
         )
 
+        if isinstance(self.fairness_policy, DocPolicy):
+            self.fairness_policy._prefill_no_retraction_token_cap = int(
+                max(0, adder.rem_total_tokens)
+            )
         self.fairness_policy.start_of_pass(
             self.running_batch,
             self.waiting_queue,
             new_token_ratio=self.new_token_ratio,
             max_running_requests=self.max_running_requests,
         )
+        if isinstance(self.fairness_policy, DocPolicy):
+            self.fairness_policy._prefill_no_retraction_token_cap = None
         telemetry["fairness_start_of_pass_ms"] = step_timer.mark(
             "fairness_start_of_pass_ms"
         )
@@ -1335,8 +1342,12 @@ class ModelTpServer:
                 self.tree_cache.evictable_size(),
             )
 
+        waiting_queue_for_prefills = self.waiting_queue
+        if evicted_reqs and isinstance(self.fairness_policy, DocPolicy):
+            waiting_queue_for_prefills = []
+
         self.fairness_policy.process_waiting_queue_prefills(
-            self.waiting_queue,
+            waiting_queue_for_prefills,
             adder=adder,
             token_counters_by_user=token_counters_by_user,
             prefix_computed=prefix_computed,
@@ -1490,6 +1501,7 @@ class ModelTpServer:
                     waiting_queue=list(self.waiting_queue),
                     scheduled_batch=batch,
                     selected_rids=None,
+                    new_token_ratio=self.new_token_ratio,
                 )
                 torch.cuda.synchronize()
                 self.last_model_forward_elapsed_ms = model_forward_start.elapsed_time(
@@ -1876,14 +1888,9 @@ class ModelTpServer:
                 selected_rids=selected_rids,
                 prepare_pass_state=prepare_pass_state,
                 decode_steps=decode_steps,
+                new_token_ratio=self.new_token_ratio,
             )
             fairness_prepare_end = time.perf_counter()
-            if not model_forward_end.query():
-                model_forward_end.synchronize()
-            after_sync = time.perf_counter()
-            self.last_model_forward_elapsed_ms = model_forward_start.elapsed_time(
-                model_forward_end
-            )
             next_token_ids = batch.check_sample_results(sample_output)
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                 next_token_ids
@@ -1897,6 +1904,10 @@ class ModelTpServer:
                 ].tolist()
 
             next_token_ids = next_token_ids.tolist()
+            after_sync = time.perf_counter()
+            self.last_model_forward_elapsed_ms = model_forward_start.elapsed_time(
+                model_forward_end
+            )
             after_sample_postprocess = time.perf_counter()
 
             # Check finish condition

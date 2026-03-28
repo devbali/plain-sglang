@@ -19,6 +19,154 @@ def _mk_req(uid: str, rid: str, n_tokens: int) -> Req:
 
 
 class TestDocPolicySimulatorUnit(unittest.TestCase):
+    def test_process_new_request_logs_isolated_start_from_simulation_time(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(sim_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod.TIMELINE_WRITER, "mark_isolated_start"
+        ) as mark_start:
+            simulator = AlternateHistorySimulator(
+                max_kv_tokens_per_user=100,
+                fairinf_n=2,
+            )
+
+            req = _mk_req("user_19", "rid_running", 4)
+            simulator.process_new_request(req)
+
+            mark_start.assert_called_once_with(
+                req.rid,
+                req.uid,
+                timestamp_iso="1970-01-01T00:00:10.000+00:00",
+            )
+
+    def test_finished_events_log_isolated_timestamps_from_simulation_time(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(sim_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            sim_mod, "isolated_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            sim_mod.TIMELINE_WRITER, "mark_isolated_prefill_done"
+        ) as mark_prefill, patch.object(
+            sim_mod.TIMELINE_WRITER, "mark_isolated_decode_done"
+        ) as mark_decode:
+            simulator = AlternateHistorySimulator(
+                max_kv_tokens_per_user=100,
+                fairinf_n=2,
+            )
+
+            req = _mk_req("user_19", "rid_running", 4)
+            simulator.process_new_request(req)
+
+            now["t"] = 11.0
+            simulator.finished_prefill(SimpleNamespace(reqs=[req]))
+
+            req.output_ids = [42, 43]
+            now["t"] = 12.0
+            simulator.finished_decode(SimpleNamespace(reqs=[req]), decode_rounds=2)
+
+            mark_prefill.assert_called_once_with(
+                req.rid,
+                req.uid,
+                timestamp_iso="1970-01-01T00:00:12.000+00:00",
+            )
+            self.assertEqual(mark_decode.call_count, 2)
+            self.assertEqual(
+                [call.kwargs["timestamp_iso"] for call in mark_decode.call_args_list],
+                [
+                    "1970-01-01T00:00:15.000+00:00",
+                    "1970-01-01T00:00:18.000+00:00",
+                ],
+            )
+            self.assertEqual(
+                [call.kwargs["completion_number"] for call in mark_decode.call_args_list],
+                [1, 2],
+            )
+
+    def test_mark_request_finished_logs_isolated_completion_from_simulation_time(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(sim_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            sim_mod, "isolated_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            sim_mod.TIMELINE_WRITER, "mark_isolated_completed"
+        ) as mark_completed:
+            simulator = AlternateHistorySimulator(
+                max_kv_tokens_per_user=100,
+                fairinf_n=2,
+            )
+
+            req = _mk_req("user_19", "rid_running", 4)
+            simulator.process_new_request(req)
+
+            now["t"] = 11.0
+            simulator.finished_prefill(SimpleNamespace(reqs=[req]))
+
+            req.output_ids = [42, 43]
+            now["t"] = 12.0
+            simulator.finished_decode(SimpleNamespace(reqs=[req]), decode_rounds=2)
+
+            now["t"] = 13.0
+            simulator.mark_request_finished(req)
+
+            mark_completed.assert_called_once_with(
+                req.rid,
+                req.uid,
+                timestamp_iso="1970-01-01T00:00:18.000+00:00",
+            )
+
+    def test_mark_request_finished_backfills_missing_isolated_decode_completion(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(sim_mod.time, "time", side_effect=fake_time), patch.object(
+            sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+        ), patch.object(
+            sim_mod, "isolated_decode_time_estimation", return_value=3.0
+        ), patch.object(
+            sim_mod.TIMELINE_WRITER, "mark_isolated_decode_done"
+        ) as mark_decode, patch.object(
+            sim_mod.TIMELINE_WRITER, "mark_isolated_completed"
+        ) as mark_completed:
+            simulator = AlternateHistorySimulator(
+                max_kv_tokens_per_user=100,
+                fairinf_n=2,
+            )
+
+            req = _mk_req("user_19", "rid_running", 4)
+            simulator.process_new_request(req)
+
+            now["t"] = 11.0
+            simulator.finished_prefill(SimpleNamespace(reqs=[req]))
+
+            req.output_ids = [42, 43]
+            now["t"] = 13.0
+            simulator.mark_request_finished(req)
+
+            self.assertEqual(
+                [call.kwargs["completion_number"] for call in mark_decode.call_args_list],
+                [1, 2],
+            )
+            mark_completed.assert_called_once_with(
+                req.rid,
+                req.uid,
+                timestamp_iso="1970-01-01T00:00:18.000+00:00",
+            )
+
     def test_grouped_finished_decode_replays_each_decode_round(self):
         now = {"t": 10.0}
 
