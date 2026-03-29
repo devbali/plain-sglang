@@ -11,6 +11,30 @@ from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Tuple
 
 import torch
 
+# ---------------------------------------------------------------------------
+# USE_C_SIM: when True, UserTimeline.rebuild_from_real_state() runs in the C
+# extension (_fairinf_sim.so) instead of pure Python.  The C path releases the
+# GIL for the entire simulation loop, allowing GPU kernel launches on the main
+# thread to proceed in parallel.  Set to False to fall back to pure Python
+# (e.g. for debugging or when the .so has not been built yet).
+# ---------------------------------------------------------------------------
+USE_C_SIM = True
+
+try:
+    from sglang.srt.delta_fairness import _fairinf_sim as _sim_c  # type: ignore[import]
+    _C_SIM_AVAILABLE = True
+except ImportError:
+    _C_SIM_AVAILABLE = False
+    if USE_C_SIM:
+        logging.getLogger(__name__).warning(
+            "_fairinf_sim C extension not found — falling back to pure-Python "
+            "simulator. Build it with: python setup_fairinf_sim.py build_ext --inplace"
+        )
+
+
+if USE_C_SIM and _C_SIM_AVAILABLE:
+    print("Using C extension for prepare snapshot simulation")
+
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.request_timeline import ISOLATED_SIM_TIMELINE_WRITER
 
@@ -160,6 +184,8 @@ class _DocPolicyPrepareWorker:
             min_new_token_ratio=min_new_token_ratio,
             enable_timeline_logging=True,
         )
+        if USE_C_SIM and _C_SIM_AVAILABLE:
+            _sim_c.patch_simulator(self._simulator)
         self._published_snapshot: Optional[_PreparedSnapshot] = None
         self._published_snapshot_lock = threading.Lock()
         self._thread_exception: Optional[BaseException] = None

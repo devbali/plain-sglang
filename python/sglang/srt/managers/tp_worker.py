@@ -446,7 +446,10 @@ class ModelTpServer:
             "doc_pass_state_source,doc_current_pass_id,doc_last_consumed_prepare_snapshot_seq,"
             "doc_first_waiting_rid,doc_first_waiting_prompt_tokens,doc_first_candidate_prefill_ms,doc_first_candidate_residual_slack_ms,"
             "doc_known_fair_uids_count,doc_earliest_uid_in_fair,doc_earliest_uid_unevictable_kv,doc_fairinf_max_per_user,"
-            "doc_pass_retraction_count\n",
+            "doc_pass_retraction_count,"
+            "doc_override_rid,doc_override_uid,doc_override_in_safe_queue,doc_override_in_waiting,doc_override_fate,"
+            "doc_adder_rem_total_after_remove,"
+            "doc_prefill_batch_uids\n",
         )
         self._doc_policy_snapshot_threshold_ms = float(
             os.environ.get("DOC_POLICY_SNAPSHOT_THRESHOLD_MS", "200")
@@ -1060,6 +1063,12 @@ class ModelTpServer:
         doc_earliest_uid_unevictable_kv = ""
         doc_fairinf_max_per_user = ""
         doc_pass_retraction_count = ""
+        doc_override_rid = ""
+        doc_override_uid = ""
+        doc_override_in_safe_queue = ""
+        doc_override_in_waiting = ""
+        doc_override_fate = ""
+        doc_adder_rem_total_after_remove = prefill_parts.get("adder_rem_total_after_remove", "")
         if isinstance(self.fairness_policy, DocPolicy):
             _known_fair = getattr(self.fairness_policy, "_debug_known_fair_uids", None)
             doc_known_fair_uids_count = "" if _known_fair is None else len(_known_fair)
@@ -1072,6 +1081,19 @@ class ModelTpServer:
             doc_fairinf_max_per_user = "" if _max_pu is None else _max_pu
             doc_pass_retraction_count = self.fairness_policy._pass_retraction_count
             self.fairness_policy._pass_retraction_count = 0
+            _override_rid = getattr(self.fairness_policy, "_force_prefill_override_rid", None)
+            _override_uid = getattr(self.fairness_policy, "_force_prefill_override_uid", None)
+            doc_override_rid = _override_rid or ""
+            doc_override_uid = _override_uid or ""
+            doc_override_fate = getattr(self.fairness_policy, "_debug_override_fate", "") or ""
+            if _override_rid:
+                _safe_rids = frozenset(
+                    r.rid for r in getattr(self.fairness_policy, "_safe_waiting_queue", ())
+                )
+                doc_override_in_safe_queue = int(_override_rid in _safe_rids)
+                doc_override_in_waiting = int(
+                    any(r.rid == _override_rid for r in self.waiting_queue)
+                )
 
         self._scheduler_pass_csv_logger.log(
             f"{time.time()},"
@@ -1102,7 +1124,10 @@ class ModelTpServer:
             f"{doc_pass_state_source},{doc_current_pass_id},{doc_last_consumed_prepare_snapshot_seq},"
             f"{doc_first_waiting_rid},{doc_first_waiting_prompt_tokens},{doc_first_candidate_prefill_ms},{doc_first_candidate_residual_slack_ms},"
             f"{doc_known_fair_uids_count},{doc_earliest_uid_in_fair},{doc_earliest_uid_unevictable_kv},{doc_fairinf_max_per_user},"
-            f"{doc_pass_retraction_count}\n"
+            f"{doc_pass_retraction_count},"
+            f"{doc_override_rid},{doc_override_uid},{doc_override_in_safe_queue},{doc_override_in_waiting},{doc_override_fate},"
+            f"{doc_adder_rem_total_after_remove},"
+            f"{'|'.join(r.uid for r in new_batch.reqs) if new_batch is not None else ''}\n"
         )
 
     def _serialize_doc_policy_req(self, req: Req) -> Dict[str, Any]:
@@ -1353,6 +1378,7 @@ class ModelTpServer:
         telemetry["remove_running_tokens_ms"] = step_timer.mark(
             "remove_running_tokens_ms"
         )
+        telemetry["adder_rem_total_after_remove"] = adder.rem_total_tokens
 
         if isinstance(self.fairness_policy, DocPolicy):
             self.fairness_policy._prefill_no_retraction_token_cap = int(

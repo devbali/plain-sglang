@@ -96,6 +96,8 @@ class DocPolicy(DeltaFairnessPolicy):
         self._last_prepare_task_seq = 0
         self._last_force_decode_reason: str = ""
         self._force_prefill_override_rid: Optional[str] = None  # RID that triggered prefill_deadline_earlier_than_decode
+        self._force_prefill_override_uid: Optional[str] = None
+        self._debug_override_fate: str = ""  # what happened to the override request in process_waiting_queue_prefills
         self._pass_retraction_count: int = 0  # retractions this pass; reset after each log
         self._prepare_worker = _DocPolicyPrepareWorker(
             self,
@@ -963,10 +965,12 @@ class DocPolicy(DeltaFairnessPolicy):
         if running_batch is None:
             self._last_force_decode_reason = ""
             self._force_prefill_override_rid = None
+            self._force_prefill_override_uid = None
             return False, self._max_safe_prefill_tokens
         if not (self._has_decode_deadline and (self._max_safe_prefill_tokens or 0) <= 0):
             self._last_force_decode_reason = ""
             self._force_prefill_override_rid = None
+            self._force_prefill_override_uid = None
             return False, self._max_safe_prefill_tokens
 
         # We would normally force decode. But if the earliest prefill deadline
@@ -980,27 +984,50 @@ class DocPolicy(DeltaFairnessPolicy):
             )
             earliest_prefill_deadline = self._waiting_prefill_start_deadline_by_rid[earliest_prefill_rid]
             if earliest_prefill_deadline < self._earliest_decode_start_deadline:
-                # Find the user for this request.
+                # Find the request object and its user.
+                earliest_prefill_req = None
                 earliest_prefill_uid = None
                 for req in self._safe_waiting_queue:
                     if req.rid == earliest_prefill_rid:
+                        earliest_prefill_req = req
                         earliest_prefill_uid = req.uid
                         break
-                if earliest_prefill_uid is not None and self.user_is_fair_prefill(
-                    earliest_prefill_uid,
-                    running_batch=running_batch,
+                if (
+                    earliest_prefill_uid is not None
+                    and self.user_is_fair_prefill(earliest_prefill_uid, running_batch=running_batch)
+                    and not self._reject_based_on_computed_fair_limit(
+                        earliest_prefill_uid,
+                        len(earliest_prefill_req.origin_input_ids),
+                    )
                 ):
-                    # Prefill deadline is more urgent and the user is under fair share —
-                    # do not force decode; let the prefill proceed uncapped (None means
-                    # "use normal system budget"). We must not return max_safe_prefill_tokens
-                    # here because it is 0 and get_new_prefill_batch would treat that as
-                    # "capped to zero" and return None immediately.
-                    self._last_force_decode_reason = "prefill_deadline_earlier_than_decode"
-                    self._force_prefill_override_rid = earliest_prefill_rid
-                    return False, None
+                        # Prefill deadline is more urgent and the user is under fair share —
+                        # do not force decode; let the prefill proceed uncapped (None means
+                        # "use normal system budget"). We must not return max_safe_prefill_tokens
+                        # here because it is 0 and get_new_prefill_batch would treat that as
+                        # "capped to zero" and return None immediately.
+                        self._last_force_decode_reason = "prefill_deadline_earlier_than_decode"
+                        self._force_prefill_override_rid = earliest_prefill_rid
+                        self._force_prefill_override_uid = earliest_prefill_uid
+                        self._debug_override_fate = ""
+                        return False, None
+
+        # If any waiting request can fit in the KV cache, yield to prefill rather than decode.
+        # PREFILL_PRIORITIZE_FAIR controls whether unfair users count here too.
+        for req in self._safe_waiting_queue:
+            if PREFILL_PRIORITIZE_FAIR and not self.user_is_fair_prefill(req.uid, running_batch=running_batch):
+                continue
+            if not self._reject_based_on_computed_fair_limit(
+                req.uid,
+                len(req.origin_input_ids),
+            ):
+                self._last_force_decode_reason = ""
+                self._force_prefill_override_rid = None
+                self._force_prefill_override_uid = None
+                return False, None
 
         self._last_force_decode_reason = "force_decode"
         self._force_prefill_override_rid = None
+        self._force_prefill_override_uid = None
         return True, 0
 
     def force_prefill_reservations(
@@ -1272,8 +1299,12 @@ class DocPolicy(DeltaFairnessPolicy):
         for prepared_req in ordered_safe_waiting:
             req = waiting_by_rid.get(prepared_req.rid)
             if req is None:
+                if prepared_req.rid == self._force_prefill_override_rid:
+                    self._debug_override_fate = "not_in_waiting"
                 continue
             if max_input_size is not None and adder.log_input_tokens > max_input_size:
+                if req.rid == self._force_prefill_override_rid:
+                    self._debug_override_fate = "input_cap"
                 break
             if max_input_size is not None:
                 adder.rem_input_tokens = max_input_size - adder.log_input_tokens
@@ -1281,9 +1312,12 @@ class DocPolicy(DeltaFairnessPolicy):
                 continue
 
             extra_tokens = pending_prefill_by_user.get(req.uid, 0)
+            is_override = req.rid == self._force_prefill_override_rid
             res = req.init_next_round_input(
                 target_tree_cache,
-                fairness_policy=self,
+                # Skip KV-limit rejection for the prefill-deadline override request;
+                # it gets ignore_global_budget treatment in add_one_req below.
+                fairness_policy=None if is_override else self,
                 fair=False,
                 extra_tokens=extra_tokens,
             )
@@ -1295,7 +1329,7 @@ class DocPolicy(DeltaFairnessPolicy):
                 )
                 continue
 
-            is_forced = req.rid in self._forced_prefill_rids or req.rid == self._force_prefill_override_rid
+            is_forced = req.rid in self._forced_prefill_rids or is_override
             if is_forced:
                 self._ignore_global_prefill_budget = True
             try:
@@ -1309,7 +1343,11 @@ class DocPolicy(DeltaFairnessPolicy):
                     req.uid,
                     req.rid,
                 )
+                if is_override:
+                    self._debug_override_fate = "adder_rejected"
                 continue
+            if is_override:
+                self._debug_override_fate = "admitted"
 
             token_counters_by_user.setdefault(req.uid, []).append(req.extend_input_len)
             pending_prefill_by_user[req.uid] = extra_tokens + req.extend_input_len
@@ -1320,6 +1358,41 @@ class DocPolicy(DeltaFairnessPolicy):
                 or running_batch_size + len(adder.can_run_list) >= effective_running_limit
             ):
                 break
+
+        # If the safe_waiting_queue loop admitted nothing (stale snapshot or all KV-rejected),
+        # try fair users from the live waiting queue sorted by prefill deadline.
+        # We bypass sorted_waiting_queue() here because it re-prioritizes by _safe_waiting_queue,
+        # which would just repeat the same rejected set at the front.
+        if not adder.can_run_list:
+            live_sorted = sorted(
+                waiting_queue,
+                key=lambda r: self._waiting_prefill_start_deadline_by_rid.get(r.rid, float("inf")),
+            )
+            for req in live_sorted:
+                if req in adder.can_run_list:
+                    continue
+                if running_batch_size + len(adder.can_run_list) >= effective_running_limit:
+                    break
+                if max_input_size is not None and adder.log_input_tokens > max_input_size:
+                    break
+                if max_input_size is not None:
+                    adder.rem_input_tokens = max_input_size - adder.log_input_tokens
+                extra_tokens = pending_prefill_by_user.get(req.uid, 0)
+                res = req.init_next_round_input(
+                    target_tree_cache,
+                    fairness_policy=self,
+                    fair=True,
+                    extra_tokens=extra_tokens,
+                )
+                if res == "rejected":
+                    continue
+                add_res = adder.add_one_req(req, extra_tokens)
+                if add_res == "rejected":
+                    continue
+                token_counters_by_user.setdefault(req.uid, []).append(req.extend_input_len)
+                pending_prefill_by_user[req.uid] = extra_tokens + req.extend_input_len
+                if not add_res or adder.no_remaining_tokens():
+                    break
 
     # -------------------------------------------------------------------------
     # Violation checking and GPU event hooks
