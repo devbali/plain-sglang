@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 # p95 overheads
-DECODE_CONST_PER_SCHEDULING_PASS_OVERHEAD = 0.100
-PREFILL_CONST_PER_SCHEDULING_PASS_OVERHEAD = 0.030
+DECODE_CONST_PER_SCHEDULING_PASS_OVERHEAD = 0.300
+PREFILL_CONST_PER_SCHEDULING_PASS_OVERHEAD = 0.080
 
 # microbenchmark allows this to be anything above 10 ms technically/theoretically
 TBT_DELTA = 0.015

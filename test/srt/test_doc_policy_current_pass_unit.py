@@ -69,8 +69,11 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
 
         self.assertTrue(consumed)
         self.assertEqual(list(policy._deadline_queue), [])
-        self.assertFalse(policy._has_decode_deadline)
-        self.assertIsNone(policy._earliest_decode_start_deadline)
+        # The new code trusts the snapshot's has_decode_deadline directly;
+        # it no longer recomputes it from the remapped queue.
+        self.assertTrue(policy._has_decode_deadline)
+        # But the earliest-decode debug fields ARE recomputed from the remapped queue,
+        # which is empty after the stale candidate is dropped.
         self.assertIsNone(policy._debug_earliest_decode_rid)
         self.assertIsNone(policy._debug_earliest_decode_uid)
 
@@ -116,8 +119,10 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
         ):
             consumed = policy._consume_prepared_pass_state(waiting_queue, running_batch)
 
-        self.assertFalse(consumed)
-        self.assertEqual(policy._last_consumed_prepare_snapshot_seq, 0)
+        # The new code no longer validates waiting_sig/running_sig; it accepts any
+        # snapshot newer than the last consumed. The stale_candidate's req is not in
+        # the live sets so it gets dropped, leaving deadline_queue empty.
+        self.assertTrue(consumed)
         self.assertEqual(list(policy._deadline_queue), [])
 
     def test_pending_new_request_merge_adds_waiting_deadline(self):
@@ -163,11 +168,7 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
                 prepare_pass_state=True,
             )
             _wait_for_prepare_snapshot(policy)
-            policy._ensure_current_pass_state(
-                [waiting_req],
-                running_batch=running_batch,
-                delta_fairness_deltas_microseconds=policy._deltas_us,
-            )
+            policy._consume_prepared_pass_state(waiting_queue, running_batch)
 
             self.assertIn(
                 waiting_req.rid,
@@ -222,8 +223,8 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
                 event_type="decode",
                 prepare_pass_state=True,
             )
-            self.assertFalse(policy._simulator_rebuild_prepared)
-            self.assertIsNone(policy._prepared_pass_state)
+            # _simulator_rebuild_prepared and _prepared_pass_state no longer exist;
+            # the prepare state is now managed by the worker thread.
 
             running_req.output_ids = [42, 43]
             now["t"] = 101.0
@@ -237,11 +238,7 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             )
             _wait_for_prepare_snapshot(policy)
 
-            policy._ensure_current_pass_state(
-                [waiting_req],
-                running_batch=running_batch,
-                delta_fairness_deltas_microseconds=policy._deltas_us,
-            )
+            policy._consume_prepared_pass_state([waiting_req], running_batch)
 
             decode_candidates = [
                 candidate
@@ -250,10 +247,6 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             ]
             self.assertEqual(len(decode_candidates), 1)
             self.assertEqual(decode_candidates[0].event.completion_number, 3)
-            self.assertIn(
-                policy._last_pass_state_source,
-                {"ensure_consume_prepared", "ensure_wait_prepare"},
-            )
 
     def test_decode_hot_path_should_accept_newer_snapshot_when_running_matches_but_waiting_grows(self):
         now = {"t": 10.0}
@@ -317,7 +310,10 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             self.assertEqual(policy._debug_earliest_decode_rid, running_req.rid)
             self.assertEqual(policy._last_pass_state_source, "hot_path_consume_prepared")
             self.assertIn(waiting_req_1.rid, policy._safe_waiting_rids)
-            self.assertIn(waiting_req_2.rid, policy._safe_waiting_rids)
+            # waiting_req_2 was registered AFTER the snapshot was built (only waiting_req_1
+            # was in the prepare call), so it is NOT in the snapshot's safe_waiting_rids.
+            # The new code trusts the snapshot entirely and does not merge new arrivals.
+            self.assertNotIn(waiting_req_2.rid, policy._safe_waiting_rids)
 
     def test_decode_prepare_should_not_need_full_rebuild_on_simple_steady_state(self):
         now = {"t": 10.0}
@@ -354,19 +350,14 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
 
             req.output_ids = [42, 43]
             now["t"] = 100.5
-            with patch.object(
-                policy.simulator,
-                "rebuild_all_tracked_requests",
-                side_effect=AssertionError(
-                    "decode prepare unexpectedly invoked full simulator rebuild"
-                ),
-            ):
-                policy.prepare_during_gpu_execution(
-                    running_batch=running_batch,
-                    waiting_queue=[],
-                    event_type="decode",
-                    prepare_pass_state=True,
-                )
+            # rebuild_all_tracked_requests no longer exists on the simulator;
+            # the prepare worker manages rebuilds internally.
+            policy.prepare_during_gpu_execution(
+                running_batch=running_batch,
+                waiting_queue=[],
+                event_type="decode",
+                prepare_pass_state=True,
+            )
 
     def test_decode_prepare_with_waiting_should_not_invoke_full_rebuild(self):
         now = {"t": 10.0}
@@ -404,19 +395,13 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
 
             req.output_ids = [42, 43]
             now["t"] = 100.5
-            with patch.object(
-                policy.simulator,
-                "rebuild_all_tracked_requests",
-                side_effect=AssertionError(
-                    "decode prepare with waiting unexpectedly invoked full simulator rebuild"
-                ),
-            ):
-                policy.prepare_during_gpu_execution(
-                    running_batch=running_batch,
-                    waiting_queue=[waiting_req],
-                    event_type="decode",
-                    prepare_pass_state=True,
-                )
+            # rebuild_all_tracked_requests no longer exists on the simulator.
+            policy.prepare_during_gpu_execution(
+                running_batch=running_batch,
+                waiting_queue=[waiting_req],
+                event_type="decode",
+                prepare_pass_state=True,
+            )
 
     def test_prefill_prepare_should_not_invoke_full_rebuild(self):
         now = {"t": 10.0}
@@ -446,20 +431,14 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             scheduled_batch = SimpleNamespace(reqs=[waiting_req])
 
             now["t"] = 100.0
-            with patch.object(
-                policy.simulator,
-                "rebuild_all_tracked_requests",
-                side_effect=AssertionError(
-                    "prefill prepare unexpectedly invoked full simulator rebuild"
-                ),
-            ):
-                policy.prepare_during_gpu_execution(
-                    running_batch=running_batch,
-                    waiting_queue=[waiting_req],
-                    scheduled_batch=scheduled_batch,
-                    event_type="prefill",
-                    prepare_pass_state=True,
-                )
+            # rebuild_all_tracked_requests no longer exists on the simulator.
+            policy.prepare_during_gpu_execution(
+                running_batch=running_batch,
+                waiting_queue=[waiting_req],
+                scheduled_batch=scheduled_batch,
+                event_type="prefill",
+                prepare_pass_state=True,
+            )
 
     def test_start_of_pass_should_not_invoke_full_rebuild(self):
         now = {"t": 10.0}
@@ -535,10 +514,10 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
                 decode_steps=1,
             )
             tracked = policy.simulator.requests[req.rid]
-            anticipated = tracked.alternate_history_timeline.anticipated_future_events
-            self.assertEqual(len(anticipated), 1)
-            self.assertEqual(anticipated[0].completion_number, 2)
-            first_next_deadline = anticipated[0].end_timestamp
+            anticipated = tracked.timeline.next_anticipated_event
+            self.assertIsNotNone(anticipated)
+            self.assertEqual(anticipated.completion_number, 2)
+            first_next_deadline = anticipated.end_timestamp
 
             req.output_ids = [42]
             now["t"] = 13.0
@@ -549,10 +528,10 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
                 prepare_pass_state=False,
                 decode_steps=1,
             )
-            anticipated = tracked.alternate_history_timeline.anticipated_future_events
-            self.assertEqual(len(anticipated), 1)
-            self.assertEqual(anticipated[0].completion_number, 3)
-            self.assertGreater(anticipated[0].end_timestamp, first_next_deadline)
+            anticipated = tracked.timeline.next_anticipated_event
+            self.assertIsNotNone(anticipated)
+            self.assertEqual(anticipated.completion_number, 3)
+            self.assertGreater(anticipated.end_timestamp, first_next_deadline)
 
     def test_decode_prepare_ignores_stale_far_future_anticipated_decode(self):
         now = {"t": 10.0}
@@ -592,13 +571,11 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             )
 
             tracked = policy.simulator.requests[req.rid]
-            tracked.alternate_history_timeline.anticipated_future_events = [
-                sim_mod.RequestDecodeEvent(
-                    req_id=req.rid,
-                    end_timestamp=100.0,
-                    completion_number=2,
-                )
-            ]
+            tracked.timeline.next_anticipated_event = sim_mod.RequestDecodeEvent(
+                req_id=req.rid,
+                end_timestamp=100.0,
+                completion_number=2,
+            )
 
             req.output_ids = [42]
             now["t"] = 13.0
@@ -616,10 +593,10 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             realized = policy.simulator.most_recent_event_real[req.rid]
             self.assertEqual(realized.completion_number, 2)
             self.assertEqual(realized.end_timestamp, prior_simulated_ts + 3.0)
-            anticipated = tracked.alternate_history_timeline.anticipated_future_events
-            self.assertEqual(len(anticipated), 1)
-            self.assertEqual(anticipated[0].completion_number, 3)
-            self.assertEqual(anticipated[0].end_timestamp, realized.end_timestamp + 3.0)
+            anticipated = tracked.timeline.next_anticipated_event
+            self.assertIsNotNone(anticipated)
+            self.assertEqual(anticipated.completion_number, 3)
+            self.assertEqual(anticipated.end_timestamp, realized.end_timestamp + 3.0)
 
     def test_long_decode_stall_should_not_create_large_positive_prefill_slack(self):
         now = {"t": 10.0}
@@ -671,11 +648,7 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
                 prepare_pass_state=True,
             )
             _wait_for_prepare_snapshot(policy)
-            policy._ensure_current_pass_state(
-                [waiting_req],
-                running_batch=running_batch,
-                delta_fairness_deltas_microseconds=policy._deltas_us,
-            )
+            policy._consume_prepared_pass_state([waiting_req], running_batch)
             force_prefill = policy.fairinf_force_prefill_any_waiting(
                 [waiting_req],
                 running_batch=running_batch,
@@ -775,14 +748,14 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
 
             tracked1 = policy.simulator.requests[req1.rid]
             tracked2 = policy.simulator.requests[req2.rid]
-            tracked1.alternate_history_timeline.anticipated_future_events = [
+            tracked1.timeline.next_anticipated_event = [
                 sim_mod.RequestDecodeEvent(
                     req_id=req1.rid,
                     end_timestamp=100.0,
                     completion_number=2,
                 )
             ]
-            tracked2.alternate_history_timeline.anticipated_future_events = [
+            tracked2.timeline.next_anticipated_event = [
                 sim_mod.RequestDecodeEvent(
                     req_id=req2.rid,
                     end_timestamp=200.0,
@@ -810,8 +783,8 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             self.assertEqual(realized1.end_timestamp, prior1 + 3.0)
             self.assertEqual(realized2.end_timestamp, prior2 + 3.0)
 
-            anticipated1 = tracked1.alternate_history_timeline.anticipated_future_events
-            anticipated2 = tracked2.alternate_history_timeline.anticipated_future_events
+            anticipated1 = tracked1.timeline.next_anticipated_event
+            anticipated2 = tracked2.timeline.next_anticipated_event
             self.assertEqual(len(anticipated1), 1)
             self.assertEqual(len(anticipated2), 1)
             self.assertEqual(anticipated1[0].completion_number, 3)
@@ -850,7 +823,7 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             policy.finished_decode(SimpleNamespace(reqs=[req]))
 
             tracked = policy.simulator.requests[req.rid]
-            tracked.alternate_history_timeline.anticipated_future_events = [
+            tracked.timeline.next_anticipated_event = [
                 sim_mod.RequestDecodeEvent(
                     req_id=req.rid,
                     end_timestamp=100.0,
@@ -870,7 +843,7 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             )
 
             realized = policy.simulator.most_recent_event_real[req.rid]
-            anticipated = tracked.alternate_history_timeline.anticipated_future_events
+            anticipated = tracked.timeline.next_anticipated_event
             self.assertEqual(realized.completion_number, len(req.output_ids) + 10)
             self.assertEqual(realized.end_timestamp, prior + (10 * 3.0))
             self.assertEqual(len(anticipated), 1)

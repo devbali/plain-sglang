@@ -444,7 +444,8 @@ class ModelTpServer:
             "doc_earliest_decode_rid,doc_earliest_decode_uid,doc_earliest_decode_completion_number,"
             "doc_earliest_decode_deadline,doc_earliest_decode_event_end_timestamp,"
             "doc_pass_state_source,doc_current_pass_id,doc_last_consumed_prepare_snapshot_seq,"
-            "doc_first_waiting_rid,doc_first_waiting_prompt_tokens,doc_first_candidate_prefill_ms,doc_first_candidate_residual_slack_ms\n",
+            "doc_first_waiting_rid,doc_first_waiting_prompt_tokens,doc_first_candidate_prefill_ms,doc_first_candidate_residual_slack_ms,"
+            "doc_known_fair_uids_count,doc_earliest_uid_in_fair,doc_earliest_uid_unevictable_kv,doc_fairinf_max_per_user\n",
         )
         self._doc_policy_snapshot_threshold_ms = float(
             os.environ.get("DOC_POLICY_SNAPSHOT_THRESHOLD_MS", "200")
@@ -680,6 +681,14 @@ class ModelTpServer:
                 decoded_reqs_by_rid = {}
                 decoded_steps_by_rid = {}
                 decode_steps_run = 0
+                if hasattr(self.fairness_policy, "prepare_during_gpu_execution"):
+                    self.fairness_policy.prepare_during_gpu_execution(
+                        event_type="decode",
+                        running_batch=self.running_batch,
+                        waiting_queue=list(self.waiting_queue),
+                        decode_steps=global_config.num_continue_decode_steps,
+                        new_token_ratio=self.new_token_ratio,
+                    )
                 for decode_step_idx in range(global_config.num_continue_decode_steps):
                     selected_rids = (
                         self.fairness_policy.fairinf_overdue_decode_subset_rids(
@@ -732,24 +741,6 @@ class ModelTpServer:
                     if self.running_batch.is_empty():
                         self.running_batch = None
                         break
-                if (
-                    decoded_steps_by_rid
-                    and self.running_batch is not None
-                    and not async_prepare_launched
-                    and hasattr(self.fairness_policy, "prepare_during_gpu_execution")
-                ):
-                    self.fairness_policy.prepare_during_gpu_execution(
-                        event_type="decode",
-                        running_batch=self.running_batch,
-                        waiting_queue=list(self.waiting_queue),
-                        scheduled_batch=None,
-                        selected_rids=set(decoded_steps_by_rid),
-                        prepare_pass_state=True,
-                        decode_steps=0,
-                        decode_steps_by_rid=dict(decoded_steps_by_rid),
-                        output_ids_already_applied=True,
-                        new_token_ratio=self.new_token_ratio,
-                    )
                 if decoded_reqs_by_rid:
                     self.fairness_policy.finished_decode(
                         SimpleNamespace(reqs=list(decoded_reqs_by_rid.values())),
@@ -1063,6 +1054,21 @@ class ModelTpServer:
                 self.fairness_policy, "_last_consumed_prepare_snapshot_seq", ""
             )
 
+        doc_known_fair_uids_count = ""
+        doc_earliest_uid_in_fair = ""
+        doc_earliest_uid_unevictable_kv = ""
+        doc_fairinf_max_per_user = ""
+        if isinstance(self.fairness_policy, DocPolicy):
+            _known_fair = getattr(self.fairness_policy, "_debug_known_fair_uids", None)
+            doc_known_fair_uids_count = "" if _known_fair is None else len(_known_fair)
+            _earliest_uid = doc_earliest_decode_uid
+            if _earliest_uid and _known_fair is not None:
+                doc_earliest_uid_in_fair = int(_earliest_uid in _known_fair)
+            _unev = getattr(self.fairness_policy, "_debug_earliest_uid_unevictable_kv", None)
+            doc_earliest_uid_unevictable_kv = "" if _unev is None else _unev
+            _max_pu = getattr(self.fairness_policy, "_debug_fairinf_max_per_user", None)
+            doc_fairinf_max_per_user = "" if _max_pu is None else _max_pu
+
         self._scheduler_pass_csv_logger.log(
             f"{time.time()},"
             f"{len(self.running_batch.reqs) if self.running_batch is not None else 0},"
@@ -1090,7 +1096,8 @@ class ModelTpServer:
             f"{doc_earliest_decode_rid},{doc_earliest_decode_uid},{doc_earliest_decode_completion_number},"
             f"{doc_earliest_decode_deadline},{doc_earliest_decode_event_end_timestamp},"
             f"{doc_pass_state_source},{doc_current_pass_id},{doc_last_consumed_prepare_snapshot_seq},"
-            f"{doc_first_waiting_rid},{doc_first_waiting_prompt_tokens},{doc_first_candidate_prefill_ms},{doc_first_candidate_residual_slack_ms}\n"
+            f"{doc_first_waiting_rid},{doc_first_waiting_prompt_tokens},{doc_first_candidate_prefill_ms},{doc_first_candidate_residual_slack_ms},"
+            f"{doc_known_fair_uids_count},{doc_earliest_uid_in_fair},{doc_earliest_uid_unevictable_kv},{doc_fairinf_max_per_user}\n"
         )
 
     def _serialize_doc_policy_req(self, req: Req) -> Dict[str, Any]:
@@ -1447,12 +1454,8 @@ class ModelTpServer:
                 self.tree_cache.evictable_size(),
             )
 
-        waiting_queue_for_prefills = self.waiting_queue
-        if evicted_reqs and isinstance(self.fairness_policy, DocPolicy):
-            waiting_queue_for_prefills = []
-
         self.fairness_policy.process_waiting_queue_prefills(
-            waiting_queue_for_prefills,
+            self.waiting_queue,
             adder=adder,
             token_counters_by_user=token_counters_by_user,
             prefix_computed=prefix_computed,
@@ -1985,16 +1988,17 @@ class ModelTpServer:
             )
             model_forward_end.record()
             fairness_prepare_start = time.perf_counter()
-            self.fairness_policy.prepare_during_gpu_execution(
-                event_type="decode",
-                running_batch=batch,
-                waiting_queue=list(self.waiting_queue),
-                scheduled_batch=None,
-                selected_rids=selected_rids,
-                prepare_pass_state=prepare_pass_state,
-                decode_steps=decode_steps,
-                new_token_ratio=self.new_token_ratio,
-            )
+            if decode_steps > 0 and hasattr(self.fairness_policy, "prepare_during_gpu_execution"):
+                self.fairness_policy.prepare_during_gpu_execution(
+                    event_type="decode",
+                    running_batch=batch,
+                    waiting_queue=list(self.waiting_queue),
+                    scheduled_batch=None,
+                    selected_rids=selected_rids,
+                    prepare_pass_state=prepare_pass_state,
+                    decode_steps=decode_steps,
+                    new_token_ratio=self.new_token_ratio,
+                )
             fairness_prepare_end = time.perf_counter()
             next_token_ids = batch.check_sample_results(sample_output)
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(

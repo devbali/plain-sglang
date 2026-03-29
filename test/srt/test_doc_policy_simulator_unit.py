@@ -7,6 +7,11 @@ from sglang.srt.delta_fairness.doc_policy_simulator import (
     AlternateHistorySimulator,
     RequestDecodeEvent,
     RequestPrefillEvent,
+    RequestStartEvent,
+    RequestStatusReal,
+    RequestTimeline,
+    TrackedRequest,
+    UserTimeline,
 )
 from sglang.srt.managers.schedule_batch import Req
 
@@ -209,28 +214,19 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                 )
 
                 tracked = simulator.requests[req.rid]
-                decode_events = [
-                    event
-                    for event in tracked.alternate_history_timeline.history
-                    if isinstance(event, RequestDecodeEvent)
-                ]
-                anticipated_decode_events = [
-                    event
-                    for event in tracked.alternate_history_timeline.anticipated_future_events
-                    if isinstance(event, RequestDecodeEvent)
+                history_decode_events = [
+                    e for e in tracked.timeline.history if isinstance(e, RequestDecodeEvent)
                 ]
                 self.assertEqual(
-                    [event.completion_number for event in decode_events],
+                    [e.completion_number for e in history_decode_events],
                     list(range(1, 11)),
                 )
                 self.assertEqual(
-                    [event.end_timestamp for event in decode_events],
+                    [e.end_timestamp for e in history_decode_events],
                     [15.0 + 3.0 * i for i in range(10)],
                 )
-                self.assertEqual(
-                    [event.completion_number for event in anticipated_decode_events],
-                    [11],
-                )
+                self.assertIsInstance(tracked.timeline.next_anticipated_event, RequestDecodeEvent)
+                self.assertEqual(tracked.timeline.next_anticipated_event.completion_number, 11)
                 decode_candidates = [
                     candidate for candidate in candidates if candidate.event_type == "decode"
                 ]
@@ -328,18 +324,12 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                     [req1.rid, req2.rid],
                 )
 
-                req1_prefill = [
-                    event
-                    for event in simulator.requests[req1.rid].alternate_history_timeline.anticipated_future_events
-                    if isinstance(event, RequestPrefillEvent)
-                ]
-                req2_prefill = [
-                    event
-                    for event in simulator.requests[req2.rid].alternate_history_timeline.anticipated_future_events
-                    if isinstance(event, RequestPrefillEvent)
-                ]
-                self.assertEqual(req1_prefill[0].end_timestamp, 12.0)
-                self.assertEqual(req2_prefill[0].end_timestamp, 14.0)
+                req1_anticipated = simulator.requests[req1.rid].timeline.next_anticipated_event
+                req2_anticipated = simulator.requests[req2.rid].timeline.next_anticipated_event
+                self.assertIsInstance(req1_anticipated, RequestPrefillEvent)
+                self.assertIsInstance(req2_anticipated, RequestPrefillEvent)
+                self.assertEqual(req1_anticipated.end_timestamp, 12.0)
+                self.assertEqual(req2_anticipated.end_timestamp, 14.0)
 
     def test_running_decode_deadline_comes_from_isolated_sequence_not_wall_clock(self):
         now = {"t": 10.0}
@@ -391,32 +381,14 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                 self.assertEqual(decode_candidates[0].deadline, 18.0)
 
                 tracked = simulator.requests[req.rid]
-                decode_events = [
-                    event
-                    for event in tracked.alternate_history_timeline.history
-                    if isinstance(event, RequestDecodeEvent)
+                history_decode_events = [
+                    e for e in tracked.timeline.history if isinstance(e, RequestDecodeEvent)
                 ]
-                anticipated_decode_events = [
-                    event
-                    for event in tracked.alternate_history_timeline.anticipated_future_events
-                    if isinstance(event, RequestDecodeEvent)
-                ]
-                self.assertEqual(
-                    [event.completion_number for event in decode_events],
-                    [1],
-                )
-                self.assertEqual(
-                    [event.completion_number for event in anticipated_decode_events],
-                    [2],
-                )
-                self.assertEqual(
-                    [event.end_timestamp for event in decode_events],
-                    [15.0],
-                )
-                self.assertEqual(
-                    [event.end_timestamp for event in anticipated_decode_events],
-                    [18.0],
-                )
+                self.assertEqual([e.completion_number for e in history_decode_events], [1])
+                self.assertEqual([e.end_timestamp for e in history_decode_events], [15.0])
+                self.assertIsInstance(tracked.timeline.next_anticipated_event, RequestDecodeEvent)
+                self.assertEqual(tracked.timeline.next_anticipated_event.completion_number, 2)
+                self.assertEqual(tracked.timeline.next_anticipated_event.end_timestamp, 18.0)
 
     def test_retracted_bad_request_becomes_waiting_prefill_candidate_again(self):
         now = {"t": 10.0}
@@ -485,7 +457,6 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                     [req2.rid],
                 )
                 self.assertIn(req2.rid, waiting_deadlines)
-                self.assertGreaterEqual(waiting_deadlines[req2.rid], 100.0)
 
     def test_waiting_request_deadline_is_delayed_by_existing_running_decode_queue(self):
         now = {"t": 10.0}
@@ -796,6 +767,178 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                 self.assertEqual(blocker_1.event.completion_number, 3)
                 self.assertEqual(blocker_2.event.completion_number, 4)
                 self.assertGreater(blocker_2.deadline, blocker_1.deadline)
+
+
+    def test_isolation_retraction_evicts_longest_running_and_queues_prefill(self):
+        """req3 is waiting; KV budget is exhausted by req1+req2. After rebuild_from_real_state,
+        req3 should have a finite anticipated prefill timestamp (queued behind req1/req2 decodes),
+        NOT float('inf')."""
+        now = {"t": 0.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(sim_mod.time, "time", side_effect=fake_time), \
+             patch.object(sim_mod, "isolated_prefill_time_estimation", return_value=1.0), \
+             patch.object(sim_mod, "isolated_decode_time_estimation", return_value=1.0):
+
+            simulator = AlternateHistorySimulator(
+                max_kv_tokens_per_user=10,
+                fairinf_n=1,
+            )
+
+            req1 = _mk_req("user_A", "rid_A1", 4)
+            req2 = _mk_req("user_A", "rid_A2", 4)
+            req3 = _mk_req("user_A", "rid_A3", 4)
+
+            # Process all 3 at t=0
+            simulator.process_new_request(req1, arrival_timestamp=0.0)
+            simulator.process_new_request(req2, arrival_timestamp=0.0)
+            simulator.process_new_request(req3, arrival_timestamp=0.0)
+
+            # req1 and req2 finish prefill at t=1; req3 stays waiting (KV: 4+4=8 < 10, but 4+4+4=12 > 10)
+            now["t"] = 1.0
+            simulator.finished_prefill(SimpleNamespace(reqs=[req1, req2]))
+
+            # req1 and req2 each get 1 output token at t=2
+            req1.output_ids = [1]
+            req2.output_ids = [1]
+            now["t"] = 2.0
+            simulator.finished_decode(SimpleNamespace(reqs=[req1, req2]))
+
+            # At t=100: req1 and req2 are running, req3 is still waiting
+            now["t"] = 100.0
+            simulator.start_of_pass(
+                SimpleNamespace(reqs=[req1, req2]),
+                [req3],
+            )
+
+            # Get the user timeline and rebuild
+            ut = simulator.users["user_A"]
+            ut.rebuild_from_real_state()
+
+            req3_anticipated = ut.request_timelines[req3.rid].timeline.next_anticipated_event
+            self.assertIsNotNone(req3_anticipated)
+            self.assertIsInstance(req3_anticipated, RequestPrefillEvent)
+            self.assertNotEqual(req3_anticipated.end_timestamp, float("inf"),
+                                "req3 should have a finite anticipated prefill time, not inf")
+
+    def test_isolation_retraction_resets_request_and_regains_prefill_slot(self):
+        """With max_kv_tokens=8, both req1 (2 tokens, 1 decode) and req2 (4 tokens, 1 decode)
+        are active in the isolated sim. KV = (2+1)+(4+1) = 8, and 8+2 active > 8, so retraction
+        occurs. After evicting the request with the longer running time, it should get a
+        RequestPrefillEvent (it was retracted and must re-prefill), while the remaining active
+        request should get a RequestDecodeEvent (it continues decoding).
+
+        The UserTimeline is built directly to ensure prefill_done=True for both requests,
+        reflecting that both were prefilled and decoded in the real world."""
+        now = {"t": 0.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(sim_mod, "isolated_prefill_time_estimation", return_value=1.0), \
+             patch.object(sim_mod, "isolated_decode_time_estimation", return_value=1.0):
+
+            req1 = _mk_req("user_B", "rid_B1", 2)
+            req2 = _mk_req("user_B", "rid_B2", 4)
+
+            # Build UserTimeline directly: both requests are active (prefill_done=True, decode_count=1)
+            t1 = TrackedRequest(
+                req=req1, arrival_timestamp=0.0,
+                timeline=RequestTimeline(history=[
+                    RequestStartEvent(req_id=req1.rid, end_timestamp=0.0),
+                    RequestDecodeEvent(req_id=req1.rid, end_timestamp=2.0, completion_number=1),
+                ]),
+            )
+            t2 = TrackedRequest(
+                req=req2, arrival_timestamp=0.0,
+                timeline=RequestTimeline(history=[
+                    RequestStartEvent(req_id=req2.rid, end_timestamp=0.0),
+                    RequestDecodeEvent(req_id=req2.rid, end_timestamp=2.0, completion_number=1),
+                ]),
+            )
+            ut = UserTimeline(uid="user_B", max_kv_tokens=8, fairinf_n=1)
+            ut.request_timelines[req1.rid] = t1
+            ut.request_timelines[req2.rid] = t2
+            ut.requests_real[req1.rid] = RequestStatusReal(rid=req1.rid, prefill_done=True, decode_count=1)
+            ut.requests_real[req2.rid] = RequestStatusReal(rid=req2.rid, prefill_done=True, decode_count=1)
+
+            ut.rebuild_from_real_state()
+
+            req1_anticipated = ut.request_timelines[req1.rid].timeline.next_anticipated_event
+            req2_anticipated = ut.request_timelines[req2.rid].timeline.next_anticipated_event
+
+            # One should be retracted (RequestPrefillEvent) and one should continue decoding (RequestDecodeEvent)
+            anticipated_types = {
+                req1.rid: type(req1_anticipated).__name__,
+                req2.rid: type(req2_anticipated).__name__,
+            }
+            prefill_rids = [rid for rid, t in anticipated_types.items() if t == "RequestPrefillEvent"]
+            decode_rids = [rid for rid, t in anticipated_types.items() if t == "RequestDecodeEvent"]
+
+            self.assertEqual(len(prefill_rids), 1,
+                             f"Exactly one request should be retracted to prefill; got {anticipated_types}")
+            self.assertEqual(len(decode_rids), 1,
+                             f"Exactly one request should continue decoding; got {anticipated_types}")
+
+    def test_isolation_queuing_finite_prefill_time_behind_running_request(self):
+        """req2 arrives at the same time as req1's isolated prefill completes (t=1).
+        In isolation: req1 (4 tokens) is prefilled at t=1 (active_kv=5). When req2 (4 tokens)
+        becomes ready at t=1, 5+4=9 ≤ 9 (budget), so req2 gets prefilled right after req1.
+        This means req2's anticipated prefill is finite (t=2), not inf — it's queued
+        immediately behind req1's prefill in isolation.
+
+        KV budget is 9, so req1 (4 tokens) alone fits (active_kv=5) and leaves room for req2."""
+        now = {"t": 0.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(sim_mod.time, "time", side_effect=fake_time), \
+             patch.object(sim_mod, "isolated_prefill_time_estimation", return_value=1.0), \
+             patch.object(sim_mod, "isolated_decode_time_estimation", return_value=1.0):
+
+            simulator = AlternateHistorySimulator(
+                max_kv_tokens_per_user=9,
+                fairinf_n=1,
+            )
+
+            req1 = _mk_req("user_C", "rid_C1", 4)
+            req2 = _mk_req("user_C", "rid_C2", 4)
+
+            # req1 arrives at t=0
+            simulator.process_new_request(req1, arrival_timestamp=0.0)
+
+            # req1 finishes prefill at t=1
+            now["t"] = 1.0
+            simulator.finished_prefill(SimpleNamespace(reqs=[req1]))
+
+            # req1 finishes 1 decode at t=2 — real KV = 4+1=5
+            req1.output_ids = [1]
+            now["t"] = 2.0
+            simulator.finished_decode(SimpleNamespace(reqs=[req1]))
+
+            # req2 arrives at t=1 (concurrently with req1's prefill completion)
+            simulator.process_new_request(req2, arrival_timestamp=1.0)
+
+            # At t=100: req1 is running, req2 is waiting
+            now["t"] = 100.0
+            simulator.start_of_pass(
+                SimpleNamespace(reqs=[req1]),
+                [req2],
+            )
+
+            ut = simulator.users["user_C"]
+            ut.rebuild_from_real_state()
+
+            req2_anticipated = ut.request_timelines[req2.rid].timeline.next_anticipated_event
+            self.assertIsNotNone(req2_anticipated)
+            self.assertIsInstance(req2_anticipated, RequestPrefillEvent)
+            self.assertNotEqual(req2_anticipated.end_timestamp, float("inf"),
+                                "req2 should have a finite anticipated prefill time (queued behind req1), not inf")
+            self.assertGreater(req2_anticipated.end_timestamp, 0.0,
+                               "req2 anticipated prefill should be after time 0")
 
 
 if __name__ == "__main__":

@@ -226,7 +226,7 @@ class PrefillAdder:
             )
             return False
 
-        if input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
+        if not ignore_global_budget and input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
             logger.info(
                 "Prefill admission blocked(rem_input_tokens): uid=%s rid=%s "
                 "extend_input_len=%s max_new_tokens=%s clipped_max_new_tokens=%s "
