@@ -410,7 +410,19 @@ class _DocPolicyPrepareWorker:
                 frozen_inputs.deltas_us if frozen_inputs is not None else owner._deltas_us
             ),
         )
-        for user_timeline in simulator.users.values():
+        # Skip rebuild for users that are definitively unfair (over their KV
+        # fair-share reservation).  Their decode deadlines are filtered out by
+        # req_is_fair_decode and their prefill deadlines are set to inf, so
+        # running the full simulation for them produces no usable output.
+        # known_fair_uids=None means "no KV info available → rebuild everyone".
+        _known_fair = (
+            frozen_cache_state.known_fair_uids
+            if frozen_cache_state is not None
+            else None
+        )
+        for uid, user_timeline in simulator.users.items():
+            if _known_fair is not None and uid not in _known_fair:
+                continue
             user_timeline.rebuild_from_real_state(
                 timing_breakdown=target_breakdown,
             )

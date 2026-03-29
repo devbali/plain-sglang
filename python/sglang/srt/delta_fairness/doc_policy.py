@@ -96,6 +96,7 @@ class DocPolicy(DeltaFairnessPolicy):
         self._last_prepare_task_seq = 0
         self._last_force_decode_reason: str = ""
         self._force_prefill_override_rid: Optional[str] = None  # RID that triggered prefill_deadline_earlier_than_decode
+        self._pass_retraction_count: int = 0  # retractions this pass; reset after each log
         self._prepare_worker = _DocPolicyPrepareWorker(
             self,
             isolated_kv_tokens_per_user=isolated_kv_tokens_per_user,
@@ -893,6 +894,7 @@ class DocPolicy(DeltaFairnessPolicy):
         )
 
     def note_retracted_reqs(self, reqs) -> None:
+        self._pass_retraction_count += len(reqs)
         self._enqueue_prepare_mutation(
             "note_retracted_reqs",
             (

@@ -177,6 +177,12 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
+        # Remove per-step decode KV accounting — the tokens are now going into
+        # the radix tree (tracked via total_user_counters through insert/lock_ref).
+        if getattr(req, "decode_kv_tracked", 0) > 0:
+            self.note_decode_kv_free(req.uid, req.decode_kv_tracked)
+            req.decode_kv_tracked = 0
+
         if self.disable:
             self.token_to_kv_pool.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
@@ -458,6 +464,22 @@ class RadixCache(BasePrefixCache):
             node.lock_ref -= 1
             node = node.parent
         return delta
+
+    def note_decode_kv_alloc(self, uid: str, n: int) -> None:
+        """Record n newly-allocated decode output KV slots for uid.
+
+        These slots live in token_to_kv_pool (outside the radix tree) and are
+        always unevictable while the request is running.  We add them to
+        total_user_counters so that fairness checks include them.  They are
+        NOT added to evictable_total_user_counters.
+        """
+        if uid and n > 0:
+            self.total_user_counters.add_tokens(uid, n)
+
+    def note_decode_kv_free(self, uid: str, n: int) -> None:
+        """Remove n decode output KV slots for uid (retraction or completion)."""
+        if uid and n > 0:
+            self.total_user_counters.remove_tokens(uid, n)
 
     def user_unevictable_kv_is_under_fair_share_reservation (self, user_id: str, extra_tokens = 0) -> bool:
         if self.fairinf_n is None:

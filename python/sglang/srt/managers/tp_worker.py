@@ -445,7 +445,8 @@ class ModelTpServer:
             "doc_earliest_decode_deadline,doc_earliest_decode_event_end_timestamp,"
             "doc_pass_state_source,doc_current_pass_id,doc_last_consumed_prepare_snapshot_seq,"
             "doc_first_waiting_rid,doc_first_waiting_prompt_tokens,doc_first_candidate_prefill_ms,doc_first_candidate_residual_slack_ms,"
-            "doc_known_fair_uids_count,doc_earliest_uid_in_fair,doc_earliest_uid_unevictable_kv,doc_fairinf_max_per_user\n",
+            "doc_known_fair_uids_count,doc_earliest_uid_in_fair,doc_earliest_uid_unevictable_kv,doc_fairinf_max_per_user,"
+            "doc_pass_retraction_count\n",
         )
         self._doc_policy_snapshot_threshold_ms = float(
             os.environ.get("DOC_POLICY_SNAPSHOT_THRESHOLD_MS", "200")
@@ -1058,6 +1059,7 @@ class ModelTpServer:
         doc_earliest_uid_in_fair = ""
         doc_earliest_uid_unevictable_kv = ""
         doc_fairinf_max_per_user = ""
+        doc_pass_retraction_count = ""
         if isinstance(self.fairness_policy, DocPolicy):
             _known_fair = getattr(self.fairness_policy, "_debug_known_fair_uids", None)
             doc_known_fair_uids_count = "" if _known_fair is None else len(_known_fair)
@@ -1068,6 +1070,8 @@ class ModelTpServer:
             doc_earliest_uid_unevictable_kv = "" if _unev is None else _unev
             _max_pu = getattr(self.fairness_policy, "_debug_fairinf_max_per_user", None)
             doc_fairinf_max_per_user = "" if _max_pu is None else _max_pu
+            doc_pass_retraction_count = self.fairness_policy._pass_retraction_count
+            self.fairness_policy._pass_retraction_count = 0
 
         self._scheduler_pass_csv_logger.log(
             f"{time.time()},"
@@ -1097,7 +1101,8 @@ class ModelTpServer:
             f"{doc_earliest_decode_deadline},{doc_earliest_decode_event_end_timestamp},"
             f"{doc_pass_state_source},{doc_current_pass_id},{doc_last_consumed_prepare_snapshot_seq},"
             f"{doc_first_waiting_rid},{doc_first_waiting_prompt_tokens},{doc_first_candidate_prefill_ms},{doc_first_candidate_residual_slack_ms},"
-            f"{doc_known_fair_uids_count},{doc_earliest_uid_in_fair},{doc_earliest_uid_unevictable_kv},{doc_fairinf_max_per_user}\n"
+            f"{doc_known_fair_uids_count},{doc_earliest_uid_in_fair},{doc_earliest_uid_unevictable_kv},{doc_fairinf_max_per_user},"
+            f"{doc_pass_retraction_count}\n"
         )
 
     def _serialize_doc_policy_req(self, req: Req) -> Dict[str, Any]:

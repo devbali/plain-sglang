@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Alternate History Simulator — per AlternateHistory.md design."""
 
+import heapq
 import time
 import logging
 from collections import deque
@@ -772,7 +773,12 @@ class AlternateHistorySimulator:
             req.rid: req
             for req in (running_batch.reqs if running_batch is not None else [])
         }
-        candidates: List[DeadlineCandidate] = []
+        # Track only what consumers actually need:
+        # - the single earliest decode candidate (by start_deadline)
+        # - all fair prefill candidates (for ordering the waiting queue)
+        # - waiting_prefill_deadline_by_rid for the force-decode override check
+        earliest_decode: Optional[DeadlineCandidate] = None
+        prefill_candidates: List[DeadlineCandidate] = []
         waiting_prefill_deadline_by_rid: Dict[str, float] = {}
 
         for rid, tracked in self.requests.items():
@@ -808,7 +814,8 @@ class AlternateHistorySimulator:
                         waiting_prefill_deadline_by_rid[rid] = float("inf")
                         continue
                     start_dl = deadline - pooled_prefill_estimate_seconds(req)
-                    candidates.append(DeadlineCandidate(deadline=deadline, start_deadline=start_dl, event_type="prefill", req=req, event=event))
+                    c = DeadlineCandidate(deadline=deadline, start_deadline=start_dl, event_type="prefill", req=req, event=event)
+                    prefill_candidates.append(c)
                     waiting_prefill_deadline_by_rid[rid] = start_dl
                 elif isinstance(event, RequestDecodeEvent):
                     if rid not in running_by_rid:
@@ -816,10 +823,28 @@ class AlternateHistorySimulator:
                     if not req_is_fair_decode(req, running_batch):
                         continue
                     start_dl = deadline - pooled_decode_estimate_seconds(req, running_batch)
-                    candidates.append(DeadlineCandidate(deadline=deadline, start_deadline=start_dl, event_type="decode", req=req, event=event))
+                    c = DeadlineCandidate(deadline=deadline, start_deadline=start_dl, event_type="decode", req=req, event=event)
+                    if earliest_decode is None or start_dl < earliest_decode.start_deadline:
+                        earliest_decode = c
 
-        candidates.sort(key=lambda c: (c.start_deadline, 0 if c.event_type == "decode" else 1, c.deadline, self.requests[c.req.rid].arrival_timestamp))
+        # We only ever need the top-K earliest prefill candidates:
+        # - the safe-prefix loop breaks after ~10 fit within the decode window
+        # - process_waiting_queue_prefills rarely schedules more than 10-20 per pass
+        # Use heapq.nsmallest so we avoid an O(N log N) sort over the full queue.
+        _PREFILL_CAP = 32
+        arrival_ts = self.requests
+        _key = lambda c: (c.start_deadline, c.deadline, arrival_ts[c.req.rid].arrival_timestamp)
+        if len(prefill_candidates) > _PREFILL_CAP:
+            top_prefills = heapq.nsmallest(_PREFILL_CAP, prefill_candidates, key=_key)
+        else:
+            top_prefills = sorted(prefill_candidates, key=_key)
+
+        # deadline_queue: at most one decode candidate (the earliest) + top prefills.
+        deadline_queue: List[DeadlineCandidate] = []
+        if earliest_decode is not None:
+            deadline_queue.append(earliest_decode)
+        deadline_queue.extend(top_prefills)
 
         if not include_ordered_waiting_queue:
-            return candidates, waiting_prefill_deadline_by_rid
-        return candidates, waiting_prefill_deadline_by_rid, tuple(c.req for c in candidates if c.event_type == "prefill")
+            return deadline_queue, waiting_prefill_deadline_by_rid
+        return deadline_queue, waiting_prefill_deadline_by_rid, tuple(c.req for c in top_prefills)

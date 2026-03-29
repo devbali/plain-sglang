@@ -505,6 +505,9 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         eviction of *unlocked* cache entries) to recover space rather than the
         base alloc_token_slots loop, which only evicts via the non-fairness path
         and silently does nothing when all nodes are locked.
+
+        If eviction is still not enough (all cache locked by running reqs),
+        retract the most unfair request and retry once.
         """
         if not self._has_delta_limit():
             return super().alloc_decode_output_slots(batch)
@@ -515,10 +518,41 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
             self.tree_cache.evict_delta_fair(bs, batch.token_to_kv_pool.free, None)
 
         out_cache_loc = batch.token_to_kv_pool.alloc(bs)
+        if out_cache_loc is not None:
+            # Account for the newly allocated decode output slots per user.
+            if self.tree_cache is not None:
+                for req in batch.reqs:
+                    self.tree_cache.note_decode_kv_alloc(req.uid, 1)
+                    req.decode_kv_tracked += 1
+            return out_cache_loc
+
+        # Eviction alone was not enough (all slots locked). Retract one request
+        # (the most unfair one) to free its locked KV, then retry.
+        logger.warning(
+            "alloc_decode_output_slots: eviction insufficient (available=%s, need=%s). "
+            "Retracting one decode request.",
+            batch.token_to_kv_pool.available_size(),
+            bs,
+        )
+        retracted, _ = batch.retract_decode(extra=bs)
+        if retracted:
+            from sglang.srt.request_timeline import TIMELINE_WRITER
+            for req in retracted:
+                TIMELINE_WRITER.mark_running_batch_removed(req.rid, req.uid)
+            self.note_retracted_reqs(retracted)
+            # After retraction the batch size shrank; re-check needed slots.
+            bs = batch.batch_size()
+
+        out_cache_loc = batch.token_to_kv_pool.alloc(bs)
         if out_cache_loc is None:
             raise RuntimeError(
-                "Failed to allocate decode slots under delta fairness policy."
+                "Failed to allocate decode slots under delta fairness policy "
+                f"even after retracting {len(retracted)} request(s)."
             )
+        if self.tree_cache is not None:
+            for req in batch.reqs:
+                self.tree_cache.note_decode_kv_alloc(req.uid, 1)
+                req.decode_kv_tracked += 1
         return out_cache_loc
 
     # ---- Delta fairness specific helpers ----------------------------------

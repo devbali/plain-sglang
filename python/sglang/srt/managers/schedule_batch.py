@@ -142,6 +142,11 @@ class Req:
         self.prefix_indices = []
         self.last_node = None
 
+        # Decode KV accounting: cumulative output slots added to
+        # tree_cache.total_user_counters via note_decode_kv_alloc.
+        # Must be removed when the request is retracted or finishes.
+        self.decode_kv_tracked: int = 0
+
         # Sampling parameters
         self.sampling_params = None
         self.stream = False
@@ -642,6 +647,11 @@ class ScheduleBatch:
                 # release the last node
                 self.tree_cache.dec_lock_ref(req.last_node)
 
+            # Remove decode-step KV accounting for this request.
+            if req.decode_kv_tracked > 0:
+                self.tree_cache.note_decode_kv_free(req.uid, req.decode_kv_tracked)
+                req.decode_kv_tracked = 0
+
                 # NOTE(lsyin): we should use the newly evictable memory instantly.
                 residual_size = (
                     len(sorted_indices) * global_config.retract_decode_steps
@@ -725,6 +735,11 @@ class ScheduleBatch:
                 self.token_to_kv_pool.free(token_indices)
                 self.req_to_token_pool.free(req.req_pool_idx)
                 self.tree_cache.dec_lock_ref(req.last_node)
+
+            # Remove decode-step KV accounting for this request.
+            if req.decode_kv_tracked > 0:
+                self.tree_cache.note_decode_kv_free(req.uid, req.decode_kv_tracked)
+                req.decode_kv_tracked = 0
 
             req.prefix_indices = []
             req.last_node = None
