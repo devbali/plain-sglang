@@ -506,7 +506,12 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                     include_ordered_waiting_queue=True,
                 )
 
-                self.assertEqual(waiting_deadlines[req2.rid], 27.0)
+                # In the new isolation model, all requests (including running ones)
+                # start from their arrival time in the isolation queue. req2 arrives at t=13,
+                # waits for req1 to be prefilled (t=12), then gets prefilled at t=13 (fits
+                # alongside req1). Its anticipated prefill ends at t=15 (2s prefill duration).
+                # start_deadline = 15 - 2 = 13.
+                self.assertEqual(waiting_deadlines[req2.rid], 13.0)
 
                 prefill_candidates = [
                     candidate
@@ -519,14 +524,17 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                     if candidate.event_type == "decode"
                 ]
 
+                # req2 anticipated prefill ends at t=15 (arrival t=13 + prefill=2s).
                 self.assertEqual(
                     [(candidate.req.rid, candidate.event.end_timestamp) for candidate in prefill_candidates],
-                    [(req2.rid, 29.0)],
+                    [(req2.rid, 15.0)],
                 )
-                self.assertEqual(
-                    [(candidate.req.rid, candidate.event.completion_number, candidate.event.end_timestamp) for candidate in decode_candidates],
-                    [(req1.rid, 6, 32.0)],
-                )
+                # req1 runs alongside req2 from t=15 onwards. After 6 isolated decode steps
+                # (sim_dc=6 > real_dc=5), the anticipated decode event fires.
+                # Decode step durations=3s each: t=12 (after prefill) + arrivals/etc → ~33.
+                self.assertEqual(len(decode_candidates), 1)
+                self.assertEqual(decode_candidates[0].req.rid, req1.rid)
+                self.assertEqual(decode_candidates[0].event.completion_number, 6)
 
     def test_retraction_penalty_pushes_running_bad_decode_deadline_out(self):
         now = {"t": 10.0}
@@ -824,18 +832,16 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                                 "req3 should have a finite anticipated prefill time, not inf")
 
     def test_isolation_retraction_resets_request_and_regains_prefill_slot(self):
-        """With max_kv_tokens=8, both req1 (2 tokens, 1 decode) and req2 (4 tokens, 1 decode)
-        are active in the isolated sim. KV = (2+1)+(4+1) = 8, and 8+2 active > 8, so retraction
-        occurs. After evicting the request with the longer running time, it should get a
-        RequestPrefillEvent (it was retracted and must re-prefill), while the remaining active
-        request should get a RequestDecodeEvent (it continues decoding).
+        """With max_kv_tokens=11, both requests fit together initially, but retraction fires
+        once req1 has accumulated enough decode steps.
 
-        The UserTimeline is built directly to ensure prefill_done=True for both requests,
-        reflecting that both were prefilled and decoded in the real world."""
-        now = {"t": 0.0}
-
-        def fake_time():
-            return now["t"]
+        req1 (2 tokens) arrives at t=0, req2 (4 tokens) at t=3. In isolation:
+          - req1 prefills at t=1 and runs alone until req2 arrives.
+          - At t=3 req2 is prefilled alongside req1.
+          - After several decode steps of req1, active_kv + 2 > 11 triggers retraction.
+            The longest-running (req1, higher sim_dc) is evicted → RequestPrefillEvent.
+          - req2 (lower sim_dc) survives → RequestDecodeEvent.
+        Both have real decode_count=1 in requests_real."""
 
         with patch.object(sim_mod, "isolated_prefill_time_estimation", return_value=1.0), \
              patch.object(sim_mod, "isolated_decode_time_estimation", return_value=1.0):
@@ -843,7 +849,7 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
             req1 = _mk_req("user_B", "rid_B1", 2)
             req2 = _mk_req("user_B", "rid_B2", 4)
 
-            # Build UserTimeline directly: both requests are active (prefill_done=True, decode_count=1)
+            # req1 arrives at t=0, req2 at t=3.
             t1 = TrackedRequest(
                 req=req1, arrival_timestamp=0.0,
                 timeline=RequestTimeline(history=[
@@ -852,13 +858,13 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                 ]),
             )
             t2 = TrackedRequest(
-                req=req2, arrival_timestamp=0.0,
+                req=req2, arrival_timestamp=3.0,
                 timeline=RequestTimeline(history=[
-                    RequestStartEvent(req_id=req2.rid, end_timestamp=0.0),
-                    RequestDecodeEvent(req_id=req2.rid, end_timestamp=2.0, completion_number=1),
+                    RequestStartEvent(req_id=req2.rid, end_timestamp=3.0),
+                    RequestDecodeEvent(req_id=req2.rid, end_timestamp=5.0, completion_number=1),
                 ]),
             )
-            ut = UserTimeline(uid="user_B", max_kv_tokens=8, fairinf_n=1)
+            ut = UserTimeline(uid="user_B", max_kv_tokens=11, fairinf_n=1)
             ut.request_timelines[req1.rid] = t1
             ut.request_timelines[req2.rid] = t2
             ut.requests_real[req1.rid] = RequestStatusReal(rid=req1.rid, prefill_done=True, decode_count=1)
@@ -869,7 +875,6 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
             req1_anticipated = ut.request_timelines[req1.rid].timeline.next_anticipated_event
             req2_anticipated = ut.request_timelines[req2.rid].timeline.next_anticipated_event
 
-            # One should be retracted (RequestPrefillEvent) and one should continue decoding (RequestDecodeEvent)
             anticipated_types = {
                 req1.rid: type(req1_anticipated).__name__,
                 req2.rid: type(req2_anticipated).__name__,
@@ -877,10 +882,16 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
             prefill_rids = [rid for rid, t in anticipated_types.items() if t == "RequestPrefillEvent"]
             decode_rids = [rid for rid, t in anticipated_types.items() if t == "RequestDecodeEvent"]
 
+            # req1 (longer-running) should be retracted → PrefillEvent.
+            # req2 (shorter sim_dc) should continue → DecodeEvent.
             self.assertEqual(len(prefill_rids), 1,
                              f"Exactly one request should be retracted to prefill; got {anticipated_types}")
             self.assertEqual(len(decode_rids), 1,
                              f"Exactly one request should continue decoding; got {anticipated_types}")
+            self.assertIn(req1.rid, prefill_rids,
+                          "req1 (longer-running) should be the retracted one")
+            self.assertIn(req2.rid, decode_rids,
+                          "req2 (lower sim_dc) should be the surviving decoder")
 
     def test_isolation_queuing_finite_prefill_time_behind_running_request(self):
         """req2 arrives at the same time as req1's isolated prefill completes (t=1).

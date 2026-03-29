@@ -497,21 +497,22 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
 
     def alloc_decode_output_slots(self, batch: "ScheduleBatch"):
         """
-        Allocate output slots for decoding. Going to call alloc_token_slots helper probably.
+        Allocate output slots for decoding.
+
+        check_decode_memory() runs before the prefill batch is merged, so a
+        large prefill in the same pass can consume the headroom it verified.
+        We therefore re-check here and use evict_delta_fair (fairness-aware
+        eviction of *unlocked* cache entries) to recover space rather than the
+        base alloc_token_slots loop, which only evicts via the non-fairness path
+        and silently does nothing when all nodes are locked.
         """
         if not self._has_delta_limit():
             return super().alloc_decode_output_slots(batch)
 
         bs = batch.batch_size()
-        eviction_necessary = batch.token_to_kv_pool.available_size() < bs
-        if eviction_necessary:
-            for _ in range(bs):
-                self.alloc_token_slots(
-                    batch.token_to_kv_pool,
-                    1,
-                    evict_only_force=True,
-                    requesting_users=None,
-                )
+        if batch.token_to_kv_pool.available_size() < bs:
+            assert self.tree_cache is not None
+            self.tree_cache.evict_delta_fair(bs, batch.token_to_kv_pool.free, None)
 
         out_cache_loc = batch.token_to_kv_pool.alloc(bs)
         if out_cache_loc is None:

@@ -1587,6 +1587,20 @@ class ModelTpServer:
 
         decoding_reqs = []
         if self.is_mixed_chunk and self.running_batch is not None:
+            # Re-check decode memory here: force_prefill_reservations may have
+            # consumed slots that check_decode_mem() verified available earlier
+            # in the decode loop (before this prefill pass ran).
+            if not self.running_batch.check_decode_mem():
+                mixed_retracted, new_token_ratio = self.running_batch.retract_decode()
+                self.new_token_ratio = new_token_ratio
+                if mixed_retracted:
+                    logger.info(
+                        "Mixed-chunk decode OOM after prefill reservations. "
+                        "#retracted_reqs: %s",
+                        len(mixed_retracted),
+                    )
+                    self.waiting_queue.extend(mixed_retracted)
+                    self.fairness_policy.note_retracted_reqs(mixed_retracted)
             self.running_batch.prepare_for_decode()
             batch.mix_with_running(self.running_batch)
             decoding_reqs = self.running_batch.reqs

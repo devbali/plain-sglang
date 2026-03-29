@@ -293,8 +293,18 @@ class UserTimeline:
             retracted = evicted_rid is not None
             if retracted:
                 current_time += RETRACTION_PENALTY_SECONDS
-                # Allow the evicted request to receive a fresh anticipated prefill event
-                anticipated_recorded.discard(evicted_rid)
+                # Allow the evicted request to receive a fresh anticipated prefill event —
+                # but only if its current anticipated event is a decode event (or absent).
+                # If it already has a prefill anticipated event, keep it: the request is
+                # still queued for prefill and doesn't need a new one.
+                tracked_evicted = self.request_timelines.get(evicted_rid)
+                existing_event = (
+                    tracked_evicted.timeline.next_anticipated_event
+                    if tracked_evicted is not None
+                    else None
+                )
+                if not isinstance(existing_event, RequestPrefillEvent):
+                    anticipated_recorded.discard(evicted_rid)
 
             if not active_rids:
                 return "retract", current_time
@@ -321,12 +331,17 @@ class UserTimeline:
                     status = self.requests_real.get(rid)
                     real_dc = status.decode_count if status else 0
                     if sim_decode_count[rid] > real_dc:
+                        # Isolation has overtaken (or reached parity with + 1 step) reality.
+                        # Record completion_number=sim_decode_count so events_after(real_dc)
+                        # returns this event (sim_decode_count > real_dc).
+                        # For an over-served request (real_dc >> sim_decode_count),
+                        # this condition never fires → no deadline generated.
                         tracked = self.request_timelines.get(rid)
                         if tracked is not None:
                             tracked.timeline.next_anticipated_event = RequestDecodeEvent(
                                 req_id=rid, duration=duration,
                                 end_timestamp=current_time,
-                                completion_number=real_dc + 1,
+                                completion_number=sim_decode_count[rid],
                             )
                             anticipated_recorded.add(rid)
             return "decode", current_time
@@ -341,50 +356,51 @@ class UserTimeline:
         until_timestamp: Optional[float] = None,
         timing_breakdown: Optional[Dict] = None,
     ) -> None:
-        """Run the isolated scheduler forward to set next_anticipated_event for each live request."""
+        """Run the isolated scheduler forward to set next_anticipated_event for each live request.
+
+        All requests — including currently-running ones — are placed in the waiting queue
+        sorted by arrival time. The isolated scheduler then simulates them from scratch,
+        assigning each request the decode count it would have earned in a fair isolated system.
+
+        For a running request with real decode_count=D, if the isolated sim only gives it
+        iso_decode_count=K where K <= D, then next_anticipated_event.completion_number = K+1.
+        Since K+1 <= D, events_after(real_event_at_D) returns nothing — the request has
+        consumed more service than isolation allows, so it doesn't drive a deadline.
+        """
         if not self.request_timelines:
             return
 
-        # Split into waiting (prefill not done) and active (prefill done) by real status
+        # All requests start as waiting — sorted by arrival time (start event timestamp).
+        # We ignore real prefill/decode status: the isolation sim determines what each
+        # request has earned, not what the real scheduler gave it.
         waiting_rids: List[str] = []
-        active_rids: List[str] = []
         sim_decode_count: Dict[str, int] = {}
+        active_rids: List[str] = []
 
         for rid, tracked in self.request_timelines.items():
-            status = self.requests_real.get(rid)
-            # Clear stale anticipated event
             tracked.timeline.next_anticipated_event = None
-            if status is not None and status.prefill_done:
-                active_rids.append(rid)
-                sim_decode_count[rid] = status.decode_count
-            else:
-                waiting_rids.append(rid)
+            waiting_rids.append(rid)
 
-        # Sort by arrival timestamp
-        waiting_rids.sort(key=lambda r: self.request_timelines[r].timeline.history[0].end_timestamp if self.request_timelines[r].timeline.history else 0.0)
-        active_rids.sort(key=lambda r: self.request_timelines[r].arrival_timestamp)
-
-        # Seed current_time from the last real committed event across active requests
-        current_time = 0.0
-        for rid in active_rids:
-            tracked = self.request_timelines[rid]
-            h = tracked.timeline.history
-            if h:
-                current_time = max(current_time, h[-1].end_timestamp)
-        if not active_rids and waiting_rids:
-            current_time = min(
-                (
-                    self.request_timelines[r].timeline.history[0].end_timestamp
-                    for r in waiting_rids
-                    if self.request_timelines[r].timeline.history
-                ),
-                default=0.0,
+        waiting_rids.sort(
+            key=lambda r: (
+                self.request_timelines[r].timeline.history[0].end_timestamp
+                if self.request_timelines[r].timeline.history
+                else 0.0
             )
+        )
+
+        # Seed current_time from the earliest arrival
+        if waiting_rids:
+            first_h = self.request_timelines[waiting_rids[0]].timeline.history
+            current_time = first_h[0].end_timestamp if first_h else 0.0
+        else:
+            current_time = 0.0
 
         anticipated_recorded: set = set()
-        all_rids = set(waiting_rids) | set(active_rids)
+        all_rids = set(waiting_rids)
 
-        for _ in range(200):
+        max_steps = max(200, len(all_rids) * 4)
+        for _ in range(max_steps):
             if anticipated_recorded >= all_rids:
                 break
             step_kind, current_time = self._advance_scheduler_step(
@@ -395,7 +411,7 @@ class UserTimeline:
             if until_timestamp is not None and current_time >= until_timestamp:
                 break
 
-        # Any waiting request still without an anticipated event is queued (blocked by active decodes).
+        # Any waiting request still without an anticipated event is queued behind active decodes.
         # Use inf so it sorts behind requests whose isolated prefill slot is known.
         for rid in waiting_rids:
             if rid not in anticipated_recorded:
@@ -497,7 +513,9 @@ class AlternateHistorySimulator:
                         RequestStartEvent(req_id=req.rid, end_timestamp=tracked.arrival_timestamp)
                     ]
                 else:
-                    prefill_done = any(isinstance(e, RequestPrefillEvent) for e in h)
+                    # A request with any decode history has necessarily been prefilled,
+                    # even if the prefill event was compacted away from the history.
+                    prefill_done = any(isinstance(e, (RequestPrefillEvent, RequestDecodeEvent)) for e in h)
                     decode_count = max(
                         (e.completion_number for e in h if isinstance(e, RequestDecodeEvent)),
                         default=0,
