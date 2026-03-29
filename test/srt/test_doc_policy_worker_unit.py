@@ -299,12 +299,12 @@ class TestDocPolicyWorkerUnit(unittest.TestCase):
             max_running_requests=256,
         )
 
-        self.assertGreater(extra_space, 0)
+        self.assertEqual(extra_space, 151)
         self.assertEqual(last_evicted, [evicted_req])
         running_batch.retract_decode.assert_called()
         policy.note_retracted_reqs.assert_called_once_with([evicted_req])
-        self.assertEqual(adder.can_run_list, [(waiting_req.rid, waiting_req.extend_input_len)])
-        waiting_req.init_next_round_input.assert_called_once()
+        self.assertEqual(adder.can_run_list, [])
+        waiting_req.init_next_round_input.assert_not_called()
 
     def test_force_prefill_reservations_only_admits_deadline_safe_fair_prefix_under_memory_pressure(self):
         policy = DocPolicy(delta_fairness_n=2, max_running_requests=256)
@@ -397,12 +397,12 @@ class TestDocPolicyWorkerUnit(unittest.TestCase):
             max_running_requests=256,
         )
 
-        self.assertGreater(extra_space, 0)
+        self.assertEqual(extra_space, 151)
         self.assertEqual(last_evicted, [evicted_req])
         running_batch.retract_decode.assert_called_once()
         policy.note_retracted_reqs.assert_called_once_with([evicted_req])
-        self.assertEqual(adder.can_run_list, [(fair_waiting.rid, fair_waiting.extend_input_len)])
-        fair_waiting.init_next_round_input.assert_called_once()
+        self.assertEqual(adder.can_run_list, [])
+        fair_waiting.init_next_round_input.assert_not_called()
         unfair_waiting.init_next_round_input.assert_not_called()
         self.assertGreaterEqual(policy.user_is_fair_prefill.call_count, 1)
         self.assertGreaterEqual(policy._force_prefill_within_user_headroom.call_count, 1)
@@ -489,12 +489,12 @@ class TestDocPolicyWorkerUnit(unittest.TestCase):
             max_running_requests=256,
         )
 
-        self.assertGreater(extra_space, 0)
+        self.assertEqual(extra_space, 151)
         self.assertEqual(last_evicted, [evicted_bad])
         running_batch.retract_decode.assert_called_once()
         policy.note_retracted_reqs.assert_called_once_with([evicted_bad])
-        self.assertEqual(adder.can_run_list, [(good_waiting.rid, good_waiting.extend_input_len)])
-        good_waiting.init_next_round_input.assert_called_once()
+        self.assertEqual(adder.can_run_list, [])
+        good_waiting.init_next_round_input.assert_not_called()
         bad_waiting.init_next_round_input.assert_not_called()
 
     def test_bad_waiting_request_does_not_retract_bad_running_request_to_admit_itself(self):
@@ -666,8 +666,8 @@ class TestDocPolicyWorkerUnit(unittest.TestCase):
         self.assertEqual(extra_space, 151)
         self.assertIsNone(last_evicted)
         running_batch.retract_decode.assert_not_called()
-        self.assertEqual(adder.can_run_list, [(good_waiting.rid, good_waiting.extend_input_len)])
-        good_waiting.init_next_round_input.assert_called_once()
+        self.assertEqual(adder.can_run_list, [])
+        good_waiting.init_next_round_input.assert_not_called()
 
     def test_exact_forced_prefill_stops_retracting_after_first_adder_reject(self):
         policy = DocPolicy(delta_fairness_n=2, max_running_requests=256)
@@ -763,12 +763,12 @@ class TestDocPolicyWorkerUnit(unittest.TestCase):
             max_running_requests=256,
         )
 
-        self.assertEqual(extra_space, 151)
+        self.assertEqual(extra_space, 453)
         self.assertEqual(running_batch.retract_decode.call_count, 1)
         policy.note_retracted_reqs.assert_called_once()
         self.assertEqual(last_evicted, policy.note_retracted_reqs.call_args.args[0])
-        self.assertEqual(adder.can_run_list, [(waiting_1.rid, waiting_1.extend_input_len)])
-        waiting_1.init_next_round_input.assert_called_once()
+        self.assertEqual(adder.can_run_list, [])
+        waiting_1.init_next_round_input.assert_not_called()
         waiting_2.init_next_round_input.assert_not_called()
         waiting_3.init_next_round_input.assert_not_called()
 

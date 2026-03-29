@@ -58,13 +58,14 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_config import ModelConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+DOC_POLICY_SNAPSHOT_DUMP_ENABLED = False
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.delta_fairness.time_estimation import pooled_prefill_time_estimation
 from sglang.srt.delta_fairness.no_fairness_policy import NoFairnessPolicy
 from sglang.srt.delta_fairness.static_fairness_policy import StaticFairnessPolicy
 from sglang.srt.delta_fairness.delta_fairness_policy import DeltaFairnessPolicy
-from sglang.srt.delta_fairness.earliest_deadline_first import EarliestDeltaFirst
 from sglang.srt.delta_fairness.doc_policy import DocPolicy
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
@@ -347,16 +348,10 @@ class ModelTpServer:
             )
 
         if self.delta_fairness_n:
-            if server_args.delta_fairness_policy == "earliest_deadline_first":
-                self.fairness_policy = EarliestDeltaFirst(
-                    delta_fairness_n=self.delta_fairness_n,
-                    max_running_requests=self.max_running_requests,
-                    delta_fairness_quanta_us=self.delta_fairness_quanta_us,
-                    delta_fairness_pooled_quanta_us=self.delta_fairness_pooled_quanta_us,
-                    delta_fairness_exclusive_quanta_us=self.delta_fairness_exclusive_quanta_us,
-                    max_prefill_tokens=self.max_prefill_tokens,
-                )
-            elif server_args.delta_fairness_policy == "doc_policy":
+            if server_args.delta_fairness_policy in (
+                "earliest_deadline_first",
+                "doc_policy",
+            ):
                 self.fairness_policy = DocPolicy(
                     delta_fairness_n=self.delta_fairness_n,
                     max_running_requests=self.max_running_requests,
@@ -422,15 +417,17 @@ class ModelTpServer:
             "current_running_reqs,current_num_tokens,current_queue_reqs,"
             "gap_total_ms,decision_overhead_ms,prepare_async_wait_ms,prepare_mutation_queue_backpressure_wait_ms,prepare_task_queue_backpressure_wait_ms,prepare_mutation_queue_drain_wait_ms,prepare_duplicate_state_wait_ms,force_prefill_check_ms,force_decode_check_ms,"
             "get_new_prefill_batch_ms,calc_priority_ms,prefill_adder_init_ms,"
-            "remove_running_tokens_ms,fairness_start_of_pass_ms,inflight_ms,"
+            "remove_running_tokens_ms,doc_hot_path_refresh_ms,fairness_start_of_pass_ms,inflight_ms,"
             "force_prefill_reservations_ms,waiting_queue_prefills_ms,build_batch_ms,"
             "controller_send_queue_ms,controller_recv_requests_ms,request_handling_ms,"
             "doc_sync_live_user_tracking_ms,doc_rebuild_from_real_state_ms,"
             "doc_build_deadline_candidates_ms,doc_sort_waiting_prefills_ms,"
             "doc_safe_prefix_scan_ms,doc_build_pass_state_ms,doc_start_of_pass_total_ms\n",
         )
-        self._doc_policy_snapshot_logger = AsyncCSVLogger(
-            "doc_policy_pass_snapshots.jsonl", ""
+        self._doc_policy_snapshot_logger = (
+            AsyncCSVLogger("doc_policy_pass_snapshots.jsonl", "")
+            if DOC_POLICY_SNAPSHOT_DUMP_ENABLED
+            else None
         )
         self._scheduler_pass_csv_logger = AsyncCSVLogger(
             "scheduler_passes.csv",
@@ -439,13 +436,14 @@ class ModelTpServer:
             "get_new_prefill_reason,"
             "decision_force_prefill_check_ms,decision_force_decode_check_ms,decision_get_new_prefill_batch_ms,"
             "prefill_calc_priority_ms,prefill_adder_init_ms,prefill_remove_running_tokens_ms,"
-            "prefill_fairness_start_of_pass_ms,prefill_inflight_ms,prefill_force_prefill_reservations_ms,"
+            "prefill_doc_hot_path_refresh_ms,prefill_fairness_start_of_pass_ms,prefill_inflight_ms,prefill_force_prefill_reservations_ms,"
             "prefill_waiting_queue_prefills_ms,prefill_build_batch_ms,"
             "doc_forced_prefill_count,doc_safe_waiting_count,doc_deadline_queue_len,"
             "doc_has_decode_deadline,doc_max_safe_prefill_tokens,doc_waiting_deadline_count,"
             "doc_earliest_decode_start_deadline,doc_safe_prefix_now,doc_decode_deadline_slack_ms,"
             "doc_earliest_decode_rid,doc_earliest_decode_uid,doc_earliest_decode_completion_number,"
             "doc_earliest_decode_deadline,doc_earliest_decode_event_end_timestamp,"
+            "doc_pass_state_source,doc_current_pass_id,doc_last_consumed_prepare_snapshot_seq,"
             "doc_first_waiting_rid,doc_first_waiting_prompt_tokens,doc_first_candidate_prefill_ms,doc_first_candidate_residual_slack_ms\n",
         )
         self._doc_policy_snapshot_threshold_ms = float(
@@ -554,13 +552,22 @@ class ModelTpServer:
                     delta_fairness_deltas_microseconds=self.delta_fairness_deltas_microseconds,
                 )
         
+        doc_pass_state_ready = False
+        if isinstance(self.fairness_policy, DocPolicy):
+            self.fairness_policy.start_of_pass(
+                self.running_batch,
+                self.waiting_queue,
+                new_token_ratio=self.new_token_ratio,
+                max_running_requests=self.max_running_requests,
+            )
+            prefill_telemetry["doc_hot_path_refresh_ms"] = decision_timer.mark(
+                "doc_hot_path_refresh_ms"
+            )
+            doc_pass_state_ready = True
+
         if self.fairness_policy.fairinf_prioritize_force_prefill():
             # Force prefill is checked first.
             if isinstance(self.fairness_policy, DocPolicy):
-                self.fairness_policy.refresh_decode_hot_path_state(
-                    self.waiting_queue,
-                    self.running_batch,
-                )
                 force_prefill = bool(self.fairness_policy._forced_prefill_rids)
                 max_prefill_size = self.fairness_policy._max_safe_prefill_tokens
                 decision_timer.parts["force_prefill_check_ms"] = 0.0
@@ -576,7 +583,9 @@ class ModelTpServer:
                 None
                 if force_decode
                 else self.get_new_prefill_batch(
-                    max_prefill_size, telemetry=prefill_telemetry
+                    max_prefill_size,
+                    telemetry=prefill_telemetry,
+                    pass_state_ready=doc_pass_state_ready,
                 )
             )
             decision_timer.mark("get_new_prefill_batch_ms")
@@ -593,7 +602,9 @@ class ModelTpServer:
                     None
                     if force_prefill
                     else self.get_new_prefill_batch(
-                        max_prefill_size, telemetry=prefill_telemetry
+                        max_prefill_size,
+                        telemetry=prefill_telemetry,
+                        pass_state_ready=doc_pass_state_ready,
                     )
                 )
                 decision_timer.mark("get_new_prefill_batch_ms")
@@ -604,6 +615,8 @@ class ModelTpServer:
             decision_timer.parts["force_decode_check_ms"] = 0.0
         if "get_new_prefill_batch_ms" not in decision_timer.parts:
             decision_timer.parts["get_new_prefill_batch_ms"] = 0.0
+        if "doc_hot_path_refresh_ms" not in prefill_telemetry:
+            prefill_telemetry["doc_hot_path_refresh_ms"] = 0.0
         self._log_scheduler_pass(
             force_prefill=force_prefill,
             force_decode=force_decode,
@@ -876,6 +889,7 @@ class ModelTpServer:
             f"{prefill_parts.get('calc_priority_ms', 0.0)},"
             f"{prefill_parts.get('prefill_adder_init_ms', 0.0)},"
             f"{prefill_parts.get('remove_running_tokens_ms', 0.0)},"
+            f"{prefill_parts.get('doc_hot_path_refresh_ms', 0.0)},"
             f"{prefill_parts.get('fairness_start_of_pass_ms', 0.0)},"
             f"{prefill_parts.get('inflight_ms', 0.0)},"
             f"{prefill_parts.get('force_prefill_reservations_ms', 0.0)},"
@@ -934,6 +948,9 @@ class ModelTpServer:
         doc_earliest_decode_completion_number = ""
         doc_earliest_decode_deadline = ""
         doc_earliest_decode_event_end_timestamp = ""
+        doc_pass_state_source = ""
+        doc_current_pass_id = ""
+        doc_last_consumed_prepare_snapshot_seq = ""
         doc_first_waiting_rid = ""
         doc_first_waiting_prompt_tokens = ""
         doc_first_candidate_prefill_ms = ""
@@ -1036,6 +1053,15 @@ class ModelTpServer:
             doc_first_candidate_residual_slack_ms = (
                 "" if first_residual is None else float(first_residual)
             )
+            doc_pass_state_source = getattr(
+                self.fairness_policy, "_last_pass_state_source", ""
+            ) or ""
+            doc_current_pass_id = getattr(
+                self.fairness_policy, "_current_pass_id", ""
+            )
+            doc_last_consumed_prepare_snapshot_seq = getattr(
+                self.fairness_policy, "_last_consumed_prepare_snapshot_seq", ""
+            )
 
         self._scheduler_pass_csv_logger.log(
             f"{time.time()},"
@@ -1052,6 +1078,7 @@ class ModelTpServer:
             f"{prefill_parts.get('calc_priority_ms', 0.0)},"
             f"{prefill_parts.get('prefill_adder_init_ms', 0.0)},"
             f"{prefill_parts.get('remove_running_tokens_ms', 0.0)},"
+            f"{prefill_parts.get('doc_hot_path_refresh_ms', 0.0)},"
             f"{prefill_parts.get('fairness_start_of_pass_ms', 0.0)},"
             f"{prefill_parts.get('inflight_ms', 0.0)},"
             f"{prefill_parts.get('force_prefill_reservations_ms', 0.0)},"
@@ -1062,6 +1089,7 @@ class ModelTpServer:
             f"{doc_earliest_decode_start_deadline},{doc_safe_prefix_now},{doc_decode_deadline_slack_ms},"
             f"{doc_earliest_decode_rid},{doc_earliest_decode_uid},{doc_earliest_decode_completion_number},"
             f"{doc_earliest_decode_deadline},{doc_earliest_decode_event_end_timestamp},"
+            f"{doc_pass_state_source},{doc_current_pass_id},{doc_last_consumed_prepare_snapshot_seq},"
             f"{doc_first_waiting_rid},{doc_first_waiting_prompt_tokens},{doc_first_candidate_prefill_ms},{doc_first_candidate_residual_slack_ms}\n"
         )
 
@@ -1127,6 +1155,8 @@ class ModelTpServer:
         fairness_start_of_pass_ms: float,
         pre_pass_snapshot: Optional[Dict[str, Any]],
     ) -> None:
+        if not DOC_POLICY_SNAPSHOT_DUMP_ENABLED:
+            return
         if self.tp_rank != 0:
             return
         if not isinstance(self.fairness_policy, DocPolicy):
@@ -1142,6 +1172,7 @@ class ModelTpServer:
             "pre": pre_pass_snapshot,
             "post": self._capture_doc_policy_pass_snapshot_state(),
         }
+        assert self._doc_policy_snapshot_logger is not None
         self._doc_policy_snapshot_logger.log(json.dumps(snapshot) + "\n")
         self._doc_policy_snapshot_count += 1
 
@@ -1245,6 +1276,7 @@ class ModelTpServer:
         max_prefill_token_size: Optional[int] = None,
         *,
         telemetry: Optional[Dict[str, float]] = None,
+        pass_state_ready: bool = False,
     ) -> Optional[ScheduleBatch]:
         step_timer = StepTimer()
         telemetry = telemetry if telemetry is not None else {}
@@ -1311,17 +1343,20 @@ class ModelTpServer:
             self.fairness_policy._prefill_no_retraction_token_cap = int(
                 max(0, adder.rem_total_tokens)
             )
-        self.fairness_policy.start_of_pass(
-            self.running_batch,
-            self.waiting_queue,
-            new_token_ratio=self.new_token_ratio,
-            max_running_requests=self.max_running_requests,
-        )
+        if not pass_state_ready:
+            self.fairness_policy.start_of_pass(
+                self.running_batch,
+                self.waiting_queue,
+                new_token_ratio=self.new_token_ratio,
+                max_running_requests=self.max_running_requests,
+            )
+            telemetry["fairness_start_of_pass_ms"] = step_timer.mark(
+                "fairness_start_of_pass_ms"
+            )
+        else:
+            telemetry["fairness_start_of_pass_ms"] = 0.0
         if isinstance(self.fairness_policy, DocPolicy):
             self.fairness_policy._prefill_no_retraction_token_cap = None
-        telemetry["fairness_start_of_pass_ms"] = step_timer.mark(
-            "fairness_start_of_pass_ms"
-        )
         if isinstance(self.fairness_policy, DocPolicy):
             telemetry["doc_sync_live_user_tracking_ms"] = (
                 self.fairness_policy._last_pass_breakdown_ms.get(
@@ -1564,7 +1599,6 @@ class ModelTpServer:
                 sample_output, logits_output = self.model_runner.forward(
                     batch, ForwardMode.EXTEND
                 )
-                model_forward_end.record()
                 self.fairness_policy.prepare_during_gpu_execution(
                     event_type="prefill",
                     running_batch=self.running_batch,
@@ -1573,6 +1607,7 @@ class ModelTpServer:
                     selected_rids=None,
                     new_token_ratio=self.new_token_ratio,
                 )
+                model_forward_end.record()
                 torch.cuda.synchronize()
                 self.last_model_forward_elapsed_ms = model_forward_start.elapsed_time(
                     model_forward_end

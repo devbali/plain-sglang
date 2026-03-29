@@ -487,6 +487,76 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                 self.assertIn(req2.rid, waiting_deadlines)
                 self.assertGreaterEqual(waiting_deadlines[req2.rid], 100.0)
 
+    def test_waiting_request_deadline_is_delayed_by_existing_running_decode_queue(self):
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(sim_mod.time, "time", side_effect=fake_time):
+            with patch.object(
+                sim_mod, "isolated_prefill_time_estimation", return_value=2.0
+            ), patch.object(
+                sim_mod, "isolated_decode_time_estimation", return_value=3.0
+            ):
+                simulator = AlternateHistorySimulator(
+                    max_kv_tokens_per_user=100,
+                    fairinf_n=2,
+                )
+
+                req1 = _mk_req("user_19", "rid_running", 4)
+                req2 = _mk_req("user_19", "rid_waiting", 4)
+
+                simulator.process_new_request(req1)
+                now["t"] = 11.0
+                simulator.finished_prefill(SimpleNamespace(reqs=[req1]))
+
+                req1.output_ids = [1, 2, 3, 4, 5]
+                now["t"] = 12.0
+                simulator.finished_decode(SimpleNamespace(reqs=[req1]), decode_rounds=5)
+
+                now["t"] = 13.0
+                simulator.process_new_request(req2)
+
+                now["t"] = 100.0
+                simulator.start_of_pass(
+                    SimpleNamespace(reqs=[req1]),
+                    [req2],
+                )
+
+                candidates, waiting_deadlines, _ = simulator.build_deadline_candidates(
+                    [req2],
+                    SimpleNamespace(reqs=[req1]),
+                    req_is_fair_prefill=lambda req, rb: True,
+                    req_is_fair_decode=lambda req, rb: True,
+                    event_delta_seconds=lambda tracked, event: 0.0,
+                    pooled_prefill_estimate_seconds=lambda req: 2.0,
+                    pooled_decode_estimate_seconds=lambda req, rb: 3.0,
+                    include_ordered_waiting_queue=True,
+                )
+
+                self.assertEqual(waiting_deadlines[req2.rid], 27.0)
+
+                prefill_candidates = [
+                    candidate
+                    for candidate in candidates
+                    if candidate.event_type == "prefill"
+                ]
+                decode_candidates = [
+                    candidate
+                    for candidate in candidates
+                    if candidate.event_type == "decode"
+                ]
+
+                self.assertEqual(
+                    [(candidate.req.rid, candidate.event.end_timestamp) for candidate in prefill_candidates],
+                    [(req2.rid, 29.0)],
+                )
+                self.assertEqual(
+                    [(candidate.req.rid, candidate.event.completion_number, candidate.event.end_timestamp) for candidate in decode_candidates],
+                    [(req1.rid, 6, 32.0)],
+                )
+
     def test_retraction_penalty_pushes_running_bad_decode_deadline_out(self):
         now = {"t": 10.0}
 

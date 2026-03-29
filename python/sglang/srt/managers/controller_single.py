@@ -60,6 +60,7 @@ class ControllerSingle:
 
         if not self.is_dp_worker:
             self.recv_from_tokenizer = context.socket(zmq.PULL)
+            self.recv_from_tokenizer.setsockopt(zmq.LINGER, 0)
             self.recv_from_tokenizer.bind(
                 f"tcp://127.0.0.1:{port_args.controller_port}"
             )
@@ -99,6 +100,7 @@ class ControllerSingle:
     def _send_loop(self):
         context = zmq.Context(1)
         send_to_detokenizer = context.socket(zmq.PUSH)
+        send_to_detokenizer.setsockopt(zmq.LINGER, 0)
         send_to_detokenizer.connect(
             f"tcp://127.0.0.1:{self.detokenizer_port}"
         )

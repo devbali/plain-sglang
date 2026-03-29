@@ -84,9 +84,11 @@ class TokenizerManager:
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = context.socket(zmq.PULL)
+        self.recv_from_detokenizer.setsockopt(zmq.LINGER, 0)
         self.recv_from_detokenizer.bind(f"tcp://127.0.0.1:{port_args.tokenizer_port}")
 
         self.send_to_controller = context.socket(zmq.PUSH)
+        self.send_to_controller.setsockopt(zmq.LINGER, 0)
         self.send_to_controller.connect(f"tcp://127.0.0.1:{port_args.controller_port}")
 
         # Read model args

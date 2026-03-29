@@ -3,6 +3,8 @@ from __future__ import annotations
 """Independent isolated-setting simulator for the Design.md policy."""
 
 import time
+from copy import deepcopy
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -17,6 +19,9 @@ from .time_estimation import (
     isolated_decode_time_estimation,
     isolated_prefill_time_estimation,
 )
+
+logger = logging.getLogger(__name__)
+
 
 RETRACTION_PENALTY_SECONDS = 0.030
 
@@ -229,6 +234,37 @@ class _SimRequestState:
 
 
 @dataclass
+class _FinishingRequest:
+    """A request that has left `request_timelines` but still occupies KV memory
+    while it generates its remaining output tokens in isolation.
+
+    prompt_tokens            — number of prompt tokens (fixed)
+    simulated_decode_count   — how many isolated decode steps have been ticked so far
+    total_completion_tokens  — the real final output length; we stop ticking here
+    configured_max_new_tokens — used for remaining-decode reservation headroom
+    """
+    prompt_tokens: int
+    simulated_decode_count: int
+    total_completion_tokens: int
+    configured_max_new_tokens: int
+
+    @property
+    def current_token_count(self) -> int:
+        return self.prompt_tokens + max(1, self.simulated_decode_count)
+
+    @property
+    def remaining_decodes(self) -> int:
+        return max(0, self.total_completion_tokens - self.simulated_decode_count)
+
+    @property
+    def remaining_max_new_tokens(self) -> int:
+        return max(0, self.configured_max_new_tokens - self.simulated_decode_count)
+
+    def is_done(self) -> bool:
+        return self.simulated_decode_count >= self.total_completion_tokens
+
+
+@dataclass
 class UserTimeline:
     uid: str
     max_kv_tokens: Optional[int] = None
@@ -237,6 +273,7 @@ class UserTimeline:
     anticipated_future_events: List[UserEvent] = field(default_factory=list)
     request_timelines: Dict[str, TrackedRequest] = field(default_factory=dict)
     finished_request_timelines: Dict[str, TrackedRequest] = field(default_factory=dict)
+    finishing_requests: List["_FinishingRequest"] = field(default_factory=list)
     min_new_token_ratio: float = 0.0
     cached_live_rids: Tuple[str, ...] = field(default_factory=tuple)
     cached_history_end_timestamp: Optional[float] = None
@@ -247,6 +284,28 @@ class UserTimeline:
         tracked = self.request_timelines.pop(req_id, None)
         if tracked is not None:
             self.finished_request_timelines[req_id] = tracked
+
+    def record_finishing_request(
+        self,
+        *,
+        prompt_tokens: int,
+        simulated_decode_count: int,
+        total_completion_tokens: int,
+        configured_max_new_tokens: int,
+    ) -> None:
+        """Call when a request leaves request_timelines so its KV footprint is
+        preserved in the isolated scheduler simulation until its real output is
+        fully generated."""
+        if total_completion_tokens <= 0:
+            return
+        finishing = _FinishingRequest(
+            prompt_tokens=prompt_tokens,
+            simulated_decode_count=simulated_decode_count,
+            total_completion_tokens=total_completion_tokens,
+            configured_max_new_tokens=configured_max_new_tokens,
+        )
+        if not finishing.is_done():
+            self.finishing_requests.append(finishing)
 
     def _persistent_request_state(self, tracked: TrackedRequest) -> Tuple[bool, int]:
         return tracked.persistent_prefill_done, tracked.persistent_decode_count
@@ -368,15 +427,17 @@ class UserTimeline:
         )
 
     def _current_active_kv_tokens(self, active_states: List[_SimRequestState]) -> int:
-        return sum(state.current_token_count for state in active_states)
+        live = sum(state.current_token_count for state in active_states)
+        finishing = sum(fr.current_token_count for fr in self.finishing_requests)
+        return live + finishing
 
     def _remaining_decode_reservation_tokens(
         self, active_states: List[_SimRequestState]
     ) -> int:
         ratio = max(0.0, float(self.min_new_token_ratio))
-        return int(
-            sum(state.remaining_max_new_tokens() * ratio for state in active_states)
-        )
+        live = sum(state.remaining_max_new_tokens() * ratio for state in active_states)
+        finishing = sum(fr.remaining_max_new_tokens * ratio for fr in self.finishing_requests)
+        return int(live + finishing)
 
     def _build_prefill_batch(
         self,
@@ -425,8 +486,10 @@ class UserTimeline:
     ) -> float:
         if future_history:
             return future_history[-1].end_timestamp
-        if self.history:
-            return self.history[-1].end_timestamp
+        # Use per-request persistent event times as the base rather than
+        # UserTimeline.history[-1], which accumulates events from all past
+        # (now-finished) requests and can run far ahead of the current live
+        # requests' real arrival times.
         persistent_event_times = [
             state.tracked.most_recent_event().end_timestamp
             for state in waiting_states + active_states
@@ -546,25 +609,28 @@ class UserTimeline:
             del waiting_states[: len(batch)]
             return "prefill"
 
-        if active_states:
-            can_decode, retracted_any = self._isolated_retract_decode(
-                waiting_states,
-                active_states,
-                extra_decode_tokens=0,
-            )
-            if not can_decode:
-                return None
-            if not active_states:
-                return "retract"
+        if active_states or self.finishing_requests:
+            retracted_any = False
+            if active_states:
+                can_decode, retracted_any = self._isolated_retract_decode(
+                    waiting_states,
+                    active_states,
+                    extra_decode_tokens=0,
+                )
+                if not can_decode:
+                    return None
 
-            token_counts = [
+            all_token_counts = [
                 state.current_token_count
                 for state in active_states
-            ]
+            ] + [fr.current_token_count for fr in self.finishing_requests]
+            if not all_token_counts:
+                # active_states was retracted to empty and no ghosts remain
+                return "retract"
             duration = isolated_decode_time_estimation(
-                sum(token_counts),
-                max(token_counts),
-                len(token_counts),
+                sum(all_token_counts),
+                max(all_token_counts),
+                len(all_token_counts),
                 self.fairinf_n,
             )
             if retracted_any:
@@ -589,7 +655,7 @@ class UserTimeline:
                 for state in active_states
                 if not state.anticipated_recorded
             ]
-            if not milestone_rounds:
+            if not milestone_rounds and not self.finishing_requests:
                 if next_arrival is not None:
                     future_history.append(
                         UserDecodeEvent(duration=0.0, end_timestamp=next_arrival)
@@ -619,6 +685,13 @@ class UserTimeline:
                 self.history.append(user_event)
             else:
                 future_history.append(user_event)
+            # Advance finishing requests and prune those that have completed
+            # their real output length.
+            for fr in self.finishing_requests:
+                fr.simulated_decode_count += rounds
+            self.finishing_requests = [
+                fr for fr in self.finishing_requests if not fr.is_done()
+            ]
             for state in active_states:
                 prev_decode_count = state.simulated_decode_count
                 state.advance_simulated_decode_count(rounds)
@@ -652,8 +725,16 @@ class UserTimeline:
                     and prev_decode_count < anticipated_completion
                     <= state.simulated_decode_count
                 ):
-                    anticipated_round = anticipated_completion - prev_decode_count
-                    anticipated_ts = chunk_start + anticipated_round * duration
+                    # Anchor the anticipated timestamp to the request's own
+                    # last isolated event, not to the shared user-timeline
+                    # clock (which may be far ahead due to other requests).
+                    req_last_event = state.tracked.most_recent_event()
+                    req_base_ts = (
+                        req_last_event.end_timestamp
+                        if req_last_event is not None
+                        else state.arrival_timestamp
+                    )
+                    anticipated_ts = req_base_ts + duration
                     anticipated_event = RequestDecodeEvent(
                         req_id=state.tracked.req.rid,
                         duration=duration,
@@ -792,11 +873,12 @@ class UserTimeline:
                     1,
                     self.fairinf_n,
                 )
+                prefill_start = state.arrival_timestamp
                 timeline.anticipated_future_events = [
                     RequestPrefillEvent(
                         req_id=req.rid,
                         duration=prefill_duration,
-                        end_timestamp=time.time() + prefill_duration,
+                        end_timestamp=prefill_start + prefill_duration,
                     )
                 ]
                 state.anticipated_recorded = True
@@ -822,6 +904,18 @@ class UserTimeline:
         active_states: List[_SimRequestState] = [
             state for state in live_states if state.prefill_done
         ]
+        # Save a snapshot of finishing_requests before the loop so each rebuild
+        # starts from the real persisted state, not from wherever a previous
+        # loop left the list.
+        saved_finishing = [
+            _FinishingRequest(
+                prompt_tokens=fr.prompt_tokens,
+                simulated_decode_count=fr.simulated_decode_count,
+                total_completion_tokens=fr.total_completion_tokens,
+                configured_max_new_tokens=fr.configured_max_new_tokens,
+            )
+            for fr in self.finishing_requests
+        ]
         scheduler_step_count = 0
         prefill_step_count = 0
         decode_step_count = 0
@@ -839,6 +933,37 @@ class UserTimeline:
                 prefill_step_count += 1
             elif step_kind == "decode":
                 decode_step_count += 1
+
+        # Any waiting state the loop didn't reach (e.g. arrival is in the
+        # future relative to current isolated time, or memory was always full)
+        # gets an anticipated prefill anchored to its own arrival timestamp so
+        # it always has a deadline candidate for EDF ordering.
+        for state in waiting_states:
+            if not state.anticipated_recorded and not state.realized_prefill_done:
+                req = state.tracked.req
+                context_tokens = (
+                    len(req.fill_ids)
+                    if req.fill_ids is not None
+                    else len(req.origin_input_ids) + len(req.output_ids)
+                )
+                prefill_duration = isolated_prefill_time_estimation(
+                    context_tokens,
+                    context_tokens,
+                    1,
+                    self.fairinf_n,
+                )
+                state.tracked.alternate_history_timeline.anticipated_future_events = [
+                    RequestPrefillEvent(
+                        req_id=req.rid,
+                        duration=prefill_duration,
+                        end_timestamp=state.arrival_timestamp + prefill_duration,
+                    )
+                ]
+                state.anticipated_recorded = True
+
+        # Restore finishing_requests to the pre-loop snapshot so the next
+        # rebuild starts from the same real persisted state.
+        self.finishing_requests = saved_finishing
         self.anticipated_future_events = future_history
         self.cached_live_rids = live_rids
         self.cached_history_end_timestamp = self._current_history_time(
@@ -894,6 +1019,12 @@ class AlternateHistorySimulator:
         self.users: Dict[str, UserTimeline] = {}
         self.requests: Dict[str, TrackedRequest] = {}
         self.most_recent_event_real: Dict[str, RequestEvent] = {}
+
+    # def clone(self, *, enable_timeline_logging: Optional[bool] = None) -> "AlternateHistorySimulator":
+    #     cloned = deepcopy(self)
+    #     if enable_timeline_logging is not None:
+    #         cloned.enable_timeline_logging = enable_timeline_logging
+    #     return cloned
 
     def _make_user_timeline(self, uid: str) -> UserTimeline:
         return UserTimeline(
@@ -986,7 +1117,7 @@ class AlternateHistorySimulator:
             )
         ]
 
-    def sync_live_user_tracking(
+    def get_live_users(
         self,
         running_batch: Optional[ScheduleBatch],
         waiting_queue: List[Req],
@@ -1021,9 +1152,14 @@ class AlternateHistorySimulator:
             for rid in list(user_timeline.request_timelines.keys()):
                 if rid in live_rids:
                     continue
+                # Do NOT clear most_recent_event_real here — the request may
+                # reappear in a future live snapshot (e.g. the waiting queue was
+                # temporarily observed without it).  Clearing it would make
+                # build_deadline_candidates skip the request on the next pass,
+                # causing large gaps in scheduled prefills.
+                # most_recent_event_real is only cleared by mark_request_finished.
                 user_timeline.request_timelines.pop(rid, None)
                 self.requests.pop(rid, None)
-                self.most_recent_event_real.pop(rid, None)
 
         for uid in list(self.users.keys()):
             user_timeline = self.users[uid]
@@ -1033,87 +1169,88 @@ class AlternateHistorySimulator:
             for rid, tracked in list(self.requests.items()):
                 if tracked.req.uid == uid:
                     self.requests.pop(rid, None)
-                    self.most_recent_event_real.pop(rid, None)
 
         return live_user_ids
 
-    def start_of_pass(
-        self,
-        running_batch: Optional[ScheduleBatch],
-        waiting_queue: List[Req],
-        *,
-        deltas_in_microseconds: Optional[Dict[str, int]] = None,
-        timing_breakdown: Optional[Dict[str, float]] = None,
-    ) -> List[str]:
-        pass_start = time.perf_counter()
-        live_user_ids = self.sync_live_user_tracking(
-            running_batch,
-            waiting_queue,
-            deltas_in_microseconds=deltas_in_microseconds,
-        )
-        after_sync = time.perf_counter()
-        self.rebuild_all_tracked_requests(
-            live_user_ids,
-            timing_breakdown=timing_breakdown,
-        )
-        after_rebuild = time.perf_counter()
-        if timing_breakdown is not None:
-            timing_breakdown["sync_live_user_tracking_ms"] = (
-                after_sync - pass_start
-            ) * 1000.0
-            timing_breakdown["rebuild_from_real_state_ms"] = (
-                after_rebuild - after_sync
-            ) * 1000.0
-            timing_breakdown["simulator_start_of_pass_ms"] = (
-                after_rebuild - pass_start
-            ) * 1000.0
-        return live_user_ids
+    # def start_of_pass(
+    #     self,
+    #     running_batch: Optional[ScheduleBatch],
+    #     waiting_queue: List[Req],
+    #     *,
+    #     deltas_in_microseconds: Optional[Dict[str, int]] = None,
+    #     timing_breakdown: Optional[Dict[str, float]] = None,
+    # ) -> List[str]:
+    #     pass_start = time.perf_counter()
+    #     live_user_ids = self.get_live_users(
+    #         running_batch,
+    #         waiting_queue,
+    #         deltas_in_microseconds=deltas_in_microseconds,
+    #     )
+    #     after_sync = time.perf_counter()
+    #     self.rebuild_all_tracked_requests(
+    #         live_user_ids,
+    #         timing_breakdown=timing_breakdown,
+    #     )
+    #     after_rebuild = time.perf_counter()
+    #     if timing_breakdown is not None:
+    #         timing_breakdown["sync_live_user_tracking_ms"] = (
+    #             after_sync - pass_start
+    #         ) * 1000.0
+    #         timing_breakdown["rebuild_from_real_state_ms"] = (
+    #             after_rebuild - after_sync
+    #         ) * 1000.0
+    #         timing_breakdown["simulator_start_of_pass_ms"] = (
+    #             after_rebuild - pass_start
+    #         ) * 1000.0
+    #     return live_user_ids
 
-    def rebuild_all_tracked_requests(
-        self,
-        user_ids: Optional[List[str]] = None,
-        *,
-        timing_breakdown: Optional[Dict[str, float]] = None,
-    ) -> None:
-        rebuild_live_states_ms = 0.0
-        rebuild_state_setup_ms = 0.0
-        rebuild_scheduler_loop_ms = 0.0
-        rebuild_scheduler_step_count = 0
-        rebuild_prefill_step_count = 0
-        rebuild_decode_step_count = 0
-        for uid in (user_ids if user_ids is not None else list(self.users.keys())):
-            user_timeline = self.users.get(uid)
-            if user_timeline is not None:
-                rebuild_breakdown: Dict[str, float] = {}
-                user_timeline.rebuild_from_real_state(
-                    self.most_recent_event_real,
-                    timing_breakdown=rebuild_breakdown,
-                )
-                rebuild_live_states_ms += rebuild_breakdown.get(
-                    "rebuild_live_states_ms", 0.0
-                )
-                rebuild_state_setup_ms += rebuild_breakdown.get(
-                    "rebuild_state_setup_ms", 0.0
-                )
-                rebuild_scheduler_loop_ms += rebuild_breakdown.get(
-                    "rebuild_scheduler_loop_ms", 0.0
-                )
-                rebuild_scheduler_step_count += int(
-                    rebuild_breakdown.get("rebuild_scheduler_step_count", 0)
-                )
-                rebuild_prefill_step_count += int(
-                    rebuild_breakdown.get("rebuild_prefill_step_count", 0)
-                )
-                rebuild_decode_step_count += int(
-                    rebuild_breakdown.get("rebuild_decode_step_count", 0)
-                )
-        if timing_breakdown is not None:
-            timing_breakdown["rebuild_live_states_ms"] = rebuild_live_states_ms
-            timing_breakdown["rebuild_state_setup_ms"] = rebuild_state_setup_ms
-            timing_breakdown["rebuild_scheduler_loop_ms"] = rebuild_scheduler_loop_ms
-            timing_breakdown["rebuild_scheduler_step_count"] = rebuild_scheduler_step_count
-            timing_breakdown["rebuild_prefill_step_count"] = rebuild_prefill_step_count
-            timing_breakdown["rebuild_decode_step_count"] = rebuild_decode_step_count
+    # def rebuild_all_tracked_requests(
+    #     self,
+    #     user_ids: Optional[List[str]] = None,
+    #     *,
+    #     timing_breakdown: Optional[Dict[str, float]] = None,
+    # ) -> None:
+    #     rebuild_live_states_ms = 0.0
+    #     rebuild_state_setup_ms = 0.0
+    #     rebuild_scheduler_loop_ms = 0.0
+    #     rebuild_scheduler_step_count = 0
+    #     rebuild_prefill_step_count = 0
+    #     rebuild_decode_step_count = 0
+    #     for uid in (user_ids if user_ids is not None else list(self.users.keys())):
+    #         user_timeline = self.users.get(uid)
+    #         if user_timeline is not None:
+    #             rebuild_breakdown: Dict[str, float] = {}
+    #             user_timeline.rebuild_from_real_state(
+    #                 self.most_recent_event_real,
+    #                 timing_breakdown=rebuild_breakdown,
+    #             )
+    #             rebuild_live_states_ms += rebuild_breakdown.get(
+    #                 "rebuild_live_states_ms", 0.0
+    #             )
+    #             rebuild_state_setup_ms += rebuild_breakdown.get(
+    #                 "rebuild_state_setup_ms", 0.0
+    #             )
+    #             rebuild_scheduler_loop_ms += rebuild_breakdown.get(
+    #                 "rebuild_scheduler_loop_ms", 0.0
+    #             )
+    #             rebuild_scheduler_step_count += int(
+    #                 rebuild_breakdown.get("rebuild_scheduler_step_count", 0)
+    #             )
+    #             rebuild_prefill_step_count += int(
+    #                 rebuild_breakdown.get("rebuild_prefill_step_count", 0)
+    #             )
+    #             rebuild_decode_step_count += int(
+    #                 rebuild_breakdown.get("rebuild_decode_step_count", 0)
+    #             )
+                
+    #             logger.info(f"Rebuilt user timeline for uid={uid} with {len(user_timeline.request_timelines)} tracked requests. Rebuild breakdown: {rebuild_breakdown}")
+    #     if timing_breakdown is not None:
+    #         timing_breakdown["rebuild_live_states_ms"] = rebuild_live_states_ms
+    #         timing_breakdown["rebuild_state_setup_ms"] = rebuild_state_setup_ms
+    #         timing_breakdown["rebuild_scheduler_loop_ms"] = rebuild_scheduler_loop_ms
+    #         timing_breakdown["rebuild_scheduler_step_count"] = rebuild_scheduler_step_count
+    #         timing_breakdown["rebuild_prefill_step_count"] = rebuild_prefill_step_count
+    #         timing_breakdown["rebuild_decode_step_count"] = rebuild_decode_step_count
 
     def build_deadline_candidates(
         self,
@@ -1175,6 +1312,12 @@ class AlternateHistorySimulator:
                     if rid not in waiting_by_rid:
                         continue
                     if not req_is_fair_prefill(req, running_batch):
+                        # Unfair requests still participate in waiting-queue
+                        # ordering so they are eventually admitted when spare
+                        # capacity exists.  Use float("inf") so they sort after
+                        # all fair requests without creating an EDF candidate
+                        # that could block fair decodes.
+                        waiting_prefill_deadline_by_rid[rid] = float("inf")
                         continue
                     start_deadline = deadline - pooled_prefill_estimate_seconds(req)
                     candidates.append(
@@ -1220,9 +1363,13 @@ class AlternateHistorySimulator:
         return candidates, waiting_prefill_deadline_by_rid, ordered_waiting_prefills
 
     def process_new_request(
-        self, req: Req, deltas_in_microseconds: Optional[Dict[str, int]] = None
+        self,
+        req: Req,
+        deltas_in_microseconds: Optional[Dict[str, int]] = None,
+        *,
+        arrival_timestamp: Optional[float] = None,
     ) -> None:
-        now = time.time()
+        now = arrival_timestamp if arrival_timestamp is not None else time.time()
         if self.enable_timeline_logging:
             TIMELINE_WRITER.mark_isolated_start(
                 req.rid,
@@ -1259,12 +1406,7 @@ class AlternateHistorySimulator:
         self._seed_waiting_prefill_future_event(tracked, now=now)
 
     def finished_prefill(self, batch: ScheduleBatch) -> None:
-        now = time.time()
         for req in batch.reqs:
-            self.most_recent_event_real[req.rid] = RequestPrefillEvent(
-                req_id=req.rid,
-                end_timestamp=now,
-            )
             tracked = self.requests.get(req.rid)
             if tracked is None:
                 continue
@@ -1286,6 +1428,13 @@ class AlternateHistorySimulator:
                 simulated_prefill_done_ts = tracked.arrival_timestamp + prefill_duration
             else:
                 simulated_prefill_done_ts = prefill_event.end_timestamp
+            # Use the isolated simulated timestamp, not wall clock, so that the
+            # isolated timeline stays anchored to arrival time regardless of
+            # when the worker thread processes this call.
+            self.most_recent_event_real[req.rid] = RequestPrefillEvent(
+                req_id=req.rid,
+                end_timestamp=simulated_prefill_done_ts,
+            )
             if self.enable_timeline_logging:
                 TIMELINE_WRITER.mark_isolated_prefill_done(
                     req.rid,
@@ -1310,89 +1459,204 @@ class AlternateHistorySimulator:
                 )
             ]
 
-    def finished_decode(self, batch: ScheduleBatch, decode_rounds: int = 1) -> None:
-        now = time.time()
-        for req in batch.reqs:
-            final_completion_number = len(req.output_ids)
-            self.most_recent_event_real[req.rid] = RequestDecodeEvent(
-                req_id=req.rid,
-                end_timestamp=now,
-                completion_number=final_completion_number,
-            )
-            tracked = self.requests.get(req.rid)
-            if tracked is None:
-                continue
-            timeline = tracked.alternate_history_timeline
-            if tracked.persistent_decode_count > 0:
-                next_completion_number = tracked.persistent_decode_count + 1
-                current_end_timestamp = tracked.persistent_decode_events[
-                    tracked.persistent_decode_count
-                ].end_timestamp
-            elif tracked.persistent_prefill_event is not None:
-                next_completion_number = 1
-                current_end_timestamp = tracked.persistent_prefill_event.end_timestamp
-            else:
-                prefill_event = next(
-                    (
-                        event
-                        for event in timeline.anticipated_future_events
-                        if isinstance(event, RequestPrefillEvent)
-                    ),
-                    None,
-                )
-                if prefill_event is None:
-                    prefill_duration = isolated_prefill_time_estimation(
-                        len(req.origin_input_ids),
-                        len(req.origin_input_ids),
-                        1,
-                        self.fairinf_n,
-                    )
-                    current_end_timestamp = tracked.arrival_timestamp + prefill_duration
-                else:
-                    current_end_timestamp = prefill_event.end_timestamp
-                next_completion_number = 1
+    # def sync_request_progress_from_live(self, req: Req) -> None:
+    #     tracked = self.requests.get(req.rid)
+    #     if tracked is None:
+    #         return
 
-            for completion_number in range(
-                next_completion_number, final_completion_number + 1
-            ):
-                context_tokens = len(req.origin_input_ids) + completion_number
-                decode_duration = isolated_decode_time_estimation(
-                    context_tokens,
-                    context_tokens,
-                    1,
-                    self.fairinf_n,
-                )
-                current_end_timestamp += decode_duration
-                if self.enable_timeline_logging:
-                    TIMELINE_WRITER.mark_isolated_decode_done(
-                        req.rid,
-                        req.uid,
-                        timestamp_iso=_iso_ts(current_end_timestamp),
-                        completion_number=completion_number,
-                    )
-            tracked.latest_simulated_completion_timestamp = current_end_timestamp
-            next_future_completion_number = final_completion_number + 1
-            next_context_tokens = len(req.origin_input_ids) + next_future_completion_number
-            next_decode_duration = isolated_decode_time_estimation(
-                next_context_tokens,
-                next_context_tokens,
-                1,
-                self.fairinf_n,
-            )
-            timeline.anticipated_future_events = [
-                RequestDecodeEvent(
-                    req_id=req.rid,
-                    duration=next_decode_duration,
-                    end_timestamp=current_end_timestamp + next_decode_duration,
-                    completion_number=next_future_completion_number,
-                )
-            ]
+    #     if not tracked.persistent_prefill_done:
+    #         prefill_event = next(
+    #             (
+    #                 event
+    #                 for event in tracked.alternate_history_timeline.anticipated_future_events
+    #                 if isinstance(event, RequestPrefillEvent)
+    #             ),
+    #             None,
+    #         )
+    #         if prefill_event is None:
+    #             prefill_duration = isolated_prefill_time_estimation(
+    #                 len(req.origin_input_ids),
+    #                 len(req.origin_input_ids),
+    #                 1,
+    #                 self.fairinf_n,
+    #             )
+    #             simulated_prefill_done_ts = tracked.arrival_timestamp + prefill_duration
+    #         else:
+    #             simulated_prefill_done_ts = prefill_event.end_timestamp
+    #         synthetic_prefill_event = RequestPrefillEvent(
+    #             req_id=req.rid,
+    #             end_timestamp=simulated_prefill_done_ts,
+    #         )
+    #         self.most_recent_event_real[req.rid] = synthetic_prefill_event
+    #         if self.enable_timeline_logging:
+    #             TIMELINE_WRITER.mark_isolated_prefill_done(
+    #                 req.rid,
+    #                 req.uid,
+    #                 timestamp_iso=_iso_ts(simulated_prefill_done_ts),
+    #             )
+    #         tracked.latest_simulated_completion_timestamp = simulated_prefill_done_ts
+    #         tracked.append_persistent_event(synthetic_prefill_event)
+    #         first_decode_completion = len(req.output_ids) + 1
+    #         decode_context_tokens = len(req.origin_input_ids) + first_decode_completion
+    #         decode_duration = isolated_decode_time_estimation(
+    #             decode_context_tokens,
+    #             decode_context_tokens,
+    #             1,
+    #             self.fairinf_n,
+    #         )
+    #         tracked.alternate_history_timeline.anticipated_future_events = [
+    #             RequestDecodeEvent(
+    #                 req_id=req.rid,
+    #                 duration=decode_duration,
+    #                 end_timestamp=simulated_prefill_done_ts + decode_duration,
+    #                 completion_number=first_decode_completion,
+    #             )
+    #         ]
+
+    #     final_completion_number = len(req.output_ids)
+    #     if final_completion_number <= tracked.persistent_decode_count:
+    #         return
+
+    #     timeline = tracked.alternate_history_timeline
+    #     if tracked.persistent_decode_count > 0:
+    #         next_completion_number = tracked.persistent_decode_count + 1
+    #         current_end_timestamp = tracked.persistent_decode_events[
+    #             tracked.persistent_decode_count
+    #         ].end_timestamp
+    #     elif tracked.persistent_prefill_event is not None:
+    #         next_completion_number = 1
+    #         current_end_timestamp = tracked.persistent_prefill_event.end_timestamp
+    #     else:
+    #         return
+
+    #     for completion_number in range(next_completion_number, final_completion_number + 1):
+    #         context_tokens = len(req.origin_input_ids) + completion_number
+    #         decode_duration = isolated_decode_time_estimation(
+    #             context_tokens,
+    #             context_tokens,
+    #             1,
+    #             self.fairinf_n,
+    #         )
+    #         current_end_timestamp += decode_duration
+    #         synthetic_decode_event = RequestDecodeEvent(
+    #             req_id=req.rid,
+    #             end_timestamp=current_end_timestamp,
+    #             completion_number=completion_number,
+    #         )
+    #         tracked.append_persistent_event(synthetic_decode_event)
+    #         if self.enable_timeline_logging:
+    #             TIMELINE_WRITER.mark_isolated_decode_done(
+    #                 req.rid,
+    #                 req.uid,
+    #                 timestamp_iso=_iso_ts(current_end_timestamp),
+    #                 completion_number=completion_number,
+    #             )
+    #     tracked.latest_simulated_completion_timestamp = current_end_timestamp
+    #     self.most_recent_event_real[req.rid] = RequestDecodeEvent(
+    #         req_id=req.rid,
+    #         end_timestamp=current_end_timestamp,
+    #         completion_number=final_completion_number,
+    #     )
+    #     next_future_completion_number = final_completion_number + 1
+    #     next_context_tokens = len(req.origin_input_ids) + next_future_completion_number
+    #     next_decode_duration = isolated_decode_time_estimation(
+    #         next_context_tokens,
+    #         next_context_tokens,
+    #         1,
+    #         self.fairinf_n,
+    #     )
+    #     timeline.anticipated_future_events = [
+    #         RequestDecodeEvent(
+    #             req_id=req.rid,
+    #             duration=next_decode_duration,
+    #             end_timestamp=current_end_timestamp + next_decode_duration,
+    #             completion_number=next_future_completion_number,
+    #         )
+    #     ]
+
+    # def finished_decode(self, batch: ScheduleBatch, decode_rounds: int = 1) -> None:
+    #     now = time.time()
+    #     for req in batch.reqs:
+    #         final_completion_number = len(req.output_ids)
+    #         self.most_recent_event_real[req.rid] = RequestDecodeEvent(
+    #             req_id=req.rid,
+    #             end_timestamp=now,
+    #             completion_number=final_completion_number,
+    #         )
+    #         tracked = self.requests.get(req.rid)
+    #         if tracked is None:
+    #             continue
+    #         timeline = tracked.alternate_history_timeline
+    #         if tracked.persistent_decode_count > 0:
+    #             next_completion_number = tracked.persistent_decode_count + 1
+    #             current_end_timestamp = tracked.persistent_decode_events[
+    #                 tracked.persistent_decode_count
+    #             ].end_timestamp
+    #         elif tracked.persistent_prefill_event is not None:
+    #             next_completion_number = 1
+    #             current_end_timestamp = tracked.persistent_prefill_event.end_timestamp
+    #         else:
+    #             prefill_event = next(
+    #                 (
+    #                     event
+    #                     for event in timeline.anticipated_future_events
+    #                     if isinstance(event, RequestPrefillEvent)
+    #                 ),
+    #                 None,
+    #             )
+    #             if prefill_event is None:
+    #                 prefill_duration = isolated_prefill_time_estimation(
+    #                     len(req.origin_input_ids),
+    #                     len(req.origin_input_ids),
+    #                     1,
+    #                     self.fairinf_n,
+    #                 )
+    #                 current_end_timestamp = tracked.arrival_timestamp + prefill_duration
+    #             else:
+    #                 current_end_timestamp = prefill_event.end_timestamp
+    #             next_completion_number = 1
+
+    #         for completion_number in range(
+    #             next_completion_number, final_completion_number + 1
+    #         ):
+    #             context_tokens = len(req.origin_input_ids) + completion_number
+    #             decode_duration = isolated_decode_time_estimation(
+    #                 context_tokens,
+    #                 context_tokens,
+    #                 1,
+    #                 self.fairinf_n,
+    #             )
+    #             current_end_timestamp += decode_duration
+    #             if self.enable_timeline_logging:
+    #                 TIMELINE_WRITER.mark_isolated_decode_done(
+    #                     req.rid,
+    #                     req.uid,
+    #                     timestamp_iso=_iso_ts(current_end_timestamp),
+    #                     completion_number=completion_number,
+    #                 )
+    #         tracked.latest_simulated_completion_timestamp = current_end_timestamp
+    #         next_future_completion_number = final_completion_number + 1
+    #         next_context_tokens = len(req.origin_input_ids) + next_future_completion_number
+    #         next_decode_duration = isolated_decode_time_estimation(
+    #             next_context_tokens,
+    #             next_context_tokens,
+    #             1,
+    #             self.fairinf_n,
+    #         )
+    #         timeline.anticipated_future_events = [
+    #             RequestDecodeEvent(
+    #                 req_id=req.rid,
+    #                 duration=next_decode_duration,
+    #                 end_timestamp=current_end_timestamp + next_decode_duration,
+    #                 completion_number=next_future_completion_number,
+    #             )
+    #         ]
 
     def mark_request_finished(self, req: Req) -> None:
         tracked = self.requests.get(req.rid)
-        if tracked is not None and tracked.persistent_decode_count < len(req.output_ids):
-            self.finished_decode(SimpleNamespace(reqs=[req]))
-            tracked = self.requests.get(req.rid)
+        # if tracked is not None and tracked.persistent_decode_count < len(req.output_ids):
+        #     self.finished_decode(SimpleNamespace(reqs=[req]))
+        #     tracked = self.requests.get(req.rid)
         if tracked is not None and tracked.latest_simulated_completion_timestamp is not None:
             if self.enable_timeline_logging:
                 TIMELINE_WRITER.mark_isolated_completed(
@@ -1402,6 +1666,22 @@ class AlternateHistorySimulator:
                 )
         user_timeline = self.users.get(req.uid)
         if user_timeline is not None:
+            # Record a ghost entry so the user timeline keeps accounting for
+            # this request's KV footprint until its real output is fully decoded
+            # in the isolated simulation.
+            total_completion_tokens = len(req.output_ids)
+            if tracked is not None and total_completion_tokens > 0:
+                sampling_params = getattr(req, "sampling_params", None)
+                configured_max_new_tokens = min(
+                    int(getattr(sampling_params, "max_new_tokens", 0) or 0),
+                    CLIP_MAX_NEW_TOKENS,
+                )
+                user_timeline.record_finishing_request(
+                    prompt_tokens=len(req.origin_input_ids),
+                    simulated_decode_count=tracked.persistent_decode_count,
+                    total_completion_tokens=total_completion_tokens,
+                    configured_max_new_tokens=configured_max_new_tokens,
+                )
             user_timeline.finished_request(req.rid)
         self.requests.pop(req.rid, None)
         self.most_recent_event_real.pop(req.rid, None)
