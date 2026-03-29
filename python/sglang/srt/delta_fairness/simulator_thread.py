@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.request_timeline import ISOLATED_SIM_TIMELINE_WRITER
 
 from .doc_policy_simulator import (
     AlternateHistorySimulator,
@@ -413,6 +414,7 @@ class _DocPolicyPrepareWorker:
             user_timeline.rebuild_from_real_state(
                 timing_breakdown=target_breakdown,
             )
+        ISOLATED_SIM_TIMELINE_WRITER.write_snapshot(simulator)
         after_sync = time.perf_counter()
 
         fairinf_n = (
@@ -587,6 +589,13 @@ class _DocPolicyPrepareWorker:
             return
         if kind == "mark_request_finished":
             req, pass_id = payload
+            # Mark is_complete on requests_real so rebuild_from_real_state can drop
+            # this request from active_rids early on the next simulation pass.
+            ut = simulator.users.get(req.uid)
+            if ut is not None:
+                s = ut.requests_real.get(req.rid)
+                if s is not None:
+                    s.is_complete = True
             simulator.mark_request_finished(req)
             return
         if kind == "note_scheduled_prefill_batch":

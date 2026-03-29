@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import time
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.policy_scheduler import CLIP_MAX_NEW_TOKENS
@@ -164,7 +165,12 @@ class UserTimeline:
         tracked = self.request_timelines.pop(rid, None)
         if tracked is not None:
             self.finished_request_timelines[rid] = tracked
-        self.requests_real.pop(rid, None)
+        # Keep requests_real entry if is_complete is already set — the simulation
+        # uses it to drop the request from active_rids early. It will be cleaned up
+        # by get_live_users once the request is no longer in the live queue.
+        s = self.requests_real.get(rid)
+        if s is None or not s.is_complete:
+            self.requests_real.pop(rid, None)
 
     # ------------------------------------------------------------------
     # Isolated scheduler primitives (operate on rid lists, not wrapper objects)
@@ -172,35 +178,24 @@ class UserTimeline:
 
     def _build_prefill_batch(
         self,
-        waiting_rids: List[str],
-        active_rids: List[str],
+        waiting_rids: Deque[str],
         current_time: float,
-        sim_decode_count: Dict[str, int],
+        active_kv_total: int,
     ) -> List[str]:
-        """Returns rids to prefill now."""
-        ready = [
-            rid for rid in waiting_rids
-            if self.request_timelines[rid].timeline.history
-            and self.request_timelines[rid].timeline.history[0].end_timestamp <= current_time
-        ]
-        if not ready:
-            return []
-
+        """Returns rids to prefill now. waiting_rids is sorted by arrival time."""
         batch: List[str] = []
-        active_kv = sum(
-            len(self.request_timelines[rid].req.origin_input_ids) + max(1, sim_decode_count.get(rid, 0))
-            for rid in active_rids
-            if rid in self.request_timelines
-        )
         batch_tokens = 0
         budget = self.max_kv_tokens
-        for rid in ready:
-            tracked = self.request_timelines[rid]
-            req = tracked.req
-            pt = len(req.origin_input_ids)
-            sp = getattr(req, "sampling_params", None)
-            max_new = min(int(getattr(sp, "max_new_tokens", 0) or 0), CLIP_MAX_NEW_TOKENS)
-            if budget is not None and active_kv + batch_tokens + pt > budget:
+        # waiting_rids is arrival-sorted; iterate until we hit one not yet ready
+        for rid in waiting_rids:
+            tl = self.request_timelines.get(rid)
+            if tl is None:
+                continue
+            h = tl.timeline.history
+            if not h or h[0].end_timestamp > current_time:
+                break  # sorted by arrival — nothing later can be ready either
+            pt = len(tl.req.origin_input_ids)
+            if budget is not None and active_kv_total + batch_tokens + pt > budget:
                 break
             batch.append(rid)
             batch_tokens += pt
@@ -208,95 +203,99 @@ class UserTimeline:
 
     def _isolated_retract(
         self,
-        waiting_rids: List[str],
+        waiting_rids: Deque[str],
         active_rids: List[str],
         sim_decode_count: Dict[str, int],
-    ) -> Optional[str]:
-        """Evict the longest-running request back to waiting. Returns the evicted rid, or None."""
+        active_kv_cache: Dict[str, int],
+        active_kv_total: int,
+    ) -> Tuple[Optional[str], int]:
+        """Evict the longest-running request back to waiting.
+        Returns (evicted_rid_or_None, updated_active_kv_total)."""
         if self.max_kv_tokens is None:
-            return None
-        active_kv = sum(
-            len(self.request_timelines[rid].req.origin_input_ids) + max(1, sim_decode_count.get(rid, 0))
-            for rid in active_rids
-            if rid in self.request_timelines
-        )
-        if active_kv + len(active_rids) <= self.max_kv_tokens:
-            return None
-        # Evict the one with most decodes (longest running)
+            return None, active_kv_total
+        if active_kv_total + len(active_rids) <= self.max_kv_tokens:
+            return None, active_kv_total
         if len(active_rids) <= 1:
-            return None
+            return None, active_kv_total
         evict_rid = max(active_rids, key=lambda r: sim_decode_count.get(r, 0))
         active_rids.remove(evict_rid)
-        waiting_rids.insert(0, evict_rid)
+        waiting_rids.appendleft(evict_rid)
         sim_decode_count.pop(evict_rid, None)
-        # Clear its anticipated event
+        # Update incremental cache
+        evicted_kv = active_kv_cache.pop(evict_rid, 0)
+        active_kv_total -= evicted_kv
         tracked = self.request_timelines.get(evict_rid)
         if tracked is not None:
             tracked.timeline.next_anticipated_event = None
-        # Reset prefill_done so the isolated scheduler re-prefills this request
         s = self.requests_real.get(evict_rid)
         if s is not None:
             s.prefill_done = False
             s.decode_count = 0
-        return evict_rid
+        return evict_rid, active_kv_total
 
     def _advance_scheduler_step(
         self,
-        waiting_rids: List[str],
+        waiting_rids: Deque[str],
         active_rids: List[str],
         current_time: float,
         sim_decode_count: Dict[str, int],
         anticipated_recorded: set,
-    ) -> Tuple[Optional[str], float]:
-        """One step. Returns (step_kind, new_current_time). Never writes to timeline.history."""
-        def _arrival_ts(rid: str) -> float:
-            h = self.request_timelines[rid].timeline.history
-            return h[0].end_timestamp if h else float("inf")
+        active_kv_cache: Dict[str, int],  # rid -> prompt_tokens + decode_count, maintained incrementally
+        active_kv_total: int,             # cached sum of active_kv_cache values
+    ) -> Tuple[Optional[str], float, int]:
+        """One step. Returns (step_kind, new_current_time, active_kv_total).
 
-        next_arrival = min(
-            (
-                _arrival_ts(rid)
-                for rid in waiting_rids
-                if rid in self.request_timelines
-                and _arrival_ts(rid) > current_time
-            ),
-            default=None,
-        )
-        any_ready = any(
-            rid in self.request_timelines
-            and _arrival_ts(rid) <= current_time
-            for rid in waiting_rids
-        )
+        waiting_rids is a deque sorted by arrival time. The front is always the
+        earliest-arriving request, so next_arrival and any_ready are O(1) checks.
+        active_kv_cache maps rid -> prompt_tokens and is maintained incrementally.
+        active_kv_total is the cached sum of active_kv_cache values + decode counts.
+        """
+        # O(1): peek at the front of the sorted deque for the next arrival
+        next_arrival: Optional[float] = None
+        any_ready = False
+        for rid in waiting_rids:
+            tl = self.request_timelines.get(rid)
+            if tl is None:
+                continue
+            h = tl.timeline.history
+            ts = h[0].end_timestamp if h else float("inf")
+            if ts <= current_time:
+                any_ready = True
+                break
+            next_arrival = ts
+            break
 
         if any_ready:
-            batch = self._build_prefill_batch(waiting_rids, active_rids, current_time, sim_decode_count)
+            batch = self._build_prefill_batch(waiting_rids, current_time, active_kv_total)
             if batch:
+                batch_set = set(batch)
                 prompt_sizes = [len(self.request_timelines[rid].req.origin_input_ids) for rid in batch]
                 duration = isolated_prefill_time_estimation(
                     sum(prompt_sizes), max(prompt_sizes), len(prompt_sizes), self.fairinf_n
                 )
                 current_time += duration
+                while waiting_rids and waiting_rids[0] in batch_set:
+                    waiting_rids.popleft()
                 for rid in batch:
-                    waiting_rids.remove(rid)
                     active_rids.append(rid)
+                    pt = len(self.request_timelines[rid].req.origin_input_ids)
+                    active_kv_cache[rid] = pt + 1  # prompt + 1 decode token
+                    active_kv_total += pt + 1
                     status = self.requests_real.get(rid)
                     if status is None or not status.prefill_done:
-                        # This prefill is anticipated (not yet real)
                         self.request_timelines[rid].timeline.next_anticipated_event = RequestPrefillEvent(
                             req_id=rid, duration=duration, end_timestamp=current_time
                         )
                         anticipated_recorded.add(rid)
-                return "prefill", current_time
+                return "prefill", current_time, active_kv_total
 
         if active_rids:
-            evicted_rid = self._isolated_retract(waiting_rids, active_rids, sim_decode_count)
+            evicted_rid, active_kv_total = self._isolated_retract(
+                waiting_rids, active_rids, sim_decode_count, active_kv_cache, active_kv_total
+            )
             retracted = evicted_rid is not None
             if retracted:
                 current_time += RETRACTION_PENALTY_SECONDS
-                # Allow the evicted request to receive a fresh anticipated prefill event —
-                # but only if its current anticipated event is a decode event (or absent).
-                # If it already has a prefill anticipated event, keep it: the request is
-                # still queued for prefill and doesn't need a new one.
                 tracked_evicted = self.request_timelines.get(evicted_rid)
                 existing_event = (
                     tracked_evicted.timeline.next_anticipated_event
@@ -307,35 +306,31 @@ class UserTimeline:
                     anticipated_recorded.discard(evicted_rid)
 
             if not active_rids:
-                return "retract", current_time
+                return "retract", current_time, active_kv_total
 
-            token_counts = [
-                len(self.request_timelines[rid].req.origin_input_ids) + max(1, sim_decode_count.get(rid, 0))
-                for rid in active_rids
-                if rid in self.request_timelines
-            ]
-            if not token_counts:
-                return "retract", current_time
+            # Compute decode duration from incremental cache — O(active) but active is small
+            total_tokens = sum(active_kv_cache.get(rid, 0) for rid in active_rids)
+            max_tokens = max((active_kv_cache.get(rid, 0) for rid in active_rids), default=0)
+            if not total_tokens:
+                return "retract", current_time, active_kv_total
 
             duration = isolated_decode_time_estimation(
-                sum(token_counts), max(token_counts), len(token_counts), self.fairinf_n
+                total_tokens, max_tokens, len(active_rids), self.fairinf_n
             )
 
             if next_arrival is not None and current_time + duration > next_arrival:
-                return "arrival", next_arrival
+                return "arrival", next_arrival, active_kv_total
 
             current_time += duration
             for rid in active_rids:
                 sim_decode_count[rid] = sim_decode_count.get(rid, 0) + 1
+                # Increment cached kv by 1 decode token
+                active_kv_cache[rid] = active_kv_cache.get(rid, 0) + 1
+                active_kv_total += 1
                 if rid not in anticipated_recorded:
                     status = self.requests_real.get(rid)
                     real_dc = status.decode_count if status else 0
                     if sim_decode_count[rid] > real_dc:
-                        # Isolation has overtaken (or reached parity with + 1 step) reality.
-                        # Record completion_number=sim_decode_count so events_after(real_dc)
-                        # returns this event (sim_decode_count > real_dc).
-                        # For an over-served request (real_dc >> sim_decode_count),
-                        # this condition never fires → no deadline generated.
                         tracked = self.request_timelines.get(rid)
                         if tracked is not None:
                             tracked.timeline.next_anticipated_event = RequestDecodeEvent(
@@ -344,11 +339,27 @@ class UserTimeline:
                                 completion_number=sim_decode_count[rid],
                             )
                             anticipated_recorded.add(rid)
-            return "decode", current_time
+            # Drop requests that are done in reality and have their anticipated event recorded —
+            # nothing more the sim needs from them.
+            active_rids[:] = [
+                rid for rid in active_rids
+                if not (
+                    rid in anticipated_recorded
+                    and (s := self.requests_real.get(rid)) is not None
+                    and s.is_complete
+                )
+            ]
+            # Sync active_kv_total after potential drops
+            for rid in list(active_kv_cache):
+                if rid not in set(active_rids):
+                    evicted_kv = active_kv_cache.pop(rid, 0)
+                    active_kv_total -= evicted_kv
+                    sim_decode_count.pop(rid, None)
+            return "decode", current_time, active_kv_total
 
         if next_arrival is None:
-            return None, current_time
-        return "arrival", next_arrival
+            return None, current_time, active_kv_total
+        return "arrival", next_arrival, active_kv_total
 
     def rebuild_from_real_state(
         self,
@@ -373,21 +384,23 @@ class UserTimeline:
         # All requests start as waiting — sorted by arrival time (start event timestamp).
         # We ignore real prefill/decode status: the isolation sim determines what each
         # request has earned, not what the real scheduler gave it.
-        waiting_rids: List[str] = []
+        sorted_rids: List[str] = []
         sim_decode_count: Dict[str, int] = {}
         active_rids: List[str] = []
 
         for rid, tracked in self.request_timelines.items():
             tracked.timeline.next_anticipated_event = None
-            waiting_rids.append(rid)
+            sorted_rids.append(rid)
 
-        waiting_rids.sort(
+        sorted_rids.sort(
             key=lambda r: (
                 self.request_timelines[r].timeline.history[0].end_timestamp
                 if self.request_timelines[r].timeline.history
                 else 0.0
             )
         )
+
+        waiting_rids: Deque[str] = deque(sorted_rids)
 
         # Seed current_time from the earliest arrival
         if waiting_rids:
@@ -397,14 +410,17 @@ class UserTimeline:
             current_time = 0.0
 
         anticipated_recorded: set = set()
-        all_rids = set(waiting_rids)
+        all_rids = set(sorted_rids)
+        active_kv_cache: Dict[str, int] = {}  # rid -> prompt_tokens + decode_count
+        active_kv_total: int = 0
 
-        max_steps = max(200, len(all_rids) * 4)
+        max_steps = min(max(200, len(all_rids) * 4), 2000)
         for _ in range(max_steps):
             if anticipated_recorded >= all_rids:
                 break
-            step_kind, current_time = self._advance_scheduler_step(
-                waiting_rids, active_rids, current_time, sim_decode_count, anticipated_recorded
+            step_kind, current_time, active_kv_total = self._advance_scheduler_step(
+                waiting_rids, active_rids, current_time, sim_decode_count, anticipated_recorded,
+                active_kv_cache, active_kv_total,
             )
             if step_kind is None:
                 break
@@ -528,6 +544,11 @@ class AlternateHistorySimulator:
                 if rid not in live_rids:
                     ut.request_timelines.pop(rid, None)
                     self.requests.pop(rid, None)
+            # Clean up completed requests_real entries that are no longer live
+            for rid in list(ut.requests_real):
+                s = ut.requests_real[rid]
+                if s.is_complete and rid not in live_rids:
+                    ut.requests_real.pop(rid, None)
 
         live_user_set = set(live_user_ids)
         for uid in list(self.users):

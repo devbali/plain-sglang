@@ -1724,5 +1724,103 @@ class TestDocPolicyCurrentPassUnit(unittest.TestCase):
             )
             self.assertEqual(policy._max_safe_prefill_tokens, 303)
 
+    def _setup_force_decode_state(
+        self,
+        policy: DocPolicy,
+        waiting_req: Req,
+        prefill_deadline: float,
+        decode_deadline: float,
+    ) -> None:
+        """Inject the minimal policy state needed to exercise fairinf_force_decode."""
+        policy._has_decode_deadline = True
+        policy._max_safe_prefill_tokens = 0  # prefill too large to fit before decode deadline
+        policy._earliest_decode_start_deadline = decode_deadline
+        policy._waiting_prefill_start_deadline_by_rid = {waiting_req.rid: prefill_deadline}
+        policy._safe_waiting_queue = (waiting_req,)
+
+    def test_force_decode_yields_to_earlier_prefill_deadline_fair_user(self):
+        """When prefill deadline < decode deadline and user is under fair share,
+        fairinf_force_decode should NOT force decode — let prefill proceed."""
+        policy = DocPolicy(delta_fairness_n=2, max_running_requests=256)
+        running_req = _mk_req("user_run", "rid_run", 4)
+        waiting_req = _mk_req("user_wait", "rid_wait", 100)
+        running_batch = SimpleNamespace(reqs=[running_req])
+
+        self._setup_force_decode_state(
+            policy,
+            waiting_req,
+            prefill_deadline=100.0,  # prefill deadline is earlier
+            decode_deadline=200.0,
+        )
+
+        with patch.object(policy, "user_is_fair_prefill", return_value=True):
+            force_decode, max_prefill = policy.fairinf_force_decode(running_batch)
+
+        self.assertFalse(force_decode)
+        # Must be None (uncapped), not 0: returning 0 would cause get_new_prefill_batch
+        # to see max_prefill_token_size=0 and bail out with "prefill_capped_to_zero_by_force_decode".
+        self.assertIsNone(max_prefill)
+
+    def test_force_decode_still_forces_when_prefill_user_is_unfair(self):
+        """When the earliest prefill's user is over their fair share,
+        fairinf_force_decode should still force decode even if prefill deadline is earlier."""
+        policy = DocPolicy(delta_fairness_n=2, max_running_requests=256)
+        running_req = _mk_req("user_run", "rid_run", 4)
+        waiting_req = _mk_req("user_unfair", "rid_wait", 100)
+        running_batch = SimpleNamespace(reqs=[running_req])
+
+        self._setup_force_decode_state(
+            policy,
+            waiting_req,
+            prefill_deadline=100.0,
+            decode_deadline=200.0,
+        )
+
+        with patch.object(policy, "user_is_fair_prefill", return_value=False):
+            force_decode, max_prefill = policy.fairinf_force_decode(running_batch)
+
+        self.assertTrue(force_decode)
+        self.assertEqual(max_prefill, 0)
+
+    def test_force_decode_still_forces_when_prefill_deadline_is_later(self):
+        """When the decode deadline is earlier than the prefill deadline,
+        fairinf_force_decode should force decode normally."""
+        policy = DocPolicy(delta_fairness_n=2, max_running_requests=256)
+        running_req = _mk_req("user_run", "rid_run", 4)
+        waiting_req = _mk_req("user_wait", "rid_wait", 100)
+        running_batch = SimpleNamespace(reqs=[running_req])
+
+        self._setup_force_decode_state(
+            policy,
+            waiting_req,
+            prefill_deadline=300.0,  # prefill deadline is later
+            decode_deadline=200.0,
+        )
+
+        with patch.object(policy, "user_is_fair_prefill", return_value=True):
+            force_decode, max_prefill = policy.fairinf_force_decode(running_batch)
+
+        self.assertTrue(force_decode)
+        self.assertEqual(max_prefill, 0)
+
+    def test_force_decode_forces_when_no_waiting_prefill_deadlines(self):
+        """When there are no prefill deadlines in the waiting queue,
+        fairinf_force_decode should force decode normally."""
+        policy = DocPolicy(delta_fairness_n=2, max_running_requests=256)
+        running_req = _mk_req("user_run", "rid_run", 4)
+        running_batch = SimpleNamespace(reqs=[running_req])
+
+        policy._has_decode_deadline = True
+        policy._max_safe_prefill_tokens = 0
+        policy._earliest_decode_start_deadline = 200.0
+        policy._waiting_prefill_start_deadline_by_rid = {}
+        policy._safe_waiting_queue = ()
+
+        force_decode, max_prefill = policy.fairinf_force_decode(running_batch)
+
+        self.assertTrue(force_decode)
+        self.assertEqual(max_prefill, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

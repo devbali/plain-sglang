@@ -1319,6 +1319,9 @@ class ModelTpServer:
         if isinstance(self.fairness_policy, DocPolicy):
             prefix_computed = False
             telemetry["calc_priority_ms"] = 0.0
+            last_reason = getattr(self.fairness_policy, "_last_force_decode_reason", "")
+            if last_reason:
+                telemetry["reason"] = last_reason
         else:
             prefix_computed = self.scheduler.calc_priority(self.waiting_queue)
             telemetry["calc_priority_ms"] = step_timer.mark("calc_priority_ms")
@@ -1531,7 +1534,8 @@ class ModelTpServer:
             self.fairness_policy.note_scheduled_prefill_batch(new_batch)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
         telemetry["build_batch_ms"] = step_timer.mark("build_batch_ms")
-        telemetry["reason"] = "built_prefill_batch"
+        if "reason" not in telemetry:
+            telemetry["reason"] = "built_prefill_batch"
         return new_batch
 
     def forward_prefill_batch(self, batch: ScheduleBatch):

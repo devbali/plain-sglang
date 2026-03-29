@@ -94,6 +94,8 @@ class DocPolicy(DeltaFairnessPolicy):
         self._prefill_no_retraction_token_cap: Optional[int] = None
         self._last_consumed_prepare_snapshot_seq = 0
         self._last_prepare_task_seq = 0
+        self._last_force_decode_reason: str = ""
+        self._force_prefill_override_rid: Optional[str] = None  # RID that triggered prefill_deadline_earlier_than_decode
         self._prepare_worker = _DocPolicyPrepareWorker(
             self,
             isolated_kv_tokens_per_user=isolated_kv_tokens_per_user,
@@ -957,10 +959,47 @@ class DocPolicy(DeltaFairnessPolicy):
     ) -> Tuple[bool, Optional[int]]:
         del decode_time_us
         if running_batch is None:
+            self._last_force_decode_reason = ""
+            self._force_prefill_override_rid = None
             return False, self._max_safe_prefill_tokens
-        if self._has_decode_deadline and (self._max_safe_prefill_tokens or 0) <= 0:
-            return True, 0
-        return False, self._max_safe_prefill_tokens
+        if not (self._has_decode_deadline and (self._max_safe_prefill_tokens or 0) <= 0):
+            self._last_force_decode_reason = ""
+            self._force_prefill_override_rid = None
+            return False, self._max_safe_prefill_tokens
+
+        # We would normally force decode. But if the earliest prefill deadline
+        # is earlier than the earliest decode deadline, AND that request's user
+        # is under their fair share, yield to prefill instead.
+        if self._earliest_decode_start_deadline is not None and self._waiting_prefill_start_deadline_by_rid:
+            # Find the waiting request with the earliest prefill deadline.
+            earliest_prefill_rid = min(
+                self._waiting_prefill_start_deadline_by_rid,
+                key=self._waiting_prefill_start_deadline_by_rid.__getitem__,
+            )
+            earliest_prefill_deadline = self._waiting_prefill_start_deadline_by_rid[earliest_prefill_rid]
+            if earliest_prefill_deadline < self._earliest_decode_start_deadline:
+                # Find the user for this request.
+                earliest_prefill_uid = None
+                for req in self._safe_waiting_queue:
+                    if req.rid == earliest_prefill_rid:
+                        earliest_prefill_uid = req.uid
+                        break
+                if earliest_prefill_uid is not None and self.user_is_fair_prefill(
+                    earliest_prefill_uid,
+                    running_batch=running_batch,
+                ):
+                    # Prefill deadline is more urgent and the user is under fair share —
+                    # do not force decode; let the prefill proceed uncapped (None means
+                    # "use normal system budget"). We must not return max_safe_prefill_tokens
+                    # here because it is 0 and get_new_prefill_batch would treat that as
+                    # "capped to zero" and return None immediately.
+                    self._last_force_decode_reason = "prefill_deadline_earlier_than_decode"
+                    self._force_prefill_override_rid = earliest_prefill_rid
+                    return False, None
+
+        self._last_force_decode_reason = "force_decode"
+        self._force_prefill_override_rid = None
+        return True, 0
 
     def force_prefill_reservations(
         self,
@@ -1254,7 +1293,7 @@ class DocPolicy(DeltaFairnessPolicy):
                 )
                 continue
 
-            is_forced = req.rid in self._forced_prefill_rids
+            is_forced = req.rid in self._forced_prefill_rids or req.rid == self._force_prefill_override_rid
             if is_forced:
                 self._ignore_global_prefill_budget = True
             try:
