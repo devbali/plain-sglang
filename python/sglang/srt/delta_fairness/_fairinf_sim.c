@@ -468,11 +468,11 @@ static void run_rebuild_kernel(
                 active_kv_total + active.len > max_kv_tokens &&
                 active.len > 1)
             {
-                /* Evict the request with the highest sim_decode_count */
+                /* Evict the request with the lowest real_decode_count (fewest real completions) */
                 int evict_pos = 0;
                 for (int i = 1; i < active.len; i++) {
-                    if (ss[active.buf[i]].sim_decode_count >
-                        ss[active.buf[evict_pos]].sim_decode_count)
+                    if (reqs[active.buf[i]].real_decode_count <
+                        reqs[active.buf[evict_pos]].real_decode_count)
                         evict_pos = i;
                 }
                 int evict_idx = active.buf[evict_pos];

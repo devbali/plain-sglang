@@ -21,7 +21,13 @@ if False:  # pragma: no cover - imported only for type checkers
     from sglang.srt.managers.policy_scheduler import PrefillAdder
 
 import time
+from datetime import datetime, timezone
 from sglang.srt.request_timeline import TIMELINE_WRITER
+
+
+def _iso_ts(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="milliseconds")
+
 
 class Event  ():
     def __init__ (self, duration=None, end_timestamp=None):
@@ -1324,6 +1330,7 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
                 RequestPrefillEvent(req.rid, 0, now)
             ]
             self.event_queue.requests[req.rid] = tracked
+            TIMELINE_WRITER.mark_isolated_start(req.rid, req.uid, timestamp_iso=_iso_ts(now))
         self.event_queue.most_recent_event_real[req.rid] = RequestStartEvent(
             req.rid, 0, time.time()
         )
@@ -1381,6 +1388,7 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
                 tracked.alternate_history_timeline.anticipated_future_events = [
                     RequestDecodeEvent(1, req.rid, 0, now)
                 ]
+            TIMELINE_WRITER.mark_isolated_prefill_done(req.rid, req.uid, timestamp_iso=_iso_ts(now))
             self.event_queue.most_recent_event_real[req.rid] = RequestPrefillEvent(req.rid, 0, now)
 
     def finished_decode (self, batch: "ScheduleBatch", decode_rounds: int = 1):
@@ -1407,6 +1415,12 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             )
 
     def mark_request_finished (self, req):
+        tracked = self.event_queue.requests.get(req.rid)
+        if tracked is not None and tracked.alternate_history_timeline.history:
+            last_ts = tracked.alternate_history_timeline.history[-1].end_timestamp
+        else:
+            last_ts = time.time()
+        TIMELINE_WRITER.mark_isolated_completed(req.rid, req.uid, timestamp_iso=_iso_ts(last_ts))
         super().mark_request_finished(req)
         self.event_queue.requests.pop(req.rid, None)
         self.event_queue.most_recent_event_real.pop(req.rid, None)

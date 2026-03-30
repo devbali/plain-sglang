@@ -35,6 +35,27 @@ except ImportError:
 if USE_C_SIM and _C_SIM_AVAILABLE:
     print("Using C extension for prepare snapshot simulation")
 
+# ---------------------------------------------------------------------------
+# USE_C_WORKER: when True, _DocPolicyPrepareWorker uses the stateful CSimulator
+# C extension (_fairinf_worker.so) for tracking requests and building deadline
+# candidates directly in C, releasing the GIL for heavy computations.
+# ---------------------------------------------------------------------------
+USE_C_WORKER = True
+
+try:
+    from sglang.srt.delta_fairness import _fairinf_worker as _worker_c  # type: ignore[import]
+    _C_WORKER_AVAILABLE = True
+except ImportError:
+    _C_WORKER_AVAILABLE = False
+    if USE_C_WORKER:
+        logging.getLogger(__name__).warning(
+            "_fairinf_worker C extension not found — falling back to Python "
+            "simulator. Build it with: python setup_fairinf_worker.py build_ext --inplace"
+        )
+
+if USE_C_WORKER and _C_WORKER_AVAILABLE:
+    print("Using C worker extension for stateful simulation")
+
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.request_timeline import ISOLATED_SIM_TIMELINE_WRITER
 
@@ -186,6 +207,14 @@ class _DocPolicyPrepareWorker:
         )
         if USE_C_SIM and _C_SIM_AVAILABLE:
             _sim_c.patch_simulator(self._simulator)
+        if USE_C_WORKER and _C_WORKER_AVAILABLE:
+            self._c_sim = _worker_c.CSimulator(
+                isolated_kv_tokens_per_user if isolated_kv_tokens_per_user is not None else -1,
+                fairinf_n,
+                1,
+            )
+        else:
+            self._c_sim = None
         self._published_snapshot: Optional[_PreparedSnapshot] = None
         self._published_snapshot_lock = threading.Lock()
         self._thread_exception: Optional[BaseException] = None
@@ -414,7 +443,7 @@ class _DocPolicyPrepareWorker:
             earliest_deadline=snapshot.earliest_decode_start_deadline,
         )
 
-    def _build_prepare_snapshot(
+    def _build_prepare_snapshot_python(
         self,
         waiting_queue: List[_PrepareReq],
         running_batch,
@@ -579,6 +608,9 @@ class _DocPolicyPrepareWorker:
         )
 
     def _apply_mutation(self, kind: str, payload) -> None:
+        if self._c_sim is not None:
+            self._apply_mutation_c(kind, payload)
+            # Fall through to also apply to Python simulator (kept for ISOLATED_SIM_TIMELINE_WRITER.write_snapshot)
         simulator = self._simulator
         if kind == "process_new_request":
             req, deltas_us, *rest = payload
@@ -634,6 +666,280 @@ class _DocPolicyPrepareWorker:
         if kind == "note_scheduled_prefill_batch":
             return
         raise ValueError(f"unknown prepare mutation kind: {kind}")
+
+    def _apply_mutation_c(self, kind: str, payload) -> None:
+        """Apply a mutation to the C simulator (self._c_sim)."""
+        sim = self._c_sim
+        if sim is None:
+            return
+        if kind == "process_new_request":
+            req, deltas_us, *rest = payload
+            arrival_ts = rest[0] if rest else None
+            now = arrival_ts if arrival_ts is not None else time.time()
+            deltas = deltas_us or {}
+            delta_prefill_us = int(deltas.get("prefill", 0))
+            delta_decode_us = int(deltas.get("decode", 0))
+            fill_len = len(req.fill_ids) if getattr(req, "fill_ids", None) is not None else -1
+            sim.process_new_request(
+                req.uid, req.rid,
+                len(req.origin_input_ids),
+                fill_len,
+                len(getattr(req, "output_ids", [])),
+                now,
+                delta_prefill_us,
+                delta_decode_us,
+            )
+            return
+        if kind == "note_retracted_reqs":
+            reqs, deltas_us = payload
+            deltas = deltas_us or {}
+            delta_prefill_us = int(deltas.get("prefill", 0))
+            delta_decode_us = int(deltas.get("decode", 0))
+            for req in reqs:
+                fill_len = len(req.fill_ids) if getattr(req, "fill_ids", None) is not None else -1
+                sim.process_new_request(
+                    req.uid, req.rid,
+                    len(req.origin_input_ids),
+                    fill_len,
+                    len(getattr(req, "output_ids", [])),
+                    time.time(),
+                    delta_prefill_us,
+                    delta_decode_us,
+                )
+            return
+        if kind == "note_prefill_done":
+            (reqs,) = payload
+            for req in reqs:
+                sim.note_prefill_done(
+                    req.uid, req.rid,
+                    len(req.origin_input_ids),
+                    len(getattr(req, "output_ids", [])),
+                )
+            return
+        if kind == "finished_decode":
+            return
+        if kind == "logical_decode_update":
+            running_batch, decode_steps = payload if len(payload) == 2 else (payload[0], 1)
+            if running_batch is not None:
+                entries = [
+                    (r.uid, r.rid, len(r.origin_input_ids), len(getattr(r, "output_ids", [])))
+                    for r in running_batch.reqs
+                ]
+                sim.finished_decode(entries, decode_steps)
+            return
+        if kind == "mark_request_finished":
+            req, pass_id = payload
+            sim.mark_request_finished(
+                req.rid, req.uid,
+                len(getattr(req, "output_ids", [])),
+            )
+            return
+        if kind == "note_scheduled_prefill_batch":
+            return
+        # Unknown mutation kinds are silently ignored in the C path
+
+    def _build_prepare_snapshot(
+        self,
+        waiting_queue,
+        running_batch,
+        *,
+        task_seq: int,
+        mutation_seq: int,
+        breakdown=None,
+        frozen_cache_state=None,
+        frozen_inputs=None,
+    ):
+        if self._c_sim is not None:
+            return self._build_prepare_snapshot_c(
+                waiting_queue, running_batch,
+                task_seq=task_seq,
+                mutation_seq=mutation_seq,
+                breakdown=breakdown,
+                frozen_cache_state=frozen_cache_state,
+                frozen_inputs=frozen_inputs,
+            )
+        return self._build_prepare_snapshot_python(
+            waiting_queue, running_batch,
+            task_seq=task_seq,
+            mutation_seq=mutation_seq,
+            breakdown=breakdown,
+            frozen_cache_state=frozen_cache_state,
+            frozen_inputs=frozen_inputs,
+        )
+
+    def _build_prepare_snapshot_c(
+        self,
+        waiting_queue,
+        running_batch,
+        *,
+        task_seq: int,
+        mutation_seq: int,
+        breakdown=None,
+        frozen_cache_state=None,
+        frozen_inputs=None,
+    ) -> _PreparedSnapshot:
+        from .doc_policy_simulator import DeadlineCandidate, RequestDecodeEvent, RequestPrefillEvent
+        owner = self._owner
+        sim = self._c_sim
+        target_breakdown: Dict[str, float] = {} if breakdown is None else breakdown
+        build_start = time.perf_counter()
+
+        # sync_live_users
+        waiting_tuples = [
+            (r.uid, r.rid, len(r.origin_input_ids), len(r.output_ids))
+            for r in waiting_queue
+        ]
+        running_tuples = [
+            (r.uid, r.rid, len(r.origin_input_ids), len(r.output_ids))
+            for r in (running_batch.reqs if running_batch is not None else [])
+        ]
+        sim.sync_live_users(waiting_tuples, running_tuples)
+
+        # rebuild (skip known-unfair users)
+        _known_fair = (
+            frozen_cache_state.known_fair_uids
+            if frozen_cache_state is not None
+            else None
+        )
+        sim.rebuild_all_users(_known_fair)
+        after_sync = time.perf_counter()
+
+        fairinf_n = (
+            frozen_inputs.fairinf_n
+            if frozen_inputs is not None
+            else max(int(owner.delta_fairness_n or 1), 1)
+        )
+
+        # Pre-compute per-user fairness
+        under_memory_pressure = (
+            frozen_inputs is not None and frozen_inputs.no_retraction_cap is not None
+        )
+        if under_memory_pressure:
+            fair_uids: Optional[set] = set()
+            for req in waiting_queue:
+                if req.uid not in fair_uids and owner._user_is_fair_prefill_from_frozen(
+                    req.uid,
+                    this_user_sum=req.get_estimated_prefill_impact(),
+                    frozen_cache_state=frozen_cache_state,
+                ):
+                    fair_uids.add(req.uid)
+            deadline_waiting_queue = [req for req in waiting_queue if req.uid in fair_uids]
+        else:
+            fair_uids = None
+            deadline_waiting_queue = waiting_queue
+
+        if (
+            DECODE_PRIORITIZE_FAIR
+            and frozen_cache_state is not None
+            and frozen_cache_state.known_fair_uids is not None
+        ):
+            fair_decode_uids: Optional[frozenset] = frozen_cache_state.known_fair_uids
+        else:
+            fair_decode_uids = None
+
+        # compute pooled estimates
+        if running_batch is not None and running_batch.reqs:
+            _rb_token_lens = [
+                len(item.fill_ids)
+                if item.fill_ids is not None
+                else len(item.origin_input_ids) + len(item.output_ids)
+                for item in running_batch.reqs
+            ]
+            _pooled_decode_s = pooled_decode_time_estimation(
+                sum(_rb_token_lens), max(_rb_token_lens), len(_rb_token_lens), fairinf_n
+            )
+        else:
+            _pooled_decode_s = 0.0
+
+        _default_deltas = frozen_inputs.deltas_us if frozen_inputs is not None else owner._deltas_us
+        delta_prefill_s = float(_default_deltas.get("prefill", 0)) / 1_000_000.0
+        delta_decode_s = float(_default_deltas.get("decode", 0)) / 1_000_000.0
+
+        waiting_rids = [r.rid for r in deadline_waiting_queue]
+        running_rids = [r.rid for r in (running_batch.reqs if running_batch is not None else [])]
+
+        rid_to_req: Dict[str, object] = {r.rid: r for r in deadline_waiting_queue}
+        rid_to_req.update(
+            {r.rid: r for r in (running_batch.reqs if running_batch is not None else [])}
+        )
+
+        pooled_prefill_s = pooled_prefill_time_estimation(
+            max((len(r.origin_input_ids) for r in deadline_waiting_queue), default=0),
+            max((len(r.origin_input_ids) for r in deadline_waiting_queue), default=0),
+            1,
+            fairinf_n,
+        ) if deadline_waiting_queue else 0.0
+
+        c_result = sim.build_deadline_candidates(
+            waiting_rids, running_rids,
+            fair_uids, fair_decode_uids,
+            delta_prefill_s, delta_decode_s,
+            pooled_prefill_s, _pooled_decode_s,
+        )
+        raw_candidates, waiting_prefill_deadline_by_rid, ordered_waiting_rids = c_result
+
+        # Convert C tuples to DeadlineCandidate objects
+        deadline_queue: List[DeadlineCandidate] = []
+        for (rid, uid, event_type_str, deadline, start_deadline, ant_ts, ant_cn) in raw_candidates:
+            req = rid_to_req.get(rid)
+            if req is None:
+                continue
+            if event_type_str == "decode":
+                event = RequestDecodeEvent(req_id=rid, duration=0.0, end_timestamp=ant_ts, completion_number=ant_cn)
+            else:
+                event = RequestPrefillEvent(req_id=rid, duration=0.0, end_timestamp=ant_ts)
+            deadline_queue.append(DeadlineCandidate(
+                deadline=deadline,
+                start_deadline=start_deadline,
+                event_type=event_type_str,
+                req=req,
+                event=event,
+            ))
+
+        ordered_waiting_queue = tuple(
+            rid_to_req[rid] for rid in ordered_waiting_rids if rid in rid_to_req
+        )
+
+        after_deadline = time.perf_counter()
+
+        safe_state = owner._compute_safe_prefix_state(
+            deadline_queue,
+            waiting_prefill_deadline_by_rid,
+            waiting_queue,
+            running_batch,
+            ordered_waiting_queue=ordered_waiting_queue,
+            frozen_cache_state=frozen_cache_state,
+            frozen_inputs=frozen_inputs,
+            fair_uids=fair_uids,
+        )
+        after_safe = time.perf_counter()
+
+        target_breakdown["sync_live_user_tracking_ms"] = (after_sync - build_start) * 1000.0
+        target_breakdown["build_deadline_candidates_ms"] = (after_deadline - after_sync) * 1000.0
+        target_breakdown["sort_waiting_prefills_ms"] = 0.0
+        target_breakdown["safe_prefix_scan_ms"] = (after_safe - after_deadline) * 1000.0
+        target_breakdown["build_pass_state_ms"] = (after_safe - build_start) * 1000.0
+
+        return _PreparedSnapshot(
+            task_seq=task_seq,
+            mutation_seq=mutation_seq,
+            deadline_queue=tuple(deadline_queue),
+            waiting_prefill_deadlines=MappingProxyType(dict(waiting_prefill_deadline_by_rid)),
+            safe_waiting_queue=tuple(safe_state["safe_waiting_queue"]),
+            safe_waiting_rids=frozenset(safe_state["safe_waiting_rids"]),
+            forced_prefill_queue=tuple(safe_state["forced_prefill_queue"]),
+            forced_prefill_rids=frozenset(safe_state["forced_prefill_rids"]),
+            max_safe_prefill_tokens=safe_state["max_safe_prefill_tokens"],
+            has_fair_waiting=bool(safe_state["has_fair_waiting"]),
+            has_decode_deadline=bool(safe_state["has_decode_deadline"]),
+            earliest_decode_start_deadline=safe_state["earliest_decode_start_deadline"],
+            earliest_decode_rid=owner._debug_earliest_decode_rid,
+            earliest_decode_uid=owner._debug_earliest_decode_uid,
+            safe_prefix_now=safe_state["safe_prefix_now"],
+            skipped_rids=tuple(safe_state.get("skipped_rids", [])),
+            skipped_reasons=tuple(safe_state.get("skipped_reasons", [])),
+            breakdown_items=tuple(target_breakdown.items()),
+        )
 
     def _worker_loop(self) -> None:
         torch.set_grad_enabled(False)

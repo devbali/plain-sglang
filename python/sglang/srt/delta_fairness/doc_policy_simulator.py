@@ -218,7 +218,7 @@ class UserTimeline:
             return None, active_kv_total
         if len(active_rids) <= 1:
             return None, active_kv_total
-        evict_rid = max(active_rids, key=lambda r: sim_decode_count.get(r, 0))
+        evict_rid = min(active_rids, key=lambda r: (self.requests_real[r].decode_count if r in self.requests_real else 0))
         active_rids.remove(evict_rid)
         waiting_rids.appendleft(evict_rid)
         sim_decode_count.pop(evict_rid, None)
