@@ -1272,29 +1272,37 @@ class DocPolicy(DeltaFairnessPolicy):
             user_id: sum(tokens) for user_id, tokens in token_counters_by_user.items()
         }
 
-        # Sort safe_waiting_queue: fair users first (within each group, preserve EDF order).
-        if PREFILL_PRIORITIZE_FAIR:
-            fair_uid_cache: Dict[str, bool] = {}
-            def _req_is_fair(req: Req) -> bool:
-                uid = req.uid
-                if uid not in fair_uid_cache:
-                    fair_uid_cache[uid] = self.user_is_fair_prefill(
-                        uid,
-                        running_batch=running_batch,
-                        this_user_len=len(token_counters_by_user.get(uid, [])),
-                        this_user_sum=pending_prefill_by_user.get(uid, 0),
-                    )
-                return fair_uid_cache[uid]
+        # Sort safe_waiting_queue with two-condition strict priority:
+        #   Tier 0: fair user + prefill deadline before earliest decode deadline (condition 1)
+        #   Tier 1: fair user, any deadline (condition 2)
+        #   Tier 2: all others
+        # Within each tier, sort by EDF.
+        decode_deadline = self._earliest_decode_start_deadline
+        fair_uid_cache: Dict[str, bool] = {}
+        def _req_is_fair(req: Req) -> bool:
+            uid = req.uid
+            if uid not in fair_uid_cache:
+                fair_uid_cache[uid] = self.user_is_fair_prefill(
+                    uid,
+                    running_batch=running_batch,
+                    this_user_len=len(token_counters_by_user.get(uid, [])),
+                    this_user_sum=pending_prefill_by_user.get(uid, 0),
+                )
+            return fair_uid_cache[uid]
 
-            ordered_safe_waiting = sorted(
-                self._safe_waiting_queue,
-                key=lambda r: (0 if _req_is_fair(r) else 1, self._waiting_prefill_start_deadline_by_rid.get(r.rid, float("inf"))),
-            )
-        else:
-            ordered_safe_waiting = sorted(
-                self._safe_waiting_queue,
-                key=lambda r: self._waiting_prefill_start_deadline_by_rid.get(r.rid, float("inf")),
-            )
+        def _sort_key(r: Req) -> tuple:
+            deadline = self._waiting_prefill_start_deadline_by_rid.get(r.rid, float("inf"))
+            is_fair = _req_is_fair(r)
+            cond1 = is_fair and decode_deadline is not None and deadline < decode_deadline
+            tier = 0 if cond1 else (1 if is_fair else 2)
+            return (tier, deadline)
+
+        ordered_safe_waiting = sorted(self._safe_waiting_queue, key=_sort_key)
+
+        # Budget of tokens that can be admitted without touching evictable cache
+        # (i.e. without risking decode retractions). Fair users may exceed this.
+        evictable = self.tree_cache.evictable_size() if self.tree_cache is not None else 0
+        no_retraction_budget = adder.rem_total_tokens - evictable
 
         for prepared_req in ordered_safe_waiting:
             req = waiting_by_rid.get(prepared_req.rid)
@@ -1309,6 +1317,9 @@ class DocPolicy(DeltaFairnessPolicy):
             if max_input_size is not None:
                 adder.rem_input_tokens = max_input_size - adder.log_input_tokens
             if req in adder.can_run_list:
+                continue
+            # Beyond the no-retraction budget, only fair users are admitted.
+            if adder.log_input_tokens > no_retraction_budget and not _req_is_fair(req):
                 continue
 
             extra_tokens = pending_prefill_by_user.get(req.uid, 0)
@@ -1375,6 +1386,8 @@ class DocPolicy(DeltaFairnessPolicy):
                     break
                 if max_input_size is not None and adder.log_input_tokens > max_input_size:
                     break
+                if adder.log_input_tokens > no_retraction_budget and not self.user_is_fair_prefill(req.uid, running_batch=running_batch):
+                    continue
                 if max_input_size is not None:
                     adder.rem_input_tokens = max_input_size - adder.log_input_tokens
                 extra_tokens = pending_prefill_by_user.get(req.uid, 0)

@@ -522,12 +522,7 @@ class _DocPolicyPrepareWorker:
                 (tracked_req.deltas_in_microseconds or _default_deltas).get(
                     "prefill"
                     if isinstance(event, RequestPrefillEvent)
-                    else (
-                        "first_decode"
-                        if isinstance(event, RequestDecodeEvent)
-                        and event.completion_number <= 1
-                        else "decode"
-                    ),
+                    else "decode",
                     0,
                 )
             )

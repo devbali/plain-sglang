@@ -146,14 +146,27 @@ _TIMELINE_HEADER = [
 
 
 class RequestTimelineWriter:
-    """In-memory row store; written atomically to disk at process exit."""
+    """In-memory row store; written atomically to disk periodically and at process exit."""
+
+    _FLUSH_INTERVAL_S: float = 30.0
 
     def __init__(self, csv_path: Optional[str] = None) -> None:
         self.csv_path = csv_path or os.path.join(os.getcwd(), "fairinf_request_timeline.csv")
         self._lock = threading.Lock()
         self._rows: Dict[str, TimelineRow] = {}
         self._write_failed = False
+        self._stop_event = threading.Event()
+        self._flush_thread = threading.Thread(
+            target=self._flush_loop,
+            name="timeline-writer-flush",
+            daemon=True,
+        )
+        self._flush_thread.start()
         atexit.register(self.flush)
+
+    def _flush_loop(self) -> None:
+        while not self._stop_event.wait(self._FLUSH_INTERVAL_S):
+            self.flush()
 
     def _get_or_create(self, request_id: str, uid: Optional[str]) -> TimelineRow:
         row = self._rows.get(request_id)
