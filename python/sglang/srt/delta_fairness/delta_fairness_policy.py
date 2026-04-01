@@ -229,7 +229,7 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         if tree_cache is None or tree_cache.fairinf_max_per_user is None:
             return False
 
-        total_capacity = getattr(tree_cache.token_to_kv_pool, "can_use_mem_size", None)
+        total_capacity = getattr(tree_cache, "capacity", None)
         if total_capacity is None:
             return False
 
@@ -258,6 +258,9 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
     def uses_static_isolated_memory(self) -> bool:
         return False
 
+    def pin_new_token_ratio(self) -> bool:
+        return True
+
     # ---- Request admission -------------------------------------------------
     def init_next_round_input_control(
         self,
@@ -274,24 +277,60 @@ class DeltaFairnessPolicy(StaticFairnessPolicy):
         rejected = super().init_next_round_input_control(
             req, fair=fair, extra_tokens=extra_tokens
         )
-        if rejected is not None or not self._has_delta_limit():
+        if rejected is not None:
+            logger.info(
+                "init_next_round_input_control REJECTED uid=%s rid=%s reason=super "
+                "extend=%s extra=%s",
+                req.uid, req.rid, req.extend_input_len, extra_tokens,
+            )
+            return rejected
+        if not self._has_delta_limit():
             return rejected
 
         if fair:
             if self._reject_based_on_computed_fair_limit(
                 req.uid, req.extend_input_len + extra_tokens
             ):
+                logger.info(
+                    "init_next_round_input_control REJECTED uid=%s rid=%s reason=fair_limit "
+                    "extend=%s extra=%s",
+                    req.uid, req.rid, req.extend_input_len, extra_tokens,
+                )
                 return "rejected"
         else:
             if self._reject_unfair_prefill_due_to_global_headroom(
                 req, extra_tokens=extra_tokens
             ):
+                used_r, used_u = self._used_reserved_and_unreserved(
+                    running_batch=getattr(self, "_pass_running_batch", None)
+                )
+                cap = getattr(self.tree_cache, "capacity", 0) if self.tree_cache else 0
+                avail_u = max(0, cap - used_r)
+                u_prot = (self.tree_cache.total_user_counters.get_tokens(req.uid)
+                          - self.tree_cache.evictable_total_user_counters.get_tokens(req.uid)) if self.tree_cache else 0
+                u_head = self._estimated_decode_headroom_for_user(req.uid, running_batch=getattr(self, "_pass_running_batch", None))
+                logger.info(
+                    "init_next_round_input_control REJECTED uid=%s rid=%s reason=global_headroom "
+                    "extend=%s extra=%s used_reserved=%s used_unreserved=%s avail_unreserved=%s "
+                    "user_protected=%s user_headroom=%s fairinf_max=%s",
+                    req.uid, req.rid, req.extend_input_len, extra_tokens,
+                    used_r, used_u, avail_u, u_prot, u_head,
+                    self.tree_cache.fairinf_max_per_user if self.tree_cache else "?",
+                )
                 return "rejected"
             if self._reject_based_on_computed_fair_limit(
                 req.uid,
                 req.extend_input_len + extra_tokens,
                 unfair=True,
             ):
+                logger.info(
+                    "init_next_round_input_control REJECTED uid=%s rid=%s reason=unfair_limit "
+                    "extend=%s extra=%s expandable=%s",
+                    req.uid, req.rid, req.extend_input_len, extra_tokens,
+                    self.tree_cache.calculate_real_expandable_size_for_user_fairinf(
+                        req.uid, [], self_unfair=True,
+                    ) if self.tree_cache else "?",
+                )
                 return "rejected"
         return None
 

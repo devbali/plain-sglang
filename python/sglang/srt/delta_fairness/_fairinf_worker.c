@@ -503,9 +503,13 @@ static void w_run_rebuild_kernel(
                 if (!ss[idx].anticipated) {
                     int real_dc = reqs[idx].real_decode_count;
                     if (ss[idx].sim_decode_count > real_dc) {
+                        /* anticipated = real+1 at pure sim-time.
+                         * Back-calculate: sim is at sim_dc now, we want time of (real_dc+1).
+                         * steps_past = sim_dc - (real_dc+1); each took dur seconds. */
+                        int steps_past = ss[idx].sim_decode_count - (real_dc + 1);
                         reqs[idx].ant_type       = 1;
-                        reqs[idx].ant_end_ts     = current_time;
-                        reqs[idx].ant_completion = ss[idx].sim_decode_count;
+                        reqs[idx].ant_end_ts     = current_time - steps_past * dur;
+                        reqs[idx].ant_completion = real_dc + 1;
                         ss[idx].anticipated      = 1;
                         anticipated_count++;
                     }
@@ -533,6 +537,27 @@ static void w_run_rebuild_kernel(
             reqs[idx].ant_type       = 0;
             reqs[idx].ant_end_ts     = Py_HUGE_VAL;
             reqs[idx].ant_completion = 0;
+            ss[idx].anticipated      = 1;
+        }
+    }
+
+    /* Fallback for active requests that never crossed real_dc (sim ran out of steps).
+     * Extrapolate forward: sim is at sim_dc at current_time, needs (real_dc+1 - sim_dc)
+     * more steps. Pure sim-time, no wall-clock floor. */
+    for (int i = 0; i < active.len; i++) {
+        int idx = active.buf[i];
+        if (!ss[idx].anticipated) {
+            int sim_dc  = ss[idx].sim_decode_count;
+            int real_dc = reqs[idx].real_decode_count;
+            if (sim_dc >= real_dc) continue;  /* over-served: no deadline */
+            int next_n = real_dc + 1;
+            int ctx    = reqs[idx].prompt_len + next_n;
+            double step_dur = w_isolated_decode_time_estimation(
+                (double)ctx, (double)ctx, 1.0, (double)fairinf_n);
+            int steps_remaining = next_n - sim_dc;
+            reqs[idx].ant_type       = 1;
+            reqs[idx].ant_end_ts     = current_time + steps_remaining * step_dur;
+            reqs[idx].ant_completion = next_n;
             ss[idx].anticipated      = 1;
         }
     }
@@ -1205,15 +1230,13 @@ CSimulator_finished_decode(CSimulatorObject *self, PyObject *args)
         tr->decode_count = new_final_n;
         tr->latest_sim_completion_ts = cur_ts;
 
-        /* Seed next anticipated decode */
-        double now = _get_now(self);
+        /* Seed next anticipated decode — pure sim-time, no wall-clock floor */
         int next_n = new_final_n + 1;
         int ctx = prompt_len + next_n;
         double dec_dur = w_isolated_decode_time_estimation(
             (double)ctx, (double)ctx, 1.0, (double)fn);
-        double base = cur_ts > now ? cur_ts : now;
         tr->ant_type = 1;
-        tr->ant_ts   = base + dec_dur;
+        tr->ant_ts   = cur_ts + dec_dur;
         tr->ant_cn   = next_n;
     }
 

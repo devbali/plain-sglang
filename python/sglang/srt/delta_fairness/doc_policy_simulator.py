@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Alternate History Simulator — per AlternateHistory.md design."""
 
+import bisect
 import heapq
 import time
 import logging
@@ -12,7 +13,7 @@ from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.policy_scheduler import CLIP_MAX_NEW_TOKENS
-from sglang.srt.request_timeline import TIMELINE_WRITER
+from sglang.srt.request_timeline import TIMELINE_WRITER, COMPLETION_WRITER
 
 from .time_estimation import (
     isolated_decode_time_estimation,
@@ -161,6 +162,13 @@ class UserTimeline:
     request_timelines: Dict[str, TrackedRequest] = field(default_factory=dict)
     requests_real: Dict[str, RequestStatusReal] = field(default_factory=dict)
     finished_request_timelines: Dict[str, TrackedRequest] = field(default_factory=dict)
+    # Incremental sim state — persisted between rebuild_from_real_state calls
+    _sim_current_time: Optional[float] = field(default=None, repr=False)
+    _sim_waiting_rids: Optional[List[str]] = field(default=None, repr=False)
+    _sim_active_rids: Optional[List[str]] = field(default=None, repr=False)
+    _sim_decode_count: Optional[Dict[str, int]] = field(default=None, repr=False)
+    _sim_active_kv_cache: Optional[Dict[str, int]] = field(default=None, repr=False)
+    _sim_active_kv_total: int = field(default=0, repr=False)
 
     def finished_request(self, rid: str) -> None:
         tracked = self.request_timelines.pop(rid, None)
@@ -334,10 +342,25 @@ class UserTimeline:
                     if sim_decode_count[rid] > real_dc:
                         tracked = self.request_timelines.get(rid)
                         if tracked is not None:
+                            # INVARIANT: anticipated = real+1 at pure sim-time.
+                            # The anticipated event is always the next event after the
+                            # real world state — i.e. decode (real_dc+1) — with a
+                            # timestamp derived solely from the isolation sim's clock.
+                            #
+                            # If real_dc=5 and sim just reached sim_dc=8 at current_time,
+                            # the timestamp for decode 6 is current_time minus the time
+                            # the sim spent on steps 7 and 8 (i.e. back-calculate):
+                            #   end_ts = current_time - (sim_dc - (real_dc+1)) * duration
+                            #
+                            # This is still pure sim-time and may be in the past relative
+                            # to wall clock — that is correct. Callers interpret it.
+                            sim_dc = sim_decode_count[rid]
+                            steps_past = sim_dc - (real_dc + 1)
+                            end_ts = current_time - steps_past * duration
                             tracked.timeline.next_anticipated_event = RequestDecodeEvent(
                                 req_id=rid, duration=duration,
-                                end_timestamp=current_time,
-                                completion_number=sim_decode_count[rid],
+                                end_timestamp=end_ts,
+                                completion_number=real_dc + 1,
                             )
                             anticipated_recorded.add(rid)
             # Drop requests that are done in reality and have their anticipated event recorded —
@@ -362,6 +385,12 @@ class UserTimeline:
             return None, current_time, active_kv_total
         return "arrival", next_arrival, active_kv_total
 
+    def _arrival_ts(self, rid: str) -> float:
+        tl = self.request_timelines.get(rid)
+        if tl and tl.timeline.history:
+            return tl.timeline.history[0].end_timestamp
+        return 0.0
+
     def rebuild_from_real_state(
         self,
         _unused_real_statuses=None,
@@ -370,51 +399,111 @@ class UserTimeline:
     ) -> None:
         """Run the isolated scheduler forward to set next_anticipated_event for each live request.
 
-        All requests — including currently-running ones — are placed in the waiting queue
-        sorted by arrival time. The isolated scheduler then simulates them from scratch,
-        assigning each request the decode count it would have earned in a fair isolated system.
+        Incremental: persists sim state between calls so the clock resumes from where it
+        left off rather than rewinding to the earliest arrival every pass.
 
-        For a running request with real decode_count=D, if the isolated sim only gives it
-        iso_decode_count=K where K <= D, then next_anticipated_event.completion_number = K+1.
-        Since K+1 <= D, events_after(real_event_at_D) returns nothing — the request has
-        consumed more service than isolation allows, so it doesn't drive a deadline.
+        New requests are inserted into the waiting queue at the correct arrival-sorted
+        position. Removed requests are dropped from the saved state. The sim advances
+        until all live requests have a next_anticipated_event, or max_steps is exhausted.
         """
         if not self.request_timelines:
+            self._sim_current_time = None
+            self._sim_waiting_rids = None
+            self._sim_active_rids = None
+            self._sim_decode_count = None
+            self._sim_active_kv_cache = None
+            self._sim_active_kv_total = 0
             return
 
-        # All requests start as waiting — sorted by arrival time (start event timestamp).
-        # We ignore real prefill/decode status: the isolation sim determines what each
-        # request has earned, not what the real scheduler gave it.
-        sorted_rids: List[str] = []
-        sim_decode_count: Dict[str, int] = {}
-        active_rids: List[str] = []
+        live_set = set(self.request_timelines)
 
-        for rid, tracked in self.request_timelines.items():
-            tracked.timeline.next_anticipated_event = None
-            sorted_rids.append(rid)
-
-        sorted_rids.sort(
-            key=lambda r: (
-                self.request_timelines[r].timeline.history[0].end_timestamp
-                if self.request_timelines[r].timeline.history
-                else 0.0
-            )
-        )
-
-        waiting_rids: Deque[str] = deque(sorted_rids)
-
-        # Seed current_time from the earliest arrival
-        if waiting_rids:
-            first_h = self.request_timelines[waiting_rids[0]].timeline.history
+        if self._sim_current_time is None:
+            # Cold start: sort all requests by arrival, seed clock from earliest arrival.
+            sorted_rids = sorted(live_set, key=self._arrival_ts)
+            waiting_rids: Deque[str] = deque(sorted_rids)
+            active_rids: List[str] = []
+            sim_decode_count: Dict[str, int] = {}
+            active_kv_cache: Dict[str, int] = {}
+            active_kv_total: int = 0
+            first_h = self.request_timelines[sorted_rids[0]].timeline.history if sorted_rids else []
             current_time = first_h[0].end_timestamp if first_h else 0.0
+            for tracked in self.request_timelines.values():
+                tracked.timeline.next_anticipated_event = None
         else:
-            current_time = 0.0
+            # Warm start: resume from saved state.
+            current_time = self._sim_current_time
+            waiting_rids = deque(self._sim_waiting_rids)
+            active_rids = list(self._sim_active_rids)
+            sim_decode_count = dict(self._sim_decode_count)
+            active_kv_cache = dict(self._sim_active_kv_cache)
+            active_kv_total = self._sim_active_kv_total
 
+            saved_set = set(waiting_rids) | set(active_rids)
+
+            # Drop requests no longer live.
+            removed = saved_set - live_set
+            if removed:
+                waiting_rids = deque(r for r in waiting_rids if r not in removed)
+                active_rids = [r for r in active_rids if r not in removed]
+                for r in removed:
+                    active_kv_total -= active_kv_cache.pop(r, 0)
+                    sim_decode_count.pop(r, None)
+
+            # Insert new requests at the correct arrival-sorted position in waiting_rids.
+            new_rids = live_set - saved_set
+            if new_rids:
+                waiting_list = list(waiting_rids)
+                arr_keys = [self._arrival_ts(r) for r in waiting_list]
+                for rid in new_rids:
+                    self.request_timelines[rid].timeline.next_anticipated_event = None
+                    arr = self._arrival_ts(rid)
+                    pos = bisect.bisect_left(arr_keys, arr)
+                    waiting_list.insert(pos, rid)
+                    arr_keys.insert(pos, arr)
+                waiting_rids = deque(waiting_list)
+
+        # Seed anticipated_recorded from existing events on TrackedRequests.
+        #
+        # ANTICIPATED EVENT SEMANTICS:
+        # The anticipated event is always the NEXT event after the real-world state of
+        # the request, with a timestamp derived solely from the isolation sim's clock.
+        #
+        # Examples:
+        #   - real_dc=5, sim reached decode 8 at sim-time T:
+        #     anticipated = decode 6 at sim-time (T - 2*step_dur)  [back-calculated]
+        #   - real_dc=5, sim stopped at decode 2 at sim-time T:
+        #     anticipated = decode 6 at sim-time (T + 4*step_dur)  [extrapolated forward]
+        #   - request queued in sim (not yet prefilled):
+        #     anticipated = prefill with end_ts=inf  [we don't know when its turn comes]
+        #   - request prefilled in sim but not yet in reality:
+        #     anticipated = prefill with finite sim-time end_ts
+        #
+        # Timestamps may be in the past relative to wall clock when the sim lags behind
+        # reality. This is correct — callers use the timestamps to compute relative
+        # scheduling urgency, not as absolute wall-clock deadlines.
+        #
+        # Invalidate an existing anticipated event ONLY if it is logically stale:
+        # a decode event whose completion_number <= real_dc (reality already passed it),
+        # or a prefill event when the real request has already been prefilled.
+        # Wall-clock comparisons must NOT be used to invalidate anticipated events.
         anticipated_recorded: set = set()
-        all_rids = set(sorted_rids)
-        active_kv_cache: Dict[str, int] = {}  # rid -> prompt_tokens + decode_count
-        active_kv_total: int = 0
+        for rid, tracked in self.request_timelines.items():
+            ev = tracked.timeline.next_anticipated_event
+            if ev is None:
+                continue
+            if isinstance(ev, RequestDecodeEvent):
+                real_dc = self.requests_real[rid].decode_count if rid in self.requests_real else 0
+                if ev.completion_number <= real_dc:
+                    tracked.timeline.next_anticipated_event = None
+                    continue
+            elif isinstance(ev, RequestPrefillEvent):
+                status = self.requests_real.get(rid)
+                if status is not None and status.prefill_done:
+                    tracked.timeline.next_anticipated_event = None
+                    continue
+            anticipated_recorded.add(rid)
 
+        all_rids = live_set
         max_steps = min(max(200, len(all_rids) * 4), 2000)
         for _ in range(max_steps):
             if anticipated_recorded >= all_rids:
@@ -425,11 +514,14 @@ class UserTimeline:
             )
             if step_kind is None:
                 break
-            if until_timestamp is not None and current_time >= until_timestamp:
-                break
 
-        # Any waiting request still without an anticipated event is queued behind active decodes.
-        # Use inf so it sorts behind requests whose isolated prefill slot is known.
+        # Waiting requests still without an event: the sim did not reach them.
+        # They are queued in isolation — we don't know when their prefill slot will come.
+        # Use inf so they sort behind requests whose isolated prefill slot is known.
+        # INVARIANT: queued requests (not yet prefilled in the isolation sim) get inf,
+        # NOT a decode deadline. Only once the sim schedules their prefill does a
+        # prefill anticipated event get a finite timestamp; only after their first decode
+        # step in the sim do they get a decode anticipated event.
         for rid in waiting_rids:
             if rid not in anticipated_recorded:
                 tracked = self.request_timelines.get(rid)
@@ -439,6 +531,40 @@ class UserTimeline:
                     req_id=tracked.req.rid, duration=0.0,
                     end_timestamp=float("inf"),
                 )
+
+        # Active requests where the sim clock ran out (max_steps) before assigning an
+        # anticipated event. The sim is at sim_dc < real_dc. Extrapolate forward:
+        # the sim needs (real_dc + 1 - sim_dc) more decode steps from current_time.
+        #
+        # INVARIANT: anticipated = logical real+1 at pure sim-time.
+        # The anticipated event is decode (real_dc+1) with a sim-time timestamp computed
+        # by projecting forward from where the sim stopped. Do NOT floor to wall clock.
+        for rid in active_rids:
+            if rid not in anticipated_recorded:
+                tracked = self.request_timelines.get(rid)
+                if tracked is None:
+                    continue
+                sim_dc = sim_decode_count.get(rid, 0)
+                real_dc = self.requests_real[rid].decode_count if rid in self.requests_real else 0
+                if sim_dc >= real_dc:
+                    continue
+                next_n = real_dc + 1
+                ctx = len(tracked.req.origin_input_ids) + next_n
+                dur = isolated_decode_time_estimation(ctx, ctx, 1, self.fairinf_n)
+                steps_remaining = next_n - sim_dc  # how many more sim steps to reach real_dc+1
+                tracked.timeline.next_anticipated_event = RequestDecodeEvent(
+                    req_id=rid, duration=dur,
+                    end_timestamp=current_time + steps_remaining * dur,
+                    completion_number=next_n,
+                )
+
+        # Save incremental state for next call.
+        self._sim_current_time = current_time
+        self._sim_waiting_rids = list(waiting_rids)
+        self._sim_active_rids = list(active_rids)
+        self._sim_decode_count = sim_decode_count
+        self._sim_active_kv_cache = active_kv_cache
+        self._sim_active_kv_total = active_kv_total
 
 
 # ---------------------------------------------------------------------------
@@ -714,10 +840,9 @@ class AlternateHistorySimulator:
             next_n = new_final_n + 1
             ctx = len(req.origin_input_ids) + next_n
             dur = isolated_decode_time_estimation(ctx, ctx, 1, self.fairinf_n)
-            base = max(cur_ts, time.time())
             tracked.timeline.next_anticipated_event = RequestDecodeEvent(
                 req_id=req.rid, duration=dur,
-                end_timestamp=base + dur, completion_number=next_n,
+                end_timestamp=cur_ts + dur, completion_number=next_n,
             )
 
     def mark_request_finished(self, req: Req) -> None:
@@ -746,7 +871,8 @@ class AlternateHistorySimulator:
         if tracked is not None and tracked.latest_simulated_completion_timestamp is not None:
             if self.enable_timeline_logging:
                 TIMELINE_WRITER.mark_isolated_completed(
-                    req.rid, req.uid, timestamp_iso=_iso_ts(tracked.latest_simulated_completion_timestamp)
+                    req.rid, req.uid, timestamp_iso=_iso_ts(tracked.latest_simulated_completion_timestamp),
+                    completion_writer=COMPLETION_WRITER,
                 )
 
         ut = self.users.get(req.uid)
@@ -790,7 +916,14 @@ class AlternateHistorySimulator:
 
             if not upcoming and rid in running_by_rid and isinstance(
                 real_event, (RequestPrefillEvent, RequestDecodeEvent)
-            ):
+            ) and not isinstance(tracked.timeline.next_anticipated_event, RequestPrefillEvent):
+                # Fallback synthesis: the sim has no anticipated decode event for this
+                # running request (events_after returned empty). Synthesize one based on
+                # the last real event.
+                # INVARIANT: Only synthesize when next_anticipated_event is NOT a prefill.
+                # If it is a prefill (RequestPrefillEvent), the isolation sim evicted this
+                # request back to waiting — synthesizing a decode deadline would be wrong
+                # (the request is over-quota in isolation and shouldn't drive decode urgency).
                 next_n = (
                     real_event.completion_number + 1
                     if isinstance(real_event, RequestDecodeEvent)
@@ -827,17 +960,7 @@ class AlternateHistorySimulator:
                     if earliest_decode is None or start_dl < earliest_decode.start_deadline:
                         earliest_decode = c
 
-        # We only ever need the top-K earliest prefill candidates:
-        # - the safe-prefix loop breaks after ~10 fit within the decode window
-        # - process_waiting_queue_prefills rarely schedules more than 10-20 per pass
-        # Use heapq.nsmallest so we avoid an O(N log N) sort over the full queue.
-        _PREFILL_CAP = 32
-        arrival_ts = self.requests
-        _key = lambda c: (c.start_deadline, c.deadline, arrival_ts[c.req.rid].arrival_timestamp)
-        if len(prefill_candidates) > _PREFILL_CAP:
-            top_prefills = heapq.nsmallest(_PREFILL_CAP, prefill_candidates, key=_key)
-        else:
-            top_prefills = sorted(prefill_candidates, key=_key)
+        top_prefills = prefill_candidates
 
         # deadline_queue: at most one decode candidate (the earliest) + top prefills.
         deadline_queue: List[DeadlineCandidate] = []

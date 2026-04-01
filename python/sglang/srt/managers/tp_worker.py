@@ -146,31 +146,23 @@ class StepTimer:
 
 def _normalize_single_delta_config(raw_deltas: Optional[Dict[str, int]]) -> Dict[str, int]:
     raw_deltas = raw_deltas or {}
-    candidate_keys = (
-        "delta",
-        "decode",
-        "first_decode",
-        "prefill",
-        "decode_running_batch",
-        "first_decode_running_batch",
-        "prefill_running_batch",
-        "prefix_cache",
-        "kv_cache",
-    )
-    effective_delta_us = 0
-    for key in candidate_keys:
-        value = raw_deltas.get(key)
-        if value is None:
-            continue
-        effective_delta_us = max(effective_delta_us, int(value))
+    # "delta" is the base fallback for any key not explicitly set.
+    base = int(raw_deltas.get("delta", 0))
+
+    def _get(key: str) -> int:
+        v = raw_deltas.get(key)
+        return int(v) if v is not None else base
+
+    # Cache reservation keys use max of all provided values (conservative).
+    cache_delta = max(base, _get("prefix_cache"), _get("kv_cache"))
 
     return {
-        "delta": effective_delta_us,
-        "prefix_cache": effective_delta_us,
-        "kv_cache": effective_delta_us,
-        "prefill": effective_delta_us,
-        "first_decode": effective_delta_us,
-        "decode": effective_delta_us,
+        "delta": base,
+        "prefix_cache": cache_delta,
+        "kv_cache": cache_delta,
+        "prefill": _get("prefill"),
+        "first_decode": _get("first_decode") if raw_deltas.get("first_decode") is not None else _get("decode"),
+        "decode": _get("decode"),
     }
 
 
@@ -758,7 +750,8 @@ class ModelTpServer:
 
             else:
                 self.check_memory()
-                self.new_token_ratio = global_config.init_new_token_ratio
+                if not self.fairness_policy.pin_new_token_ratio():
+                    self.new_token_ratio = global_config.init_new_token_ratio
 
     def print_stats(self, decode=True, elapsed_time_ms=0, wall_time_ms=None):
         num_used = self.max_total_num_tokens - (
@@ -1588,22 +1581,11 @@ class ModelTpServer:
 
         # Build batch tensors
         requesting_users = {req.uid for req in batch.reqs}
-        try:
-            removed_requests = batch.prepare_for_extend(
-                self.model_config.vocab_size,
-                running_batch=self.running_batch,
-                requesting_users=list(requesting_users),
-            )
-        except RuntimeError as exc:
-            if "Static prefill admission denied" not in str(exc):
-                raise
-            logger.info("Skipping prefill batch: %s", exc)
-            if self.fairness_policy.uses_static_isolated_memory():
-                self.waiting_queue = list(batch.reqs) + self.waiting_queue
-            else:
-                self.waiting_queue.extend(batch.reqs)
-            batch.reqs = []
-            return
+        removed_requests = batch.prepare_for_extend(
+            self.model_config.vocab_size,
+            running_batch=self.running_batch,
+            requesting_users=list(requesting_users),
+        )
         _log_prefill_step("prepare_for_extend")
 
         if removed_requests:
@@ -1627,7 +1609,8 @@ class ModelTpServer:
             # in the decode loop (before this prefill pass ran).
             if not self.running_batch.check_decode_mem():
                 mixed_retracted, new_token_ratio = self.running_batch.retract_decode()
-                self.new_token_ratio = new_token_ratio
+                if not self.fairness_policy.pin_new_token_ratio():
+                    self.new_token_ratio = new_token_ratio
                 if mixed_retracted:
                     logger.info(
                         "Mixed-chunk decode OOM after prefill reservations. "
@@ -1981,7 +1964,8 @@ class ModelTpServer:
                 old_ratio = self.new_token_ratio
 
                 retracted_reqs, new_token_ratio = batch.retract_decode()
-                self.new_token_ratio = new_token_ratio
+                if not self.fairness_policy.pin_new_token_ratio():
+                    self.new_token_ratio = new_token_ratio
 
                 logger.info(
                     "Decode out of memory happened. "
@@ -1995,10 +1979,11 @@ class ModelTpServer:
                 self.fairness_policy.note_retracted_reqs(retracted_reqs)
                 restore_state = apply_restricted_decode_subset()
             else:
-                self.new_token_ratio = max(
-                    self.new_token_ratio - self.new_token_ratio_decay,
-                    self.min_new_token_ratio,
-                )
+                if not self.fairness_policy.pin_new_token_ratio():
+                    self.new_token_ratio = max(
+                        self.new_token_ratio - self.new_token_ratio_decay,
+                        self.min_new_token_ratio,
+                    )
             after_check_mem = time.perf_counter()
 
             if not self.disable_regex_jump_forward:

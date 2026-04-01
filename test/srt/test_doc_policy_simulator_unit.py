@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import sglang.srt.delta_fairness.doc_policy_simulator as sim_mod
 from sglang.srt.delta_fairness.doc_policy_simulator import (
@@ -130,6 +130,7 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                 req.rid,
                 req.uid,
                 timestamp_iso="1970-01-01T00:00:18.000+00:00",
+                completion_writer=ANY,
             )
 
     def test_mark_request_finished_backfills_missing_isolated_decode_completion(self):
@@ -170,6 +171,7 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                 req.rid,
                 req.uid,
                 timestamp_iso="1970-01-01T00:00:18.000+00:00",
+                completion_writer=ANY,
             )
 
     def test_grouped_finished_decode_replays_each_decode_round(self):
@@ -938,6 +940,328 @@ class TestDocPolicySimulatorUnit(unittest.TestCase):
                                 "req2 should have a finite anticipated prefill time (queued behind req1), not inf")
             self.assertGreater(req2_anticipated.end_timestamp, 0.0,
                                "req2 anticipated prefill should be after time 0")
+
+
+    def test_rebuild_next_anticipated_event_for_long_running_request(self):
+        """rebuild_from_real_state with a request that has 500 real decodes but sim exhausts budget.
+
+        Scenario: one user, one request that has already completed 500 real decode steps.
+        Each isolated decode step takes 1.0s in the sim. With max_steps = max(200, 4*1) = 200,
+        the sim exhausts its budget and uses the active-fallback path: anticipated = decode 501
+        at sim-time current_time + dur (pure sim-time, which may be in the past relative to wall).
+
+        Per the design: anticipated timestamps are always pure sim-time. The deadline queue
+        consumers (doc_policy.py) are responsible for handling past-sim-time deadlines
+        (e.g. DECODE_DEADLINE_FAIR_ONLY filters unfair users).
+        """
+        arrival = 1000.0
+        real_decode_steps = 500
+        step_duration = 1.0  # 1s per isolated decode step
+        now_t = arrival + real_decode_steps  # time.time() = 1500.0
+
+        def fake_time():
+            return now_t
+
+        with patch.object(sim_mod.time, "time", side_effect=fake_time), \
+             patch.object(sim_mod, "isolated_decode_time_estimation", return_value=step_duration), \
+             patch.object(sim_mod, "isolated_prefill_time_estimation", return_value=0.01):
+
+            simulator = AlternateHistorySimulator(
+                max_kv_tokens_per_user=100000,
+                fairinf_n=1,
+            )
+
+            req = _mk_req("user_bad", "rid_long", 10)
+            simulator.process_new_request(req, arrival_timestamp=arrival)
+            simulator.finished_prefill(SimpleNamespace(reqs=[req]))
+
+            # Simulate 500 real decode steps
+            req.output_ids = list(range(real_decode_steps))
+            simulator.finished_decode(SimpleNamespace(reqs=[req]), decode_rounds=real_decode_steps)
+
+            # Now rebuild — the sim exhausts max_steps, falls back to active-fallback path.
+            simulator.start_of_pass(SimpleNamespace(reqs=[req]), [])
+
+            tracked = simulator.requests[req.rid]
+            anticipated = tracked.timeline.next_anticipated_event
+            self.assertIsNotNone(anticipated,
+                "next_anticipated_event should not be None after rebuild")
+            self.assertIsInstance(anticipated, RequestDecodeEvent,
+                f"anticipated event should be a decode event, got: {anticipated}")
+            # completion_number should be real_dc + 1 = 501
+            self.assertEqual(anticipated.completion_number, real_decode_steps + 1,
+                f"anticipated completion_number should be {real_decode_steps + 1}, "
+                f"got: {anticipated.completion_number}")
+            # end_timestamp is pure sim-time — may be in the past relative to wall clock.
+            # We only check it's a finite positive number.
+            self.assertGreater(anticipated.end_timestamp, 0.0,
+                f"anticipated end_timestamp should be positive, got: {anticipated.end_timestamp}")
+
+
+    def test_rebuild_next_anticipated_event_is_in_future_for_long_running_request_c_sim(self):
+        """C sim path is disabled (USE_C_SIM=False); rebuild_from_real_state is now incremental Python."""
+        self.skipTest("C sim path disabled: rebuild_from_real_state is now incremental (Python only)")
+
+        arrival = 1000.0
+        real_decode_steps = 500
+        step_duration = 1.0
+        now_t = arrival + real_decode_steps  # 1500.0
+
+        def fake_time():
+            return now_t
+
+        # Save and restore rebuild_from_real_state so patch_simulator doesn't
+        # contaminate subsequent tests (patch_simulator replaces the class method).
+        original_rebuild = UserTimeline.rebuild_from_real_state
+        try:
+            with patch.object(sim_mod.time, "time", side_effect=fake_time), \
+                 patch.object(sim_mod, "isolated_decode_time_estimation", return_value=step_duration), \
+                 patch.object(sim_mod, "isolated_prefill_time_estimation", return_value=0.01):
+
+                simulator = AlternateHistorySimulator(
+                    max_kv_tokens_per_user=100000,
+                    fairinf_n=1,
+                )
+                _sim_c.patch_simulator(simulator)
+
+                req = _mk_req("user_bad", "rid_long_c", 10)
+                simulator.process_new_request(req, arrival_timestamp=arrival)
+                simulator.finished_prefill(SimpleNamespace(reqs=[req]))
+
+                req.output_ids = list(range(real_decode_steps))
+                simulator.finished_decode(SimpleNamespace(reqs=[req]), decode_rounds=real_decode_steps)
+
+                simulator.start_of_pass(SimpleNamespace(reqs=[req]), [])
+
+                tracked = simulator.requests[req.rid]
+                anticipated = tracked.timeline.next_anticipated_event
+                self.assertIsNotNone(anticipated,
+                    "C sim: next_anticipated_event should not be None after rebuild")
+                self.assertGreaterEqual(
+                    anticipated.end_timestamp,
+                    now_t,
+                    f"C sim: next_anticipated_event.end_timestamp ({anticipated.end_timestamp:.1f}) "
+                    f"is in the past (time.time()={now_t:.1f})",
+                )
+        finally:
+            UserTimeline.rebuild_from_real_state = original_rebuild
+
+
+    def test_exact_schedule_two_users_incremental_rebuild(self):
+        """Verify the exact isolated schedule across multiple passes for two users.
+
+        Each user has their own UserTimeline — the isolated sim is per-user.
+
+        Setup (prefill=2s, decode=3s, max_kv=1000, fairinf_n=2):
+          user_A: 1 request, arrives t=10, prompt=4 tokens
+          user_B: 1 request, arrives t=15, prompt=4 tokens
+
+        Isolated schedule for user_A alone:
+          t=10 → prefill → t=12
+          t=12 → decode → t=15  (sim_dc=1)
+          t=15 → decode → t=18  (sim_dc=2)
+          t=18 → decode → t=21  (sim_dc=3)
+          t=21 → decode → t=24  (sim_dc=4, > real_dc=3) → anticipated decode at t=24, completion_number=4
+
+        Isolated schedule for user_B alone:
+          t=15 → prefill → t=17
+          t=17 → decode → t=20  (sim_dc=1, > real_dc=0) → anticipated decode at t=20, completion_number=1
+        """
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        with patch.object(sim_mod.time, "time", side_effect=fake_time), \
+             patch.object(sim_mod, "isolated_prefill_time_estimation", return_value=2.0), \
+             patch.object(sim_mod, "isolated_decode_time_estimation", return_value=3.0):
+
+            simulator = AlternateHistorySimulator(
+                max_kv_tokens_per_user=1000,
+                fairinf_n=2,
+            )
+
+            req_a = _mk_req("user_A", "rid_A", 4)
+            req_b = _mk_req("user_B", "rid_B", 4)
+
+            simulator.process_new_request(req_a, arrival_timestamp=10.0)
+            now["t"] = 12.0
+            simulator.finished_prefill(SimpleNamespace(reqs=[req_a]))
+
+            req_a.output_ids = [1, 2, 3]
+            now["t"] = 21.0
+            simulator.finished_decode(SimpleNamespace(reqs=[req_a]), decode_rounds=3)
+
+            simulator.process_new_request(req_b, arrival_timestamp=15.0)
+
+            # Pass 1: A running (real_dc=3), B waiting (real_dc=0)
+            now["t"] = 22.0
+            simulator.start_of_pass(SimpleNamespace(reqs=[req_a]), [req_b])
+
+            a_ant = simulator.requests[req_a.rid].timeline.next_anticipated_event
+            b_ant = simulator.requests[req_b.rid].timeline.next_anticipated_event
+
+            # B: not yet prefilled in reality → anticipated prefill
+            self.assertIsInstance(b_ant, RequestPrefillEvent,
+                "B not yet prefilled → anticipated should be prefill")
+
+            # A: real_dc=3, anticipated = real_dc+1 = 4
+            self.assertIsInstance(a_ant, RequestDecodeEvent,
+                "A has real decodes → anticipated should be decode")
+            self.assertEqual(a_ant.completion_number, 4)
+            # Isolated schedule: t=10+2+4*3 = 24.0
+            self.assertAlmostEqual(a_ant.end_timestamp, 24.0, places=5,
+                msg=f"A anticipated end_timestamp should be 24.0, got {a_ant.end_timestamp}")
+
+            # B isolated: prefill ends at t=17.0
+            self.assertAlmostEqual(b_ant.end_timestamp, 17.0, places=5,
+                msg=f"B anticipated prefill end_timestamp should be 17.0, got {b_ant.end_timestamp}")
+
+            # Pass 2: B prefilled at t=24 and has 1 real decode, now=25
+            now["t"] = 24.0
+            simulator.finished_prefill(SimpleNamespace(reqs=[req_b]))
+            req_b.output_ids = [1]
+            now["t"] = 25.0
+            simulator.finished_decode(SimpleNamespace(reqs=[req_b]), decode_rounds=1)
+
+            # finished_decode eagerly sets next_anticipated_event for B:
+            # cur_ts = iso_prefill_ts + 1*decode_dur. iso_prefill_ts comes from history,
+            # which was set at pass1 to 17.0. So cur_ts = 17 + 3 = 20.
+            # end_ts = cur_ts + dur = 20 + 3 = 23. completion_number=2. Pure sim-time, no wall clock.
+
+            simulator.start_of_pass(SimpleNamespace(reqs=[req_a, req_b]), [])
+
+            a_ant2 = simulator.requests[req_a.rid].timeline.next_anticipated_event
+            b_ant2 = simulator.requests[req_b.rid].timeline.next_anticipated_event
+
+            # B: real_dc=1. finished_decode set completion_number=2.
+            # cur_ts = iso_prefill_ts(17) + 1*decode_dur(3) = 20.
+            # end_ts = cur_ts + dur = 20 + 3 = 23. completion_number=2 > real_dc=1 → valid, kept by rebuild.
+            self.assertIsInstance(b_ant2, RequestDecodeEvent,
+                "B now has real decodes → anticipated should be decode")
+            self.assertEqual(b_ant2.completion_number, 2)
+            self.assertAlmostEqual(b_ant2.end_timestamp, 23.0, places=5,
+                msg=f"B anticipated end_timestamp should be 23.0, got {b_ant2.end_timestamp}")
+
+            # A: real_dc=3. Pass 1 set end_ts=24.0, completion_number=4.
+            # Anticipated timestamps are pure sim-time — even if sim-time is in the past
+            # relative to wall clock (now=25), the event is still valid (completion=4 > real_dc=3).
+            # The incremental sim keeps this event unchanged.
+            self.assertIsInstance(a_ant2, RequestDecodeEvent)
+            self.assertEqual(a_ant2.completion_number, 4)
+            self.assertAlmostEqual(a_ant2.end_timestamp, 24.0, places=5,
+                msg=f"A anticipated end_timestamp should be 24.0 (pure sim-time, kept from pass 1), got {a_ant2.end_timestamp}")
+
+
+    def _run_kv_overflow_evicted_request_has_no_decode_deadline_test(self, use_c_sim: bool):
+        """
+        When more requests are running in reality than fit in the per-user KV limit,
+        the isolation sim can only hold 2 requests at a time (max_kv=8, 4 tokens each).
+        r3 is evicted back to the waiting queue in isolation. It ends up in waiting_rids
+        and should get end_ts=inf (prefill event), NOT a decode deadline.
+        r1 and r2 are served in isolation up to real_dc=5, so they get anticipated decode 6.
+        """
+        from sglang.srt.delta_fairness.doc_policy_simulator import UserTimeline
+        now = {"t": 10.0}
+
+        def fake_time():
+            return now["t"]
+
+        original_rebuild = UserTimeline.rebuild_from_real_state
+
+        try:
+            with patch.object(sim_mod.time, "time", side_effect=fake_time), patch.object(
+                sim_mod, "isolated_prefill_time_estimation", return_value=1.0
+            ), patch.object(
+                sim_mod, "isolated_decode_time_estimation", return_value=1.0
+            ):
+                # max_kv=8, each request occupies 4 tokens → only 2 fit at once.
+                # 3 requests all running in reality → the 3rd gets evicted in isolation
+                # and ends up in waiting. It must NOT produce a decode deadline.
+                simulator = AlternateHistorySimulator(
+                    max_kv_tokens_per_user=8,
+                    fairinf_n=1,
+                )
+
+                if use_c_sim:
+                    try:
+                        from sglang.srt.delta_fairness import _fairinf_sim as _sim_c
+                        _sim_c.patch_simulator(simulator)
+                    except ImportError:
+                        self.skipTest("_fairinf_sim C extension not available")
+
+                req1 = _mk_req("user_bad", "rid_bad_1", 4)
+                req2 = _mk_req("user_bad", "rid_bad_2", 4)
+                req3 = _mk_req("user_bad", "rid_bad_3", 4)
+
+                for req in (req1, req2, req3):
+                    simulator.process_new_request(req)
+
+                now["t"] = 11.0
+                simulator.finished_prefill(SimpleNamespace(reqs=[req1, req2, req3]))
+
+                for req in (req1, req2, req3):
+                    req.output_ids = list(range(5))
+                now["t"] = 12.0
+                simulator.finished_decode(SimpleNamespace(reqs=[req1, req2, req3]), decode_rounds=5)
+
+                # Jump wall clock far into the future so sim-time is firmly in the past.
+                now["t"] = 1000.0
+                simulator.start_of_pass(
+                    SimpleNamespace(reqs=[req1, req2, req3]),
+                    [],
+                )
+
+                candidates, _ = simulator.build_deadline_candidates(
+                    [],
+                    SimpleNamespace(reqs=[req1, req2, req3]),
+                    req_is_fair_prefill=lambda req, rb: True,
+                    req_is_fair_decode=lambda req, rb: True,
+                    event_delta_seconds=lambda tracked, event: 0.0,
+                    pooled_prefill_estimate_seconds=lambda req: 1.0,
+                    pooled_decode_estimate_seconds=lambda req, rb: 1.0,
+                )
+
+                # With max_kv=8 and 4 tokens each, at most 1 request can sustain
+                # decode after the initial eviction (active_kv grows past budget quickly).
+                # Requests that end up queued/evicted in isolation get end_ts=inf (prefill),
+                # and must NOT appear as decode candidates.
+                ut = simulator.users["user_bad"]
+                evs = {
+                    rid: ut.request_timelines[rid].timeline.next_anticipated_event
+                    for rid in (req1.rid, req2.rid, req3.rid)
+                }
+                prefill_inf_rids = [
+                    rid for rid, ev in evs.items()
+                    if isinstance(ev, RequestPrefillEvent) and ev.end_timestamp == float("inf")
+                ]
+                decode_ev_rids = [rid for rid, ev in evs.items() if isinstance(ev, RequestDecodeEvent)]
+
+                # At least one request must have been served (got a decode event)
+                self.assertGreater(len(decode_ev_rids), 0,
+                    f"at least one request should have a decode event, got: {evs}")
+                # Requests with decode events should have completion_number = real_dc + 1 = 6
+                for rid in decode_ev_rids:
+                    ev = evs[rid]
+                    self.assertEqual(ev.completion_number, 6,
+                        f"served request should have anticipated decode 6 (real_dc+1), got: {ev}")
+
+                # Requests stuck in isolation waiting (prefill inf) must NOT appear as
+                # decode candidates — they were evicted and never served in isolation.
+                decode_candidates = [c for c in candidates if c.event_type == "decode"]
+                decode_candidate_rids = {c.req.rid for c in decode_candidates}
+                for evicted_rid in prefill_inf_rids:
+                    self.assertNotIn(evicted_rid, decode_candidate_rids,
+                        f"evicted request {evicted_rid} must not appear as a decode candidate, "
+                        f"got candidates: {[(c.req.rid, c.event.end_timestamp) for c in decode_candidates]}")
+        finally:
+            UserTimeline.rebuild_from_real_state = original_rebuild
+
+    def test_kv_overflow_evicted_request_has_no_decode_deadline_python(self):
+        self._run_kv_overflow_evicted_request_has_no_decode_deadline_test(use_c_sim=False)
+
+    def test_kv_overflow_evicted_request_has_no_decode_deadline_c(self):
+        self._run_kv_overflow_evicted_request_has_no_decode_deadline_test(use_c_sim=True)
 
 
 if __name__ == "__main__":

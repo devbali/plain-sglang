@@ -10,7 +10,7 @@ diffs.
 
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from sglang.srt.request_timeline import TIMELINE_WRITER
+from sglang.srt.request_timeline import TIMELINE_WRITER, COMPLETION_WRITER
 
 if False:  # pragma: no cover - imported only for type checkers
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -91,6 +91,10 @@ class NoFairnessPolicy:
         return False
 
     def deny_prefill_if_decode_retraction_needed(self) -> bool:
+        return False
+
+    def pin_new_token_ratio(self) -> bool:
+        """If True, tp_worker will not update new_token_ratio on OOM/decay."""
         return False
 
     def running_request_partition_size(
@@ -189,7 +193,7 @@ class NoFairnessPolicy:
         self._pass_max_running_requests = max_running_requests
     
     def mark_request_finished (self, req: "Req"):
-        TIMELINE_WRITER.mark_completed(req.rid, req.uid)
+        TIMELINE_WRITER.mark_completed(req.rid, req.uid, completion_writer=COMPLETION_WRITER)
 
     def prepare_during_gpu_execution(
         self,

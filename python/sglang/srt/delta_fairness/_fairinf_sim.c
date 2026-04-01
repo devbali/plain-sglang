@@ -58,7 +58,7 @@
 /* time_estimation.py constants */
 #define DECODE_CONST_OVERHEAD   0.020   /* CONST_INTERVAL_DECODE */
 #define PREFILL_CONST_OVERHEAD  0.080   /* CONST_INTERVAL_PREFILL */
-#define TBT_DELTA               0.050
+#define TBT_DELTA               0.080
 #define MAX_POOLED_DECODE_LATENCY  0.07092250719117761  /* pre-computed */
 #define PREFILL_PIECEWISE_BOUND  4064.0
 
@@ -304,17 +304,32 @@ typedef struct {
 /* -------------------------------------------------------------------------
  * Core kernel — no Python objects touched, GIL not required
  *
- * Implements rebuild_from_real_state exactly:
+ * Implements rebuild_from_real_state:
  *   1. Sort all requests by arrival_ts
  *   2. Run isolated scheduler steps until all have anticipated events or
  *      max_steps reached
  *   3. Remaining waiting requests without events get prefill(inf)
+ *
+ * ANTICIPATED EVENT SEMANTICS:
+ * The anticipated event is always the NEXT event after the real-world state,
+ * with a timestamp derived solely from the isolation sim's clock:
+ *
+ *   - real_dc=5, sim reached decode 8 at sim-time T:
+ *       anticipated = decode 6 at (T - 2*step_dur)   [back-calculated]
+ *   - real_dc=5, sim stopped at decode 2 at sim-time T:
+ *       anticipated = decode 6 at (T + 4*step_dur)   [extrapolated forward]
+ *   - request still queued in sim:
+ *       anticipated = prefill with end_ts=inf
+ *
+ * Timestamps may be in the past relative to wall clock. This is correct.
+ * Do NOT floor to wall clock here — callers interpret timestamps.
  * ------------------------------------------------------------------------- */
 
 static void run_rebuild_kernel(
         CReq *reqs, int n,
         int max_kv_tokens,   /* -1 = unlimited */
-        int fairinf_n)
+        int fairinf_n,
+        double until_timestamp)  /* stop when current_time >= this; -1 = no limit */
 {
     if (n <= 0) return;
 
@@ -369,6 +384,7 @@ static void run_rebuild_kernel(
     for (int step = 0; step < max_steps; step++) {
 
         if (anticipated_count >= n) break;
+        if (until_timestamp >= 0.0 && current_time >= until_timestamp) break;
 
         /* --- peek at waiting queue: any request ready? --- */
         int any_ready = 0;
@@ -533,9 +549,14 @@ static void run_rebuild_kernel(
                 if (!ss[idx].anticipated) {
                     int real_dc = reqs[idx].real_decode_count;
                     if (ss[idx].sim_decode_count > real_dc) {
+                        /* anticipated = real+1 at the sim-time when that decode
+                         * would have completed. Back-calculate from current_time:
+                         * sim is now at sim_dc, we want the time of (real_dc+1).
+                         * steps_past = sim_dc - (real_dc+1); each took dur seconds. */
+                        int steps_past = ss[idx].sim_decode_count - (real_dc + 1);
                         reqs[idx].ant_type       = 1;   /* decode */
-                        reqs[idx].ant_end_ts     = current_time;
-                        reqs[idx].ant_completion = ss[idx].sim_decode_count;
+                        reqs[idx].ant_end_ts     = current_time - steps_past * dur;
+                        reqs[idx].ant_completion = real_dc + 1;
                         ss[idx].anticipated      = 1;
                         anticipated_count++;
                     }
@@ -569,6 +590,32 @@ static void run_rebuild_kernel(
             reqs[idx].ant_end_ts     = Py_HUGE_VAL;  /* inf */
             reqs[idx].ant_completion = 0;
             ss[idx].anticipated      = 1;
+        }
+    }
+
+    /* Active requests without an anticipated event: sim stopped (max_steps or
+     * until_timestamp) before sim_decode_count exceeded real_decode_count.
+     * Extrapolate forward: the sim is at sim_dc at current_time, and needs
+     * (real_dc+1 - sim_dc) more steps to reach the anticipated decode.
+     * INVARIANT: anticipated = logical real+1 at pure sim-time. Extrapolate from
+     * sim's current position — do not floor to wall clock. */
+    {
+        for (int i = 0; i < active.len; i++) {
+            int idx = active.buf[i];
+            if (!ss[idx].anticipated) {
+                int sim_dc  = ss[idx].sim_decode_count;
+                int real_dc = reqs[idx].real_decode_count;
+                if (sim_dc >= real_dc) continue;  /* over-served: no deadline */
+                int next_n = real_dc + 1;
+                int ctx    = reqs[idx].prompt_len + next_n;
+                double dur = isolated_decode_time_estimation(
+                    (double)ctx, (double)ctx, 1.0, (double)fairinf_n);
+                int steps_remaining = next_n - sim_dc;
+                reqs[idx].ant_type       = 1;   /* decode */
+                reqs[idx].ant_end_ts     = current_time + steps_remaining * dur;
+                reqs[idx].ant_completion = next_n;
+                ss[idx].anticipated      = 1;
+            }
         }
     }
 
@@ -625,7 +672,7 @@ py_rebuild_kernel(PyObject *self, PyObject *args)
 
     /* --- Release GIL for the simulation --- */
     Py_BEGIN_ALLOW_THREADS
-    run_rebuild_kernel(reqs, (int)n, max_kv, fairinf_n);
+    run_rebuild_kernel(reqs, (int)n, max_kv, fairinf_n, -1.0);
     Py_END_ALLOW_THREADS
 
     /* --- Build result list (GIL re-acquired) --- */
@@ -678,9 +725,14 @@ c_rebuild_from_real_state(PyObject *self_capsule, PyObject *args, PyObject *kwar
         ut = self_capsule;  /* called directly with the UserTimeline as self */
     }
 
-    /* We ignore _unused, until_timestamp, timing_breakdown for now —
-     * until_timestamp is only used in tests, timing_breakdown is for profiling. */
-    (void)args; (void)kwargs;
+    /* Parse until_timestamp from kwargs if provided */
+    double until_ts = -1.0;
+    if (kwargs) {
+        PyObject *py_until = PyDict_GetItemString(kwargs, "until_timestamp");
+        if (py_until && py_until != Py_None)
+            until_ts = PyFloat_AsDouble(py_until);
+    }
+    (void)args;
 
     /* --- Read request_timelines dict --- */
     PyObject *request_timelines = PyObject_GetAttrString(ut, "request_timelines");
@@ -811,7 +863,7 @@ c_rebuild_from_real_state(PyObject *self_capsule, PyObject *args, PyObject *kwar
 
     /* --- Release GIL and run the kernel --- */
     Py_BEGIN_ALLOW_THREADS
-    run_rebuild_kernel(reqs, (int)n, max_kv, fairinf_n);
+    run_rebuild_kernel(reqs, (int)n, max_kv, fairinf_n, until_ts);
     Py_END_ALLOW_THREADS
 
     /* --- Write back anticipated events to Python objects --- */

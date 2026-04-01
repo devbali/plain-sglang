@@ -214,18 +214,13 @@ class StaticFairnessPolicy(NoFairnessPolicy):
             0,
             tree_cache.token_to_kv_pool.available_size() - pending_global_extend_tokens,
         )
-        user_evictable = tree_cache.evictable_total_user_counters.get_tokens(req.uid)
-        overlimit_evictable = 0
-        if tree_cache.static_max_per_user is not None:
-            total_snapshot = tree_cache.total_user_counters.snapshot()
-            evictable_snapshot = tree_cache.evictable_total_user_counters.snapshot()
-            for user_id, total_tokens in total_snapshot.items():
-                if user_id == req.uid:
-                    continue
-                if total_tokens > tree_cache.static_max_per_user:
-                    overlimit_evictable += evictable_snapshot.get(user_id, 0)
+        # The allocator can evict any evictable cache globally, so count all
+        # evictable tokens (not just overlimit users') in the capacity check.
+        total_evictable = sum(
+            tree_cache.evictable_total_user_counters.snapshot().values()
+        )
 
-        return req.extend_input_len > available_now + user_evictable + overlimit_evictable
+        return req.extend_input_len > available_now + total_evictable
 
     # ---- Request admission -------------------------------------------------
     def init_next_round_input_control(
@@ -268,8 +263,11 @@ class StaticFairnessPolicy(NoFairnessPolicy):
     def uses_static_isolated_memory(self) -> bool:
         return self._has_static_limit()
 
+    def pin_new_token_ratio(self) -> bool:
+        return self._has_static_limit()
+
     def ignore_global_prefill_token_budget(self) -> bool:
-        return False
+        return self._has_static_limit()
 
     def continue_scanning_waiting_queue_on_prefill_block(self) -> bool:
         return self._has_static_limit()
@@ -318,11 +316,11 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         assert tree_cache is not None
         out_cache_loc = None if evict_only_force else token_to_kv_pool.alloc(num_tokens)
         logger.debug(
-            "StaticFairnessPolicy: alloc %s tokens for %s (force=%s, initial_loc=%s)",
+            "StaticFairnessPolicy: alloc %s tokens for %s (force=%s, initial_ok=%s)",
             num_tokens,
             user_id,
             evict_only_force,
-            out_cache_loc,
+            out_cache_loc is not None,
         )
 
         if evict_only_force or (out_cache_loc is None and not evict_only_force):
@@ -365,18 +363,13 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         running_batch: Optional["ScheduleBatch"] = None,
         requesting_users: Optional[Sequence[str]] = None,
     ) -> Tuple[Optional[int], List["Req"]]:
-        if not self.requires_per_user_allocation():
-            return super().prepare_for_extend_allocation(
-                batch,
-                extend_num_tokens,
-                running_batch=running_batch,
-                requesting_users=requesting_users,
-            )
-        out_cache_loc = self.alloc_token_slots(
-            batch.token_to_kv_pool,
-            extend_num_tokens,
-            user_id=batch.reqs[0].uid if batch.reqs else None,
-        )
+        # Same as vanilla SGLang: evict any evictable cache globally, allocate.
+        # Partition admission was already checked upstream by the scheduler;
+        # here we just need to make physical space.
+        out_cache_loc = batch.token_to_kv_pool.alloc(extend_num_tokens)
+        if out_cache_loc is None and self.tree_cache is not None:
+            self.tree_cache.evict(extend_num_tokens, batch.token_to_kv_pool.free)
+            out_cache_loc = batch.token_to_kv_pool.alloc(extend_num_tokens)
         return out_cache_loc, []
 
     def process_waiting_queue_prefills(
@@ -584,8 +577,13 @@ class StaticFairnessPolicy(NoFairnessPolicy):
             bs,
             overages,
         )
+        # Evict over-partition users' cache first.
         for user_id, overage in overages.items():
             tree_cache.evict_from_user(overage, batch.token_to_kv_pool.free, user_id)
+
+        # If physical pool still tight, evict globally (any evictable cache).
+        if batch.token_to_kv_pool.available_size() < bs:
+            tree_cache.evict(bs, batch.token_to_kv_pool.free)
 
         remaining_overages = self._users_exceeding_static_limit_for_decode(batch)
         if batch.token_to_kv_pool.available_size() >= bs and not remaining_overages:
@@ -621,6 +619,7 @@ class StaticFairnessPolicy(NoFairnessPolicy):
         if not self.requires_per_user_allocation():
             return super().alloc_decode_output_slots(batch)
 
+        bs = batch.batch_size()
         overages = self._users_exceeding_static_limit_for_decode(batch)
         for user_id, overage in overages.items():
             self.alloc_token_slots(
@@ -630,7 +629,12 @@ class StaticFairnessPolicy(NoFairnessPolicy):
                 evict_only_force=True,
             )
 
-        out_cache_loc = batch.token_to_kv_pool.alloc(batch.batch_size())
+        out_cache_loc = batch.token_to_kv_pool.alloc(bs)
+        if out_cache_loc is None:
+            # Physical pool tight but no user over partition — global eviction.
+            if self.tree_cache is not None:
+                self.tree_cache.evict(bs, batch.token_to_kv_pool.free)
+            out_cache_loc = batch.token_to_kv_pool.alloc(bs)
         if out_cache_loc is None:
             raise RuntimeError(
                 "Failed to allocate decode slots under static fairness policy."

@@ -503,12 +503,17 @@ class ScheduleBatch:
 
         # Allocate memory
         req_pool_indices_cpu = self.alloc_req_slots(bs)
-        out_cache_loc, removed_requests = self.fairness_policy.prepare_for_extend_allocation(
-            self,
-            extend_num_tokens,
-            running_batch=running_batch,
-            requesting_users=requesting_users,
-        )
+        try:
+            out_cache_loc, removed_requests = self.fairness_policy.prepare_for_extend_allocation(
+                self,
+                extend_num_tokens,
+                running_batch=running_batch,
+                requesting_users=requesting_users,
+            )
+        except Exception:
+            # Free req pool slots before propagating so they aren't leaked.
+            self.req_to_token_pool.free(req_pool_indices_cpu)
+            raise
         alloc_done = time.perf_counter()
 
         pt = 0

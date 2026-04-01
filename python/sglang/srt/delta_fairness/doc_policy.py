@@ -36,12 +36,15 @@ from .time_estimation import (
 )
 
 logger = logging.getLogger(__name__)
-DOC_POLICY_TRACE_ENABLED = True
+DOC_POLICY_TRACE_ENABLED = False
 
 # When True: sort the safe prefill queue fair-clients-first.
 PREFILL_PRIORITIZE_FAIR = True
 # When True: only consider fair clients' decode deadlines when deciding whether to force a decode pass.
 DECODE_PRIORITIZE_FAIR = True
+# When True: only consider fair clients' decode deadlines when computing earliest_decode_start_deadline
+# (i.e. unfair users' decode deadlines do not throttle prefills of fair users).
+DECODE_DEADLINE_FAIR_ONLY = False
 
 
 class DocPolicy(DeltaFairnessPolicy):
@@ -455,11 +458,22 @@ class DocPolicy(DeltaFairnessPolicy):
                 candidate
                 for candidate in deadline_queue
                 if candidate.event_type == "decode"
+                and (not DECODE_DEADLINE_FAIR_ONLY or fair_uids is None or candidate.req.uid in fair_uids)
             ),
             key=lambda candidate: candidate.start_deadline,
             default=None,
         )
         if earliest_decode_candidate is None:
+            # No decode deadline — force all fair waiting requests unconditionally.
+            # Without a decode deadline there is no time constraint on prefills,
+            # so every fair waiting request should be admitted (with retraction if
+            # needed) to prevent starvation when the cache is full of unfair reqs.
+            for req in waiting_queue:
+                if fair_uids is None or req.uid in fair_uids:
+                    forced_prefill_queue.append(req)
+                    forced_prefill_rids.add(req.rid)
+            max_safe_prefill_tokens = sum(len(req.origin_input_ids) for req in forced_prefill_queue) or None
+            has_fair_waiting = bool(forced_prefill_queue) or has_fair_waiting
             return {
                 "safe_waiting_queue": safe_waiting_queue,
                 "safe_waiting_rids": safe_waiting_rids,
@@ -498,32 +512,23 @@ class DocPolicy(DeltaFairnessPolicy):
                 no_retraction_cap is not None
                 and next_safe_prompt_tokens > no_retraction_cap
             )
-            if beyond_no_retraction_cap:
-                if fair_uids is not None:
-                    is_fair = req.uid in fair_uids
-                else:
-                    this_user_sum = pending_prefill_sum_by_user.get(req.uid, 0)
-                    is_fair = self._user_is_fair_prefill_from_frozen(
-                        req.uid,
-                        this_user_sum=req.get_estimated_prefill_impact() + this_user_sum,
-                        frozen_cache_state=frozen_cache_state,
-                    )
-                if not is_fair:
-                    skipped_rids.append(req.rid)
-                    skipped_reasons.append("unfair_user")
-                    continue
-                if not self._force_prefill_within_user_headroom_from_frozen(
-                    req,
-                    running_batch=running_batch,
-                    pending_prefill_tokens=pending_prefill_sum_by_user.get(req.uid, 0),
-                    frozen_cache_state=frozen_cache_state,
-                    new_token_ratio=(
-                        frozen_inputs.new_token_ratio if frozen_inputs is not None else 0.0
-                    ),
-                ):
-                    skipped_rids.append(req.rid)
-                    skipped_reasons.append("headroom")
-                    continue
+            is_fair = fair_uids is None or req.uid in fair_uids
+            if not is_fair and beyond_no_retraction_cap:
+                skipped_rids.append(req.rid)
+                skipped_reasons.append("unfair_user")
+                continue
+            if is_fair and not self._force_prefill_within_user_headroom_from_frozen(
+                req,
+                running_batch=running_batch,
+                pending_prefill_tokens=pending_prefill_sum_by_user.get(req.uid, 0),
+                frozen_cache_state=frozen_cache_state,
+                new_token_ratio=(
+                    frozen_inputs.new_token_ratio if frozen_inputs is not None else 0.0
+                ),
+            ):
+                skipped_rids.append(req.rid)
+                skipped_reasons.append("headroom")
+                continue
             candidate_max_tokens = max(selected_batch_max_tokens, req_prefill_tokens)
             pooled_prefill_s = pooled_prefill_time_estimation(
                 next_safe_prompt_tokens,
@@ -725,10 +730,40 @@ class DocPolicy(DeltaFairnessPolicy):
         breakdown: Dict[str, float] = {}
         pass_start = time.perf_counter()
 
+        # If no new task has been enqueued since the last consumed snapshot, enqueue one
+        # now (with no mutations — just a fresh view of current state) so the background
+        # thread can produce an up-to-date snapshot.  Skip this on fully idle passes
+        # (nothing running and nothing waiting) since there is nothing to compute.
+        if self._last_prepare_task_seq <= self._last_consumed_prepare_snapshot_seq:
+            has_live = (running_batch is not None and len(running_batch.reqs) > 0) or len(waiting_queue) > 0
+            if has_live:
+                running_prepare = self._prepare_worker.make_prepare_batch(running_batch)
+                waiting_prepare = [_PrepareReq.from_req(req) for req in waiting_queue]
+                task_seq = self._enqueue_prepare_task(
+                    (
+                        waiting_prepare,
+                        running_prepare,
+                        self._freeze_prepare_cache_state(known_fair_uids=None),
+                        self._freeze_prepare_inputs(new_token_ratio=new_token_ratio),
+                        self._prepare_worker.mutation_seq,
+                    )
+                )
+                self._last_prepare_task_seq = task_seq
+                self._trace(
+                    "enqueue_prepare",
+                    pass_id=self._current_pass_id,
+                    task_seq=task_seq,
+                    event_type="start_of_pass_refresh",
+                    waiting_len=len(waiting_prepare),
+                    running_len=0 if running_prepare is None else len(running_prepare.reqs),
+                    decode_steps=0,
+                    current_pass_id=self._current_pass_id,
+                )
         # Wait until the worker publishes a snapshot newer than the last one we consumed.
-        self._prepare_worker.wait_for_snapshot(
-            min_task_seq=self._last_consumed_prepare_snapshot_seq + 1,
-        )
+        if self._last_prepare_task_seq > self._last_consumed_prepare_snapshot_seq:
+            self._prepare_worker.wait_for_snapshot(
+                min_task_seq=self._last_consumed_prepare_snapshot_seq + 1,
+            )
         if self._consume_prepared_pass_state(waiting_queue, running_batch):
             self._last_pass_state_source = "start_of_pass_consume_prepared"
         else:
@@ -884,6 +919,7 @@ class DocPolicy(DeltaFairnessPolicy):
     def process_new_request(self, req: Req) -> None:
         arrival_ts = time.time()
         super().process_new_request(req)
+        TIMELINE_WRITER.mark_queue_enter(req.rid, req.uid)
         self._enqueue_prepare_mutation(
             "process_new_request",
             (_PrepareReq.from_req(req), dict(self._deltas_us), arrival_ts),
@@ -907,6 +943,7 @@ class DocPolicy(DeltaFairnessPolicy):
 
     def mark_request_finished(self, req: Req) -> None:
         super().mark_request_finished(req)
+        TIMELINE_WRITER.mark_completed(req.rid, req.uid)
         self._enqueue_prepare_mutation(
             "mark_request_finished",
             (_PrepareReq.from_req(req), self._current_pass_id),
@@ -1299,10 +1336,9 @@ class DocPolicy(DeltaFairnessPolicy):
 
         ordered_safe_waiting = sorted(self._safe_waiting_queue, key=_sort_key)
 
-        # Budget of tokens that can be admitted without touching evictable cache
-        # (i.e. without risking decode retractions). Fair users may exceed this.
-        evictable = self.tree_cache.evictable_size() if self.tree_cache is not None else 0
-        no_retraction_budget = adder.rem_total_tokens - evictable
+        # no_retraction_budget disabled — was incorrectly blocking unfair users
+        # even when there was plenty of physical memory available.
+        no_retraction_budget = float("inf")
 
         for prepared_req in ordered_safe_waiting:
             req = waiting_by_rid.get(prepared_req.rid)
@@ -1371,40 +1407,57 @@ class DocPolicy(DeltaFairnessPolicy):
                 break
 
         # If the safe_waiting_queue loop admitted nothing (stale snapshot or all KV-rejected),
-        # try fair users from the live waiting queue sorted by prefill deadline.
-        # We bypass sorted_waiting_queue() here because it re-prioritizes by _safe_waiting_queue,
-        # which would just repeat the same rejected set at the front.
+        # try from the live waiting queue sorted by prefill deadline.
+        # Pre-split into fair-only and all lists to avoid expensive match_prefix
+        # calls on requests that will just be rejected by fairness checks.
         if not adder.can_run_list:
-            live_sorted = sorted(
-                waiting_queue,
-                key=lambda r: self._waiting_prefill_start_deadline_by_rid.get(r.rid, float("inf")),
-            )
-            for req in live_sorted:
-                if req in adder.can_run_list:
-                    continue
-                if running_batch_size + len(adder.can_run_list) >= effective_running_limit:
-                    break
-                if max_input_size is not None and adder.log_input_tokens > max_input_size:
-                    break
-                if adder.log_input_tokens > no_retraction_budget and not self.user_is_fair_prefill(req.uid, running_batch=running_batch):
-                    continue
-                if max_input_size is not None:
-                    adder.rem_input_tokens = max_input_size - adder.log_input_tokens
-                extra_tokens = pending_prefill_by_user.get(req.uid, 0)
-                res = req.init_next_round_input(
-                    target_tree_cache,
-                    fairness_policy=self,
-                    fair=True,
-                    extra_tokens=extra_tokens,
-                )
-                if res == "rejected":
-                    continue
-                add_res = adder.add_one_req(req, extra_tokens)
-                if add_res == "rejected":
-                    continue
-                token_counters_by_user.setdefault(req.uid, []).append(req.extend_input_len)
-                pending_prefill_by_user[req.uid] = extra_tokens + req.extend_input_len
-                if not add_res or adder.no_remaining_tokens():
+            _deadline_key = lambda r: self._waiting_prefill_start_deadline_by_rid.get(r.rid, float("inf"))
+            _fair_cache: Dict[str, bool] = {}
+            live_fair: List[Req] = []
+            live_all: List[Req] = []
+            for req in waiting_queue:
+                uid = req.uid
+                if uid not in _fair_cache:
+                    _fair_cache[uid] = self.user_is_fair_prefill(uid, running_batch=running_batch)
+                if _fair_cache[uid]:
+                    live_fair.append(req)
+                live_all.append(req)
+            live_fair.sort(key=_deadline_key)
+            live_all.sort(key=_deadline_key)
+
+            # Try fair users first; fall back to all users only if no fair
+            # requests could be admitted (e.g. all fair users already running).
+            candidate_lists = [live_fair]
+            if not live_fair:
+                candidate_lists = [live_all]
+
+            for candidates in candidate_lists:
+                for req in candidates:
+                    if req in adder.can_run_list:
+                        continue
+                    if running_batch_size + len(adder.can_run_list) >= effective_running_limit:
+                        break
+                    if max_input_size is not None and adder.log_input_tokens > max_input_size:
+                        break
+                    if max_input_size is not None:
+                        adder.rem_input_tokens = max_input_size - adder.log_input_tokens
+                    extra_tokens = pending_prefill_by_user.get(req.uid, 0)
+                    res = req.init_next_round_input(
+                        target_tree_cache,
+                        fairness_policy=self,
+                        fair=_fair_cache.get(req.uid, False),
+                        extra_tokens=extra_tokens,
+                    )
+                    if res == "rejected":
+                        continue
+                    add_res = adder.add_one_req(req, extra_tokens)
+                    if add_res == "rejected":
+                        continue
+                    token_counters_by_user.setdefault(req.uid, []).append(req.extend_input_len)
+                    pending_prefill_by_user[req.uid] = extra_tokens + req.extend_input_len
+                    if not add_res or adder.no_remaining_tokens():
+                        break
+                if adder.can_run_list:
                     break
 
     # -------------------------------------------------------------------------
@@ -1452,6 +1505,7 @@ class DocPolicy(DeltaFairnessPolicy):
         super().finished_prefill(batch)
         now = time.time()
         for req in batch.reqs:
+            TIMELINE_WRITER.mark_prefill_done(req.rid, req.uid)
             self._mark_violation_if_executed_after_deadline(
                 req,
                 event_type="prefill",
@@ -1459,6 +1513,15 @@ class DocPolicy(DeltaFairnessPolicy):
             )
 
     def finished_decode(self, batch: ScheduleBatch, decode_rounds: int = 1) -> None:
+        now = time.time()
+        for req in batch.reqs:
+            completion_number = len(getattr(req, "output_ids", []))
+            self._mark_violation_if_executed_after_deadline(
+                req,
+                event_type="decode",
+                completion_number=completion_number,
+                now=now,
+            )
         super().finished_decode(batch, decode_rounds=decode_rounds)
 
     # -------------------------------------------------------------------------

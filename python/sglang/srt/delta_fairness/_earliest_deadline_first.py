@@ -22,7 +22,7 @@ if False:  # pragma: no cover - imported only for type checkers
 
 import time
 from datetime import datetime, timezone
-from sglang.srt.request_timeline import TIMELINE_WRITER
+from sglang.srt.request_timeline import TIMELINE_WRITER, COMPLETION_WRITER
 
 
 def _iso_ts(ts: float) -> str:
@@ -1420,7 +1420,7 @@ class EarliestDeltaFirst (DeltaFairnessPolicy):
             last_ts = tracked.alternate_history_timeline.history[-1].end_timestamp
         else:
             last_ts = time.time()
-        TIMELINE_WRITER.mark_isolated_completed(req.rid, req.uid, timestamp_iso=_iso_ts(last_ts))
+        TIMELINE_WRITER.mark_isolated_completed(req.rid, req.uid, timestamp_iso=_iso_ts(last_ts), completion_writer=COMPLETION_WRITER)
         super().mark_request_finished(req)
         self.event_queue.requests.pop(req.rid, None)
         self.event_queue.most_recent_event_real.pop(req.rid, None)

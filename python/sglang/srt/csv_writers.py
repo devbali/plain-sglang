@@ -183,38 +183,10 @@ class RequestTimelineWriter:
             fn(self._get_or_create(request_id, uid))
 
     def flush(self) -> None:
-        if not ENABLE_REQUEST_TIMELINE_WRITES:
-            return
-        with self._lock:
-            if self._write_failed:
-                return
-            tmp = f"{self.csv_path}.tmp"
-            try:
-                with open(tmp, "w", newline="") as f:
-                    w = csv.writer(f)
-                    w.writerow(_TIMELINE_HEADER)
-                    for rid in sorted(self._rows):
-                        r = self._rows[rid]
-                        w.writerow([
-                            r.request_id, r.user_id, r.user_request_number,
-                            r.queue_enter_ts, r.prefill_start_ts, r.prefill_done_ts,
-                            r.running_batch_removed_ts, r.running_batch_removed_count,
-                            r.retraction_count, r.delta_violation_count,
-                            r.prefill_delta_violation_count, r.decode_delta_violation_count,
-                            r.total_request_event_count, r.prefill_request_event_count,
-                            r.decode_request_event_count, r.first_decode_start_ts,
-                            r.isolated_start_ts, r.isolated_prefill_done_ts,
-                            r.isolated_first_decode_done_ts, r.isolated_latest_decode_done_ts,
-                            r.isolated_completed_ts, r.completed_ts,
-                        ])
-                os.replace(tmp, self.csv_path)
-            except OSError:
-                self._write_failed = True
-                try:
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
-                except OSError:
-                    pass
+        # Disk writes are handled by COMPLETION_WRITER (append-only).
+        # This method is kept as a no-op so atexit and the flush thread
+        # don't error, but it no longer overwrites fairinf_request_timeline.csv.
+        pass
 
     def mark_queue_enter(self, rid: str, uid: Optional[str]) -> None:
         now = _now_iso()
@@ -266,9 +238,18 @@ class RequestTimelineWriter:
             elif event_type == "decode":
                 r.decode_request_event_count += 1
 
-    def mark_completed(self, rid: str, uid: Optional[str]) -> None:
+    def mark_completed(self, rid: str, uid: Optional[str], *, completion_writer=None) -> None:
         now = _now_iso()
-        self._update(rid, uid, lambda r: None if r.completed_ts else setattr(r, "completed_ts", now))
+        if not ENABLE_REQUEST_TIMELINE_WRITES or not rid:
+            return
+        with self._lock:
+            r = self._get_or_create(rid, uid)
+            if not r.completed_ts:
+                r.completed_ts = now
+                # Write now (may lack isolated fields); a second row with
+                # complete data will be appended by mark_isolated_completed.
+                if completion_writer is not None:
+                    completion_writer.write_completion(r)
 
     def mark_isolated_prefill_done(self, rid: str, uid: Optional[str], *, timestamp_iso: str) -> None:
         self._update(rid, uid, lambda r: None if r.isolated_prefill_done_ts == timestamp_iso else setattr(r, "isolated_prefill_done_ts", timestamp_iso))
@@ -281,8 +262,16 @@ class RequestTimelineWriter:
                 r.isolated_latest_decode_done_ts = timestamp_iso
         self._update(rid, uid, _apply)
 
-    def mark_isolated_completed(self, rid: str, uid: Optional[str], *, timestamp_iso: str) -> None:
-        self._update(rid, uid, lambda r: None if r.isolated_completed_ts == timestamp_iso else setattr(r, "isolated_completed_ts", timestamp_iso))
+    def mark_isolated_completed(self, rid: str, uid: Optional[str], *, timestamp_iso: str, completion_writer=None) -> None:
+        if not ENABLE_REQUEST_TIMELINE_WRITES or not rid:
+            return
+        with self._lock:
+            r = self._get_or_create(rid, uid)
+            if r.isolated_completed_ts != timestamp_iso:
+                r.isolated_completed_ts = timestamp_iso
+            # Append a final row with all isolated fields filled in.
+            if r.completed_ts and completion_writer is not None:
+                completion_writer.write_completion(r)
 
 
 # ---------------------------------------------------------------------------
@@ -379,9 +368,37 @@ class IsolatedSimTimelineWriter(_BufferedAppendWriter):
 
 
 # ---------------------------------------------------------------------------
+# RequestCompletionWriter — append-only, one row per completed request
+# ---------------------------------------------------------------------------
+
+class RequestCompletionWriter(_BufferedAppendWriter):
+    _HEADER = _TIMELINE_HEADER
+
+    def __init__(self, csv_path: Optional[str] = None) -> None:
+        super().__init__(csv_path or os.path.join(os.getcwd(), "fairinf_request_completions.csv"))
+
+    def write_completion(self, row: TimelineRow) -> None:
+        if not ENABLE_REQUEST_TIMELINE_WRITES:
+            return
+        self._enqueue([[
+            row.request_id, row.user_id, row.user_request_number,
+            row.queue_enter_ts, row.prefill_start_ts, row.prefill_done_ts,
+            row.running_batch_removed_ts, row.running_batch_removed_count,
+            row.retraction_count, row.delta_violation_count,
+            row.prefill_delta_violation_count, row.decode_delta_violation_count,
+            row.total_request_event_count, row.prefill_request_event_count,
+            row.decode_request_event_count, row.first_decode_start_ts,
+            row.isolated_start_ts, row.isolated_prefill_done_ts,
+            row.isolated_first_decode_done_ts, row.isolated_latest_decode_done_ts,
+            row.isolated_completed_ts, row.completed_ts,
+        ]])
+
+
+# ---------------------------------------------------------------------------
 # Singletons
 # ---------------------------------------------------------------------------
 
 TIMELINE_WRITER = RequestTimelineWriter()
+COMPLETION_WRITER = RequestCompletionWriter()
 RUNNING_BATCH_WRITER = RunningBatchSnapshotWriter()
 ISOLATED_SIM_TIMELINE_WRITER = IsolatedSimTimelineWriter()

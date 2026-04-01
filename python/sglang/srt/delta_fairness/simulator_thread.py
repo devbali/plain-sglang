@@ -18,7 +18,7 @@ import torch
 # thread to proceed in parallel.  Set to False to fall back to pure Python
 # (e.g. for debugging or when the .so has not been built yet).
 # ---------------------------------------------------------------------------
-USE_C_SIM = True
+USE_C_SIM = True  # Disabled: rebuild_from_real_state is now incremental (Python only)
 
 try:
     from sglang.srt.delta_fairness import _fairinf_sim as _sim_c  # type: ignore[import]
@@ -475,10 +475,12 @@ class _DocPolicyPrepareWorker:
             if frozen_cache_state is not None
             else None
         )
+        now_ts = time.time()
         for uid, user_timeline in simulator.users.items():
             if _known_fair is not None and uid not in _known_fair:
                 continue
             user_timeline.rebuild_from_real_state(
+                until_timestamp=now_ts,
                 timing_breakdown=target_breakdown,
             )
         ISOLATED_SIM_TIMELINE_WRITER.write_snapshot(simulator)
