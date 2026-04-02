@@ -857,10 +857,14 @@ class _DocPolicyPrepareWorker:
         delta_prefill_s = float(_default_deltas.get("prefill", 0)) / 1_000_000.0
         delta_decode_s = float(_default_deltas.get("decode", 0)) / 1_000_000.0
 
-        waiting_rids = [r.rid for r in deadline_waiting_queue]
+        # Pass ALL waiting RIDs to the C extension so it can include non-fair users
+        # in its waiting_set. The C extension filters to fair_uids internally for
+        # deadline candidates, but the second pass (no-deadline waiters) needs all
+        # waiting RIDs present to emit good-user entries.
+        waiting_rids = [r.rid for r in waiting_queue]
         running_rids = [r.rid for r in (running_batch.reqs if running_batch is not None else [])]
 
-        rid_to_req: Dict[str, object] = {r.rid: r for r in deadline_waiting_queue}
+        rid_to_req: Dict[str, object] = {r.rid: r for r in waiting_queue}
         rid_to_req.update(
             {r.rid: r for r in (running_batch.reqs if running_batch is not None else [])}
         )

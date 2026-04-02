@@ -559,7 +559,7 @@ class DocPolicy(DeltaFairnessPolicy):
             break
 
         max_safe_prefill_tokens = safe_prompt_tokens
-        return {
+        state = {
             "safe_waiting_queue": safe_waiting_queue,
             "safe_waiting_rids": safe_waiting_rids,
             "forced_prefill_queue": forced_prefill_queue,
@@ -573,6 +573,8 @@ class DocPolicy(DeltaFairnessPolicy):
             "skipped_reasons": skipped_reasons,
         }
 
+        print(f"DEBUG DOC POLICY COMPUTE_SAFE_PREFIX_STATE: {state}")
+        return state
     # -------------------------------------------------------------------------
     # Prepare-thread snapshot builder (called from the worker thread)
     # -------------------------------------------------------------------------

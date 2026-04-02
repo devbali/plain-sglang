@@ -35,7 +35,8 @@
  *   = 0.020 + 0.05092250719117761 = 0.07092250719117761
  */
 #define W_DECODE_CONST_OVERHEAD   0.020
-#define W_TBT_DELTA               0.080
+#define W_PREFILL_CONST_OVERHEAD  0.080
+#define W_TBT_DELTA               0.080 // 0.960, 1.500, micro: 0.080
 /* MAX_POOLED_DECODE_LATENCY as used in isolated_decode_time_estimation comparison:
  * The Python function compares the inner linear term against MAX_POOLED_DECODE_LATENCY,
  * which is the FULL return value of pooled_decode_time_estimation (includes CONST_INTERVAL_DECODE).
@@ -63,15 +64,15 @@ static double w_isolated_prefill_time_estimation(
     if (total_batch_sum <= W_PREFILL_PIECEWISE_BOUND) {
         v =  9.15608285e-03
            + 6.14834557e-05 * n * total_batch_sum
-           + 2.26526916e-06 * n * max_token_size
-           + -1.52741501e-05 * n * batch_length;
+           + 2.26526916e-06 * n * max_token_size;
+          // + -1.52741501e-05 * n * batch_length;
     } else {
         v = -4.03734644e-02
            + 6.62669482e-05 * n * total_batch_sum
-           + 1.42083211e-05 * n * max_token_size
-           + -1.02748344e-04 * n * batch_length;
+           + 1.42083211e-05 * n * max_token_size;
+         //  + -1.02748344e-04 * n * batch_length;
     }
-    return v > 5e-3 ? v : 5e-3;
+    return v > 5e-3 ? W_PREFILL_CONST_OVERHEAD + v : 5e-3;
 }
 
 static double w_isolated_decode_time_estimation(
@@ -541,15 +542,15 @@ static void w_run_rebuild_kernel(
         }
     }
 
-    /* Fallback for active requests that never crossed real_dc (sim ran out of steps).
-     * Extrapolate forward: sim is at sim_dc at current_time, needs (real_dc+1 - sim_dc)
-     * more steps. Pure sim-time, no wall-clock floor. */
+    /* Fallback for active requests without an anticipated event (sim ran out
+     * of steps or time).  Always extrapolate the next decode (real_dc+1).
+     * If sim_dc > real_dc, steps_remaining is negative and the deadline is
+     * in the past — the request is overdue relative to isolation. */
     for (int i = 0; i < active.len; i++) {
         int idx = active.buf[i];
         if (!ss[idx].anticipated) {
             int sim_dc  = ss[idx].sim_decode_count;
             int real_dc = reqs[idx].real_decode_count;
-            if (sim_dc >= real_dc) continue;  /* over-served: no deadline */
             int next_n = real_dc + 1;
             int ctx    = reqs[idx].prompt_len + next_n;
             double step_dur = w_isolated_decode_time_estimation(
@@ -1908,8 +1909,11 @@ CSimulator_build_deadline_candidates(CSimulatorObject *self, PyObject *args)
         int mre_type = tr->mre_type;
 
         if (mre_type == 0) {
-            /* Start: upcoming = ant if ant_type >= 0 */
-            if (tr->ant_type >= 0) {
+            /* Start: upcoming = ant if ant_type >= 0.
+             * But if the request is already running and ant says prefill,
+             * the prefill already happened — skip it so the fallback
+             * generates a decode deadline instead. */
+            if (tr->ant_type >= 0 && !(in_running && tr->ant_type == 0)) {
                 upcoming_type = tr->ant_type;
                 upcoming_ts   = tr->ant_ts;
                 upcoming_cn   = tr->ant_cn;
@@ -1931,16 +1935,41 @@ CSimulator_build_deadline_candidates(CSimulatorObject *self, PyObject *args)
             }
         }
 
-        /* Fallback for running with no upcoming decode */
-        if (in_running && upcoming_type == -1 &&
-            (mre_type == 1 || mre_type == 2))
-        {
-            int next_n = (mre_type == 2) ? tr->mre_cn + 1 : 1;
+        /* Fallback for running with no upcoming decode.
+         * mre_type==0 (Start) can happen when prefill/decode mutations haven't
+         * propagated yet — the request is running so it must be prefilled;
+         * use decode_count to figure out where it is. */
+        if (in_running && upcoming_type == -1) {
+            int next_n;
+            double base_ts;
+            if (mre_type == 2) {
+                next_n  = tr->mre_cn + 1;
+                base_ts = tr->mre_ts;
+            } else if (mre_type == 1) {
+                next_n  = 1;
+                base_ts = tr->mre_ts;
+            } else {
+                /* mre_type == 0 (Start): mutations not yet applied.
+                 * Use decode_count from real state.  For base_ts, prefer
+                 * latest_sim_completion_ts; fall back to arrival_ts only if
+                 * it looks like a valid Unix timestamp (> 1e9). Otherwise
+                 * use wall-clock now — the deadline will be "right now". */
+                next_n  = tr->decode_count + 1;
+                if (tr->latest_sim_completion_ts > 1e9)
+                    base_ts = tr->latest_sim_completion_ts;
+                else if (tr->arrival_ts > 1e9)
+                    base_ts = tr->arrival_ts;
+                else {
+                    struct timespec _ts;
+                    clock_gettime(CLOCK_REALTIME, &_ts);
+                    base_ts = (double)_ts.tv_sec + (double)_ts.tv_nsec / 1e9;
+                }
+            }
             int ctx = tr->prompt_len + next_n;
             double dur = w_isolated_decode_time_estimation(
                 (double)ctx, (double)ctx, 1.0, (double)fn);
             upcoming_type = 1;
-            upcoming_ts   = tr->mre_ts + dur;
+            upcoming_ts   = base_ts + dur;
             upcoming_cn   = next_n;
         }
 
@@ -1973,7 +2002,16 @@ CSimulator_build_deadline_candidates(CSimulatorObject *self, PyObject *args)
             }
         } else if (upcoming_type == 1 && in_running) {
             /* Decode candidate */
-            if (has_fair_decode && w_hm_get(&fair_decode_set, tr->uid) == HT_EMPTY) continue;
+            /* upcoming_ts can back-calculate below 1e9 when the isolation sim ran far ahead
+             * of the real state and the back-calculation underflows. This means the decode
+             * was due long ago — clamp to arrival_ts so the deadline is maximally urgent
+             * (past-due). Only skip if we have no valid timestamp at all. */
+            if (upcoming_ts < 1e9) {
+                if (tr->arrival_ts > 1e9)
+                    upcoming_ts = tr->arrival_ts;
+                else
+                    continue;  /* truly uninitialized — no valid timestamp available */
+            }
             double deadline = upcoming_ts + delta_decode_s;
             double start_dl = deadline - pooled_decode_s;
             if (!has_earliest_decode || start_dl < earliest_decode.start_deadline) {
@@ -1991,7 +2029,6 @@ CSimulator_build_deadline_candidates(CSimulatorObject *self, PyObject *args)
     }
 
     /* Sort prefill_candidates by (start_deadline, deadline, arrival_ts) — insertion sort */
-    #define PREFILL_CAP 32
     if (n_prefill > 1) {
         /* Use insertion sort */
         for (int i = 1; i < n_prefill; i++) {
@@ -2013,7 +2050,50 @@ CSimulator_build_deadline_candidates(CSimulatorObject *self, PyObject *args)
             }
             prefill_candidates[j + 1] = tmp;
         }
-        if (n_prefill > PREFILL_CAP) n_prefill = PREFILL_CAP;
+    }
+
+    /* Cap at 16 per-user and 72 global prefill candidates (keep earliest deadlines).
+     * The array is already sorted by start_deadline, so scan linearly and compact
+     * in-place, skipping entries whose user has already contributed 16 entries or
+     * the global output count has reached 72. */
+    #define PREFILL_PER_USER_CAP 16
+    #define PREFILL_GLOBAL_CAP   72
+    if (n_prefill > 0) {
+        /* Small hash map: uid string -> count. Use a fixed-size open-address table. */
+        #define PUC_SLOTS 64
+        char   puc_keys[PUC_SLOTS][W_UID_MAX];
+        int    puc_vals[PUC_SLOTS];
+        int    puc_used[PUC_SLOTS];
+        memset(puc_used, 0, sizeof(puc_used));
+
+        int out = 0;
+        for (int i = 0; i < n_prefill; i++) {
+            if (out >= PREFILL_GLOBAL_CAP) break;
+            const char *uid = prefill_candidates[i].uid;
+            /* FNV-1a hash */
+            unsigned int h = 2166136261u;
+            for (const char *p = uid; *p; p++) {
+                h ^= (unsigned char)*p;
+                h *= 16777619u;
+            }
+            int slot = (int)(h % PUC_SLOTS);
+            /* Linear probe */
+            while (puc_used[slot] && strncmp(puc_keys[slot], uid, W_UID_MAX) != 0)
+                slot = (slot + 1) % PUC_SLOTS;
+            if (!puc_used[slot]) {
+                puc_used[slot] = 1;
+                strncpy(puc_keys[slot], uid, W_UID_MAX - 1);
+                puc_keys[slot][W_UID_MAX - 1] = '\0';
+                puc_vals[slot] = 0;
+            }
+            if (puc_vals[slot] < PREFILL_PER_USER_CAP) {
+                puc_vals[slot]++;
+                prefill_candidates[out++] = prefill_candidates[i];
+            }
+            /* else: user over per-user quota — skip, continue for other users */
+        }
+        n_prefill = out;
+        #undef PUC_SLOTS
     }
 
     Py_END_ALLOW_THREADS
@@ -2068,11 +2148,129 @@ CSimulator_build_deadline_candidates(CSimulatorObject *self, PyObject *args)
         Py_DECREF(val);
     }
 
-    /* Build ordered_waiting_rids tuple */
-    PyObject *ordered_rids = PyTuple_New(n_prefill);
+    /* Build ordered_waiting_rids list: deadline-sorted candidates first (already capped),
+     * then any waiting requests with no simulation result (no deadline), also per-user capped.
+     * This ensures every waiting user appears, not just those with simulation deadlines. */
+    PyObject *ordered_rids = PyList_New(0);
     if (!ordered_rids) { Py_DECREF(deadline_list); Py_DECREF(wpd_dict); goto cleanup_and_error; }
-    for (int i = 0; i < n_prefill; i++) {
-        PyTuple_SET_ITEM(ordered_rids, i, PyUnicode_FromString(prefill_candidates[i].rid));
+    /* Re-use puc state from above for per-user counts — already populated from capped candidates.
+     * Build a small hash set of RIDs already in ordered_rids to avoid duplicates. */
+    /* uid counts are in puc_keys/puc_vals/puc_used from the cap block above.
+     * But that block is scoped — we need the counts here. Re-compute from prefill_candidates. */
+    {
+        #define OWQ_SLOTS 256
+        char   owq_uid_keys[OWQ_SLOTS][W_UID_MAX];
+        int    owq_uid_vals[OWQ_SLOTS];
+        int    owq_uid_used[OWQ_SLOTS];
+        char   owq_rid_keys[OWQ_SLOTS][W_RID_MAX];
+        int    owq_rid_used[OWQ_SLOTS];
+        memset(owq_uid_used, 0, sizeof(owq_uid_used));
+        memset(owq_rid_used, 0, sizeof(owq_rid_used));
+
+        /* Helper macros for open-address lookup */
+        #define OWQ_UID_SLOT(uid_str, slot_out) do { \
+            unsigned int _h = 2166136261u; \
+            for (const char *_p = (uid_str); *_p; _p++) { _h ^= (unsigned char)*_p; _h *= 16777619u; } \
+            (slot_out) = (int)(_h % OWQ_SLOTS); \
+            while (owq_uid_used[(slot_out)] && strncmp(owq_uid_keys[(slot_out)], (uid_str), W_UID_MAX) != 0) \
+                (slot_out) = ((slot_out) + 1) % OWQ_SLOTS; \
+        } while(0)
+
+        #define OWQ_RID_SLOT(rid_str, slot_out) do { \
+            unsigned int _h = 2166136261u; \
+            for (const char *_p = (rid_str); *_p; _p++) { _h ^= (unsigned char)*_p; _h *= 16777619u; } \
+            (slot_out) = (int)(_h % OWQ_SLOTS); \
+            while (owq_rid_used[(slot_out)] && strncmp(owq_rid_keys[(slot_out)], (rid_str), W_RID_MAX) != 0) \
+                (slot_out) = ((slot_out) + 1) % OWQ_SLOTS; \
+        } while(0)
+
+        int owq_total = 0;
+
+        /* First pass: add capped prefill_candidates */
+        for (int i = 0; i < n_prefill; i++) {
+            const char *rid = prefill_candidates[i].rid;
+            const char *uid = prefill_candidates[i].uid;
+            PyObject *rid_obj = PyUnicode_FromString(rid);
+            if (!rid_obj) { Py_DECREF(ordered_rids); Py_DECREF(deadline_list); Py_DECREF(wpd_dict); goto cleanup_and_error; }
+            PyList_Append(ordered_rids, rid_obj);
+            Py_DECREF(rid_obj);
+            owq_total++;
+            /* track uid count */
+            int us; OWQ_UID_SLOT(uid, us);
+            if (!owq_uid_used[us]) { owq_uid_used[us]=1; strncpy(owq_uid_keys[us],uid,W_UID_MAX-1); owq_uid_keys[us][W_UID_MAX-1]='\0'; owq_uid_vals[us]=0; }
+            owq_uid_vals[us]++;
+            /* track rid seen */
+            int rs; OWQ_RID_SLOT(rid, rs);
+            owq_rid_used[rs]=1; strncpy(owq_rid_keys[rs],rid,W_RID_MAX-1); owq_rid_keys[rs][W_RID_MAX-1]='\0';
+        }
+
+        /* Second pass: append waiting requests with no deadline, per-user capped */
+        /* DEBUG: log counts and unique UIDs in waiting_set to stderr */
+        {
+            int _dbg_alive=0, _dbg_in_waiting=0, _dbg_fair=0;
+            /* collect unique UIDs in waiting_set (up to 16) */
+            char _dbg_uids[16][W_UID_MAX];
+            int  _dbg_uid_n = 0;
+            int  _dbg_uid_only_user8 = 1; /* assume true until proven otherwise */
+            for (int i = 0; i < self->reqs_len; i++) {
+                if (!self->reqs[i].alive) continue;
+                _dbg_alive++;
+                CTrackedReq *_tr = &self->reqs[i];
+                if (w_hm_get(&waiting_set, _tr->rid) == HT_EMPTY) continue;
+                _dbg_in_waiting++;
+                /* track unique UIDs */
+                int _seen = 0;
+                for (int j = 0; j < _dbg_uid_n; j++) {
+                    if (strncmp(_dbg_uids[j], _tr->uid, W_UID_MAX) == 0) { _seen = 1; break; }
+                }
+                if (!_seen && _dbg_uid_n < 16) {
+                    strncpy(_dbg_uids[_dbg_uid_n], _tr->uid, W_UID_MAX-1);
+                    _dbg_uids[_dbg_uid_n][W_UID_MAX-1] = '\0';
+                    _dbg_uid_n++;
+                }
+                if (strncmp(_tr->uid, "user_8", W_UID_MAX) != 0)
+                    _dbg_uid_only_user8 = 0;
+                if (has_fair_uids && w_hm_get(&fair_uids_set, _tr->uid) == HT_EMPTY) continue;
+                _dbg_fair++;
+            }
+            /* build uid list string */
+            char _dbg_uid_buf[256] = {0};
+            int _dbg_off = 0;
+            for (int j = 0; j < _dbg_uid_n && _dbg_off < 250; j++) {
+                int _n = snprintf(_dbg_uid_buf + _dbg_off, 256 - _dbg_off, "%s%s",
+                    j > 0 ? "," : "", _dbg_uids[j]);
+                if (_n > 0) _dbg_off += _n;
+            }
+            fprintf(stderr, "[owq2] alive=%d in_waiting=%d fair=%d has_fair_uids=%d uids_in_waiting=[%s]%s\n",
+                _dbg_alive, _dbg_in_waiting, _dbg_fair, has_fair_uids, _dbg_uid_buf,
+                (_dbg_uid_only_user8 && _dbg_in_waiting > 0) ? " WARNING:only_user_8_in_waiting" : "");
+            fflush(stderr);
+        }
+        for (int i = 0; i < self->reqs_len && owq_total < PREFILL_GLOBAL_CAP; i++) {
+            if (!self->reqs[i].alive) continue;
+            CTrackedReq *tr = &self->reqs[i];
+            if (w_hm_get(&waiting_set, tr->rid) == HT_EMPTY) continue;
+            /* skip unfair users */
+            if (has_fair_uids && w_hm_get(&fair_uids_set, tr->uid) == HT_EMPTY) continue;
+            /* skip already included */
+            int rs; OWQ_RID_SLOT(tr->rid, rs);
+            if (owq_rid_used[rs] && strncmp(owq_rid_keys[rs], tr->rid, W_RID_MAX) == 0) continue;
+            /* per-user cap */
+            int us; OWQ_UID_SLOT(tr->uid, us);
+            if (!owq_uid_used[us]) { owq_uid_used[us]=1; strncpy(owq_uid_keys[us],tr->uid,W_UID_MAX-1); owq_uid_keys[us][W_UID_MAX-1]='\0'; owq_uid_vals[us]=0; }
+            if (owq_uid_vals[us] >= PREFILL_PER_USER_CAP) continue;
+            owq_uid_vals[us]++;
+            /* mark rid seen */
+            owq_rid_used[rs]=1; strncpy(owq_rid_keys[rs],tr->rid,W_RID_MAX-1); owq_rid_keys[rs][W_RID_MAX-1]='\0';
+            PyObject *rid_obj = PyUnicode_FromString(tr->rid);
+            if (!rid_obj) { Py_DECREF(ordered_rids); Py_DECREF(deadline_list); Py_DECREF(wpd_dict); goto cleanup_and_error; }
+            PyList_Append(ordered_rids, rid_obj);
+            Py_DECREF(rid_obj);
+            owq_total++;
+        }
+        #undef OWQ_UID_SLOT
+        #undef OWQ_RID_SLOT
+        #undef OWQ_SLOTS
     }
 
     /* Free C arrays */
