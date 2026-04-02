@@ -285,27 +285,16 @@ class DocPolicy(DeltaFairnessPolicy):
         this_user_sum: int = 0,
     ) -> bool:
         del running_batch
+        if not self.delta_fairness_n:
+            return False
         tree_cache = getattr(self, "tree_cache", None)
-        if tree_cache is None or hasattr(
-            tree_cache, "user_unevictable_kv_is_under_fair_share_reservation"
-        ):
-            return super().user_is_fair_prefill(
-                user_id,
-                running_batch=None,
-                this_user_len=this_user_len,
-                this_user_sum=this_user_sum,
-            )
-        original_tree_cache = self.tree_cache
-        try:
-            self.tree_cache = None
-            return super().user_is_fair_prefill(
-                user_id,
-                running_batch=None,
-                this_user_len=this_user_len,
-                this_user_sum=this_user_sum,
-            )
-        finally:
-            self.tree_cache = original_tree_cache
+        if tree_cache is None or tree_cache.fairinf_max_per_user is None:
+            return True
+        # Use fairinf_max_per_user (total per-user budget), not the unevictable
+        # reservation from calculate_delta_fair_reservation_size.
+        return tree_cache.user_total_is_under_fair_share_reservation(
+            user_id, this_user_sum
+        )
 
     def _force_prefill_within_user_headroom_from_frozen(
         self,
@@ -321,33 +310,10 @@ class DocPolicy(DeltaFairnessPolicy):
         total_tokens = frozen_cache_state.total_user_tokens.get(req.uid, 0)
         evictable_tokens = frozen_cache_state.evictable_user_tokens.get(req.uid, 0)
         cached_unevictable_tokens = total_tokens - evictable_tokens
-        uncached_running_tokens = 0
-        if running_batch is not None and getattr(running_batch, "seq_lens", None) is not None:
-            seq_lens_cpu = running_batch.seq_lens.cpu().tolist()
-            for i, running_req in enumerate(running_batch.reqs):
-                if running_req.uid != req.uid:
-                    continue
-                uncached_running_tokens += max(
-                    0, int(seq_lens_cpu[i]) - len(running_req.prefix_indices)
-                )
-        ratio = max(0.0, float(new_token_ratio))
-        decode_headroom = 0
-        if running_batch is not None:
-            for running_req in running_batch.reqs:
-                if running_req.uid != req.uid:
-                    continue
-                remaining = max(
-                    0,
-                    running_req.sampling_params.max_new_tokens
-                    - len(running_req.output_ids),
-                )
-                decode_headroom += int(min(remaining, 4096) * ratio)
-        protected_tokens = (
-            cached_unevictable_tokens + uncached_running_tokens + pending_prefill_tokens
-        )
-        # Do not count speculative decode_headroom: it over-rejects fair users who
-        # are already near their per-user limit due to their own running requests.
-        # The headroom reservation is still enforced by the KV adder at admit time.
+        # cached_unevictable_tokens already includes decode output KV slots via
+        # note_decode_kv_alloc → total_user_counters. Do not add uncached_running_tokens
+        # (seq_len - prefix_indices) separately — that would double-count decode KV.
+        protected_tokens = cached_unevictable_tokens + pending_prefill_tokens
         return (
             protected_tokens + req.extend_input_len
             <= frozen_cache_state.fairinf_max_per_user
@@ -360,10 +326,18 @@ class DocPolicy(DeltaFairnessPolicy):
         running_batch: Optional[ScheduleBatch],
         pending_prefill_tokens: int = 0,
     ) -> bool:
-        return super()._force_prefill_within_user_headroom(
-            req,
-            running_batch=running_batch,
-            pending_prefill_tokens=pending_prefill_tokens,
+        tree_cache = self.tree_cache
+        if tree_cache is None or tree_cache.fairinf_max_per_user is None:
+            return True
+        # Use only unevictable cached tokens (which already include decode KV via
+        # note_decode_kv_alloc) — do not add uncached_running_tokens (double-count)
+        # or decode_headroom (speculative, over-rejects users near their limit).
+        cached_total = tree_cache.total_user_counters.get_tokens(req.uid)
+        cached_evictable = tree_cache.evictable_total_user_counters.get_tokens(req.uid)
+        cached_unevictable = cached_total - cached_evictable
+        return (
+            cached_unevictable + pending_prefill_tokens + req.extend_input_len
+            <= tree_cache.fairinf_max_per_user
         )
 
     def _memory_pressure_active_for_prefill(self) -> bool:
