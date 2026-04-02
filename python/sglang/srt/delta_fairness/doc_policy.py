@@ -345,8 +345,11 @@ class DocPolicy(DeltaFairnessPolicy):
         protected_tokens = (
             cached_unevictable_tokens + uncached_running_tokens + pending_prefill_tokens
         )
+        # Do not count speculative decode_headroom: it over-rejects fair users who
+        # are already near their per-user limit due to their own running requests.
+        # The headroom reservation is still enforced by the KV adder at admit time.
         return (
-            protected_tokens + decode_headroom + req.extend_input_len
+            protected_tokens + req.extend_input_len
             <= frozen_cache_state.fairinf_max_per_user
         )
 
@@ -559,7 +562,7 @@ class DocPolicy(DeltaFairnessPolicy):
             break
 
         max_safe_prefill_tokens = safe_prompt_tokens
-        return {
+        state = {
             "safe_waiting_queue": safe_waiting_queue,
             "safe_waiting_rids": safe_waiting_rids,
             "forced_prefill_queue": forced_prefill_queue,
@@ -573,6 +576,8 @@ class DocPolicy(DeltaFairnessPolicy):
             "skipped_reasons": skipped_reasons,
         }
 
+        print(f"DEBUG DOC POLICY COMPUTE_SAFE_PREFIX_STATE: {state}")
+        return state
     # -------------------------------------------------------------------------
     # Prepare-thread snapshot builder (called from the worker thread)
     # -------------------------------------------------------------------------

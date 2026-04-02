@@ -246,10 +246,11 @@ class RequestTimelineWriter:
             r = self._get_or_create(rid, uid)
             if not r.completed_ts:
                 r.completed_ts = now
-                # Write now (may lack isolated fields); a second row with
-                # complete data will be appended by mark_isolated_completed.
-                if completion_writer is not None:
-                    completion_writer.write_completion(r)
+                # Always write a row now (may lack isolated fields); a second
+                # row with complete isolation data will be appended by
+                # mark_isolated_completed.
+                writer = completion_writer if completion_writer is not None else COMPLETION_WRITER
+                writer.write_completion(r)
 
     def mark_isolated_prefill_done(self, rid: str, uid: Optional[str], *, timestamp_iso: str) -> None:
         self._update(rid, uid, lambda r: None if r.isolated_prefill_done_ts == timestamp_iso else setattr(r, "isolated_prefill_done_ts", timestamp_iso))
