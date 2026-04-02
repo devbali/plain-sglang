@@ -1231,13 +1231,33 @@ CSimulator_finished_decode(CSimulatorObject *self, PyObject *args)
         tr->decode_count = new_final_n;
         tr->latest_sim_completion_ts = cur_ts;
 
-        /* Seed next anticipated decode — pure sim-time, no wall-clock floor */
+        /* Seed next anticipated decode.
+         * cur_ts is the isolation-chain timestamp after the last simulated decode.
+         * If cur_ts is already in the past the request has received more real service
+         * than isolation would give it (over-served).  In that case anchor to now
+         * so the deadline is now+dec_dur rather than a spuriously early past time. */
         int next_n = new_final_n + 1;
         int ctx = prompt_len + next_n;
         double dec_dur = w_isolated_decode_time_estimation(
             (double)ctx, (double)ctx, 1.0, (double)fn);
+        double base_fd = cur_ts;
+        if (base_fd < 1e9) {
+            /* isolation chain has no valid timestamp — use wall clock */
+            struct timespec _ts_fd;
+            clock_gettime(CLOCK_REALTIME, &_ts_fd);
+            base_fd = (double)_ts_fd.tv_sec + (double)_ts_fd.tv_nsec / 1e9;
+        } else {
+            /* clamp to wall clock so over-served requests get a future deadline */
+            double _now_fd;
+            {
+                struct timespec _ts_fd;
+                clock_gettime(CLOCK_REALTIME, &_ts_fd);
+                _now_fd = (double)_ts_fd.tv_sec + (double)_ts_fd.tv_nsec / 1e9;
+            }
+            if (base_fd < _now_fd) base_fd = _now_fd;
+        }
         tr->ant_type = 1;
-        tr->ant_ts   = cur_ts + dec_dur;
+        tr->ant_ts   = base_fd + dec_dur;
         tr->ant_cn   = next_n;
     }
 

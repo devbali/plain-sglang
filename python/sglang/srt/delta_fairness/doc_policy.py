@@ -345,13 +345,21 @@ class DocPolicy(DeltaFairnessPolicy):
         protected_tokens = (
             cached_unevictable_tokens + uncached_running_tokens + pending_prefill_tokens
         )
+        result = protected_tokens + req.extend_input_len <= frozen_cache_state.fairinf_max_per_user
+        if not result:
+            import sys
+            print(
+                f"[headroom_reject] uid={req.uid} rid={req.rid} "
+                f"cached_unev={cached_unevictable_tokens} uncached_run={uncached_running_tokens} "
+                f"pending={pending_prefill_tokens} extend={req.extend_input_len} "
+                f"protected={protected_tokens} total={protected_tokens + req.extend_input_len} "
+                f"max_per_user={frozen_cache_state.fairinf_max_per_user}",
+                file=sys.stderr, flush=True,
+            )
         # Do not count speculative decode_headroom: it over-rejects fair users who
         # are already near their per-user limit due to their own running requests.
         # The headroom reservation is still enforced by the KV adder at admit time.
-        return (
-            protected_tokens + req.extend_input_len
-            <= frozen_cache_state.fairinf_max_per_user
-        )
+        return result
 
     def _force_prefill_within_user_headroom(
         self,
