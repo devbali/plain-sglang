@@ -35,7 +35,7 @@
  *   = 0.020 + 0.05092250719117761 = 0.07092250719117761
  */
 #define W_DECODE_CONST_OVERHEAD   0.020
-#define W_PREFILL_CONST_OVERHEAD  0.080
+#define W_PREFILL_CONST_OVERHEAD  0.300
 #define W_TBT_DELTA               0.080 // 0.960, 1.500, micro: 0.080
 /* MAX_POOLED_DECODE_LATENCY as used in isolated_decode_time_estimation comparison:
  * The Python function compares the inner linear term against MAX_POOLED_DECODE_LATENCY,
