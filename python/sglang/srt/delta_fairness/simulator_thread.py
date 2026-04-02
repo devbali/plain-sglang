@@ -881,6 +881,7 @@ class _DocPolicyPrepareWorker:
             fair_uids, fair_decode_uids,
             delta_prefill_s, delta_decode_s,
             pooled_prefill_s, _pooled_decode_s,
+            time.time(),
         )
         raw_candidates, waiting_prefill_deadline_by_rid, ordered_waiting_rids = c_result
 
