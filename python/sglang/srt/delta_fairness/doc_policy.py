@@ -517,7 +517,7 @@ class DocPolicy(DeltaFairnessPolicy):
                     else max(int(self.delta_fairness_n or 1), 1)
                 ),
             )
-            if now + pooled_prefill_s <= earliest_decode_start_deadline:
+            if earliest_decode_start_deadline <= now or now + pooled_prefill_s <= earliest_decode_start_deadline:
                 safe_prompt_tokens = next_safe_prompt_tokens
                 selected_batch_max_tokens = candidate_max_tokens
                 selected_batch_count += 1
@@ -550,7 +550,6 @@ class DocPolicy(DeltaFairnessPolicy):
             "skipped_reasons": skipped_reasons,
         }
 
-        print(f"DEBUG DOC POLICY COMPUTE_SAFE_PREFIX_STATE: {state}")
         return state
     # -------------------------------------------------------------------------
     # Prepare-thread snapshot builder (called from the worker thread)

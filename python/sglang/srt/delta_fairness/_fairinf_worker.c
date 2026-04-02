@@ -1776,12 +1776,14 @@ CSimulator_build_deadline_candidates(CSimulatorObject *self, PyObject *args)
     PyObject *py_fair_uids, *py_fair_decode_uids;
     double delta_prefill_s, delta_decode_s;
     double pooled_prefill_s, pooled_decode_s;
+    double now_ts = 0.0;
 
-    if (!PyArg_ParseTuple(args, "OOOOdddd",
+    if (!PyArg_ParseTuple(args, "OOOOdddd|d",
                           &py_waiting_rids, &py_running_rids,
                           &py_fair_uids, &py_fair_decode_uids,
                           &delta_prefill_s, &delta_decode_s,
-                          &pooled_prefill_s, &pooled_decode_s))
+                          &pooled_prefill_s, &pooled_decode_s,
+                          &now_ts))
         return NULL;
 
     /* Extract inputs (GIL held) */
@@ -2012,6 +2014,9 @@ CSimulator_build_deadline_candidates(CSimulatorObject *self, PyObject *args)
                 else
                     continue;  /* truly uninitialized — no valid timestamp available */
             }
+            /* Clamp to now so past-due events produce a current deadline, not a stale past one. */
+            if (now_ts > 1e9 && upcoming_ts < now_ts)
+                upcoming_ts = now_ts;
             double deadline = upcoming_ts + delta_decode_s;
             double start_dl = deadline - pooled_decode_s;
             if (!has_earliest_decode || start_dl < earliest_decode.start_deadline) {
