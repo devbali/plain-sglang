@@ -170,6 +170,15 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.scheduling_hooks import NoOpSchedulingPolicy
+
+
+def _load_class(dotted_path: str):
+    """Dynamically load a class from a dotted module path."""
+    import importlib
+
+    module_path, class_name = dotted_path.rsplit(".", 1)
+    mod = importlib.import_module(module_path)
+    return getattr(mod, class_name)
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
@@ -1107,7 +1116,13 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
         )
-        self.scheduling_hooks_policy: NoOpSchedulingPolicy = NoOpSchedulingPolicy()
+        # Initialize scheduling hooks policy
+        if self.server_args.scheduling_policy_path:
+            self.scheduling_hooks_policy: NoOpSchedulingPolicy = _load_class(
+                self.server_args.scheduling_policy_path
+            )()
+        else:
+            self.scheduling_hooks_policy: NoOpSchedulingPolicy = NoOpSchedulingPolicy()
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.max_prefill_bs: int = 0
         if self.server_args.enable_prefill_delayer:

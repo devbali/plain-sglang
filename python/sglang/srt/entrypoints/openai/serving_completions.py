@@ -128,6 +128,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
+            uid=request.user,
             custom_logit_processor=request.custom_logit_processor,
         )
 

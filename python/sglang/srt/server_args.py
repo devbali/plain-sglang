@@ -369,6 +369,7 @@ class ServerArgs:
     max_prefill_tokens: int = 16384
     prefill_max_requests: Optional[int] = None
     schedule_policy: str = "fcfs"
+    scheduling_policy_path: Optional[str] = None
     enable_priority_scheduling: bool = False
     disable_priority_preemption: bool = False
     default_priority_value: Optional[int] = None
@@ -4526,6 +4527,14 @@ class ServerArgs:
                 "routing-key",
             ],
             help="The scheduling policy of the requests.",
+        )
+        parser.add_argument(
+            "--scheduling-policy-path",
+            type=str,
+            default=ServerArgs.scheduling_policy_path,
+            help="Dotted path to a custom scheduling hooks policy class (e.g. "
+            "'sglang.srt.scheduling_hooks.logging_policy.LoggingSchedulingPolicy'). "
+            "The class must be a subclass of NoOpSchedulingPolicy.",
         )
         parser.add_argument(
             "--enable-priority-scheduling",
