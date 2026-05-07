@@ -28,6 +28,8 @@ def start_server():
         "--model-path", MODEL,
         "--host", "0.0.0.0",
         "--port", str(PORT),
+        "--disable-cuda-graph",
+        "--mem-fraction-static", "0.3",
         "--scheduling-policy-path",
         "sglang.srt.scheduling_hooks.logging_policy.LoggingSchedulingPolicy",
     ]
