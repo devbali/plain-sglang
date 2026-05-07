@@ -580,6 +580,7 @@ class Req(ReqDllmMixin):
         origin_input_text: str,
         origin_input_ids: List[int],
         sampling_params: SamplingParams,
+        uid: Optional[str] = None,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
         dllm_config: Optional[DllmConfig] = None,
@@ -618,6 +619,7 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
+        self.uid = uid
         self.origin_input_text = origin_input_text
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded

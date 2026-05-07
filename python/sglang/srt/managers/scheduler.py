@@ -169,6 +169,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.scheduling_hooks import NoOpSchedulingPolicy
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
@@ -1106,6 +1107,7 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
         )
+        self.scheduling_hooks_policy: NoOpSchedulingPolicy = NoOpSchedulingPolicy()
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.max_prefill_bs: int = 0
         if self.server_args.enable_prefill_delayer:
@@ -1986,6 +1988,7 @@ class Scheduler(
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
+                uid=recv_req.uid,
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
@@ -2071,6 +2074,7 @@ class Scheduler(
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
+                uid=recv_req.uid,
                 vocab_size=self.model_config.vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
@@ -2201,6 +2205,7 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
+            self.scheduling_hooks_policy.on_new_request(req)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -2329,6 +2334,7 @@ class Scheduler(
             recv_req.input_text,
             recv_req.input_ids,
             recv_req.sampling_params,
+            uid=recv_req.uid,
             positional_embed_overrides=recv_req.positional_embed_overrides,
             token_type_ids=recv_req.token_type_ids,
             routed_dp_rank=recv_req.routed_dp_rank,
@@ -2531,6 +2537,7 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
+            self.scheduling_hooks_policy.on_prefill_decision(ret)
         else:
             # Run decode (skip for prefill-only batches)
             if (
@@ -2539,6 +2546,8 @@ class Scheduler(
             ):
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
+                if ret is not None:
+                    self.scheduling_hooks_policy.on_decode_decision(ret)
             else:
                 ret = None
 
@@ -2551,6 +2560,7 @@ class Scheduler(
         if ret:
             set_schedule_time_batch(ret)
 
+        self.scheduling_hooks_policy.on_end_of_scheduler_pass(ret)
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):

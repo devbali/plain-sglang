@@ -1024,6 +1024,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                uid=obj.uid,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -1047,6 +1048,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 rid=obj.rid,
                 priority=obj.priority,
                 dimensions=obj.dimensions,
+                uid=obj.uid,
                 lora_id=obj.lora_id,
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,

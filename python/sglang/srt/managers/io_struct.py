@@ -231,6 +231,9 @@ class GenerateReqInput(BaseReq):
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
+    # User ID for per-user tracking and scheduling hooks
+    uid: Optional[str] = None
+
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
@@ -688,6 +691,7 @@ class GenerateReqInput(BaseReq):
             priority=self.priority,
             extra_key=self.extra_key,
             no_logs=self.no_logs,
+            uid=self.uid,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
@@ -779,6 +783,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
+    # User ID for per-user tracking and scheduling hooks
+    uid: Optional[str] = None
+
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
 
@@ -855,6 +862,9 @@ class EmbeddingReqInput(BaseReq):
     priority: Optional[int] = None
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
+
+    # User ID for per-user tracking and scheduling hooks
+    uid: Optional[str] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
@@ -975,6 +985,7 @@ class EmbeddingReqInput(BaseReq):
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 sampling_params=self.sampling_params[i],
                 rid=self.rid[i],
+                uid=self.uid,
                 lora_path=self.lora_path[i] if self.lora_path is not None else None,
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
                 is_cross_encoder_request=True,
@@ -1002,6 +1013,7 @@ class EmbeddingReqInput(BaseReq):
                 video_data=self.video_data[i] if self.video_data is not None else None,
                 sampling_params=self.sampling_params[i],
                 rid=self.rid[i],
+                uid=self.uid,
                 lora_path=self.lora_path[i] if self.lora_path is not None else None,
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
                 external_trace_header=self.external_trace_header,
@@ -1039,6 +1051,9 @@ class TokenizedEmbeddingReqInput(BaseReq):
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+
+    # User ID for per-user tracking and scheduling hooks
+    uid: Optional[str] = None
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
