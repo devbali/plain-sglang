@@ -91,3 +91,41 @@ The fairinf `DocPolicy` and `NoFairnessPolicy` use additional hooks that were in
 4. **Per-user KV accounting**: The fairinf `alloc_token_slots` hook is the right place to enforce per-user memory budgets. The upstream `BaseTokenToKVPool.alloc` call sites in `schedule_batch.py` would need wrapping.
 
 5. **`uid` in OpenAI-compatible adapters**: The internal request structs now support `uid`, but the OpenAI-compatible entrypoints do not yet map an external field into it. Wire that adapter layer if you want callers on those surfaces to set `uid` directly.
+
+---
+
+## VM Procedure
+
+A spot GCP VM (`sglang-hooks-spot`, europe-west4-a, a2-highgpu-1g [1x A100 40GB]) is created in the `delta-fair-inference` project for running this branch. (Originally a2-ultragpu-1g [1x A100 80GB] but fell back to a2-highgpu-1g due to stockouts.)
+
+### Workflow
+
+1. **Minor iteration (fast)**: Commit with a minor message → push → `ssh` to VM → `cd ~/fairinf-sglang-upstream && git pull` → test
+2. **Major checkpoint (save)**: Once a feature runs well locally/on VM → commit with a descriptive "major" message → push → sync VM
+
+### VM lifecycle
+- **Spot instance** — auto-stops after 4h max run, or after 30 minutes of idle activity (cron-controlled)
+- **Auto-shutdown** — a cron job on the VM runs every 5 minutes; if no SSH session activity for 30+ minutes and the GPU is idle, the VM self-terminates (`sudo shutdown -h now`)
+- **Re-create** — if the VM is stopped, re-create from this procedure:
+  ```
+  gcloud compute instances create sglang-hooks-spot \
+    --zone=europe-west4-a \
+    --machine-type=a2-highgpu-1g \
+    --image-project=ubuntu-os-cloud \
+    --image-family=ubuntu-minimal-2404-lts-amd64 \
+    --boot-disk-size=200GB --boot-disk-type=pd-balanced \
+    --network=delta-fair-vpc --subnet=europe-west4 \
+    --maintenance-policy=TERMINATE \
+    --provisioning-model=SPOT \
+    --instance-termination-action=STOP \
+    --max-run-duration=4h \
+    --discard-local-ssds-at-termination-timestamp=true \
+    --service-account=878574312380-compute@developer.gserviceaccount.com \
+    --metadata-from-file=ssh-keys=/path/to/ssh-keys
+  ```
+
+### First-time setup on new VM
+- Clone repo via git bundle or `git clone` from GitHub
+- `python3 -m venv ~/sglang_venv && source ~/sglang_venv/bin/activate`
+- `pip install -e "python[all]"`
+- Set up the auto-shutdown cron (see `crontab -l` for current rules)
