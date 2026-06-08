@@ -2164,6 +2164,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if not server_args.speculative_algorithm:
             sorted_indices.sort(
                 key=lambda i: (
+                    # Hook: over-quota users get higher retraction priority
+                    getattr(self.tree_cache, 'cache_hooks_policy', None)
+                    and self.tree_cache.cache_hooks_policy.get_retract_priority(
+                        req=self.reqs[i], cache=self.tree_cache
+                    ) or 0,
                     len(self.reqs[i].output_ids),
                     -len(self.reqs[i].origin_input_ids),
                 ),

@@ -60,6 +60,7 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    owner: Optional[str] = None  # uid for per-user tracking
 
 
 @dataclasses.dataclass

@@ -62,6 +62,7 @@ from sglang.srt.mem_cache.evict_policy import (
     PriorityStrategy,
     SLRUStrategy,
 )
+from sglang.srt.cache_hooks.no_op_cache_policy import NoOpCachePolicy
 from sglang.srt.mem_cache.utils import hash_str_to_int64
 
 if TYPE_CHECKING:
@@ -231,6 +232,8 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        # owner uid for fairness/per-user tracking
+        self.owner: Optional[str] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -359,6 +362,9 @@ class RadixCache(BasePrefixCache):
                 f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
             )
 
+        # Scheduling/cache hooks policy — replace with subclass for fairness, etc.
+        self.cache_hooks_policy: NoOpCachePolicy = NoOpCachePolicy()
+
         self.evictable_leaves = set()
         self.reset()
 
@@ -394,6 +400,7 @@ class RadixCache(BasePrefixCache):
         self.protected_size_ = 0
         self.evictable_leaves.clear()
         self._record_all_cleared_event()
+        self.cache_hooks_policy.on_cache_reset(self)
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
@@ -482,7 +489,7 @@ class RadixCache(BasePrefixCache):
             # Debug/test fallback: use token ids themselves as values.
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
-        prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
+        prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked, owner=params.owner)
         return InsertResult(prefix_len=prefix_len)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
@@ -514,7 +521,7 @@ class RadixCache(BasePrefixCache):
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
             result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+                InsertParams(key=radix_key, value=values, priority=priority, owner=getattr(req, "uid", None))
             )
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
@@ -554,6 +561,7 @@ class RadixCache(BasePrefixCache):
                 value=values,
                 chunked=chunked,
                 priority=getattr(req, "priority", 0) or 0,
+                owner=getattr(req, "uid", None),
             )
         )
         new_prefix_len = result.prefix_len
@@ -621,8 +629,16 @@ class RadixCache(BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
+            # Hook: allow policy to protect nodes from eviction
+            if not self.cache_hooks_policy.can_evict_node(x):
+                continue
+
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
+
+            # Hook: notify policy of eviction
+            self.cache_hooks_policy.on_evict(x)
+
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
@@ -644,6 +660,8 @@ class RadixCache(BasePrefixCache):
                 self.evictable_size_ -= len(node.key)
                 self.protected_size_ += len(node.key)
                 delta -= len(node.key)
+                # Hook: node becomes protected
+                self.cache_hooks_policy.on_lock_ref_inc(node)
             node.lock_ref += 1
             self._update_leaf_status(node)
             node = node.parent
@@ -661,6 +679,8 @@ class RadixCache(BasePrefixCache):
                 self.evictable_size_ += len(node.key)
                 self.protected_size_ -= len(node.key)
                 delta += len(node.key)
+                # Hook: node becomes evictable
+                self.cache_hooks_policy.on_lock_ref_dec(node)
             node.lock_ref -= 1
             self._update_leaf_status(node)
             if node.parent is None:
@@ -726,6 +746,8 @@ class RadixCache(BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        # Inherit owner from child (shared prefix belongs to same user)
+        new_node.owner = child.owner
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
@@ -753,6 +775,7 @@ class RadixCache(BasePrefixCache):
         value,
         priority: int = 0,
         chunked: bool = False,
+        owner: Optional[str] = None,
     ):
         # Convert None priority to 0
         if priority is None:
@@ -788,6 +811,7 @@ class RadixCache(BasePrefixCache):
 
         if len(key):
             new_node = TreeNode(priority=priority)
+            new_node.owner = owner
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
@@ -798,6 +822,8 @@ class RadixCache(BasePrefixCache):
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
+            # Hook: notify policy of insert
+            self.cache_hooks_policy.on_insert(new_node, owner)
         return total_prefix_length
 
     def _print_helper(self, node: TreeNode, indent: int):

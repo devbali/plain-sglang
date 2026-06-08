@@ -1123,6 +1123,11 @@ class Scheduler(
             )()
         else:
             self.scheduling_hooks_policy: NoOpSchedulingPolicy = NoOpSchedulingPolicy()
+
+        # Wire cache hooks policy if scheduling policy exposes one
+        cache_hooks = getattr(self.scheduling_hooks_policy, "cache_policy", None)
+        if cache_hooks is not None:
+            self.tree_cache.cache_hooks_policy = cache_hooks
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.max_prefill_bs: int = 0
         if self.server_args.enable_prefill_delayer:
@@ -2549,11 +2554,28 @@ class Scheduler(
             new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
-        if new_batch is not None:
-            # Run prefill first if possible
+        # 🪝 Hook: allow policy to override prefill vs. decode decision
+        schedule_decision = self.scheduling_hooks_policy.on_prefill_vs_decode_decision(
+            self.waiting_queue,
+            self.running_batch,
+            new_batch,
+        )
+
+        # Decide whether to run prefill or decode
+        should_run_prefill = (
+            (schedule_decision == "prefill")
+            or (schedule_decision is None and new_batch is not None)
+        )
+        should_run_decode = (
+            (schedule_decision == "decode")
+            or (schedule_decision is None and new_batch is None)
+        )
+
+        if should_run_prefill and new_batch is not None:
+            # Run prefill
             ret = new_batch
             self.scheduling_hooks_policy.on_prefill_decision(ret)
-        else:
+        elif should_run_decode:
             # Run decode (skip for prefill-only batches)
             if (
                 not self.running_batch.is_empty()
@@ -2565,6 +2587,9 @@ class Scheduler(
                     self.scheduling_hooks_policy.on_decode_decision(ret)
             else:
                 ret = None
+        else:
+            # Hook returned invalid decision or contradictory state
+            ret = None
 
         # Handle DP attention and log stats
         ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
@@ -2604,7 +2629,49 @@ class Scheduler(
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
-        # Check if the grammar is ready in the grammar queue
+        """Main scheduler pass: decide which requests to prefill.
+
+        High-level flow:
+        1. Prepare grammar + cache context
+        2. Check if we can schedule anything
+        3. Apply upstream scheduling policy (calc_priority)
+        4. Allow scheduling hook to override queue
+        5. Add requests to batch (respecting memory + LoRA constraints)
+        6. Finalize batch for GPU dispatch
+        """
+        # Step 1: Prepare context
+        self._prepare_prefill_context()
+
+        # Step 2: Early exit if nothing to schedule
+        if self._should_skip_prefill():
+            return None
+
+        # Step 3: Apply upstream scheduling policy
+        self.policy.calc_priority(self.waiting_queue, self.running_batch)
+
+        # Step 4: Build prefill adder (resource manager)
+        adder = self._create_prefill_adder(prefill_delayer_single_pass)
+
+        # Step 5: Allow scheduling hook to override queue
+        queue_to_schedule = self.scheduling_hooks_policy.on_schedule_prefill(
+            self.waiting_queue,
+            self.running_batch,
+            adder,
+        )
+        if queue_to_schedule is None:
+            queue_to_schedule = self.waiting_queue
+
+        # Step 6: Process chunked request if present
+        self._process_chunked_request(adder)
+
+        # Step 7: Add requests to batch
+        self._add_requests_to_batch(adder, queue_to_schedule)
+
+        # Step 8: Finalize batch for GPU
+        return self._finalize_prefill_batch(adder)
+
+    def _prepare_prefill_context(self) -> None:
+        """Prepare grammar manager and hierarchical cache state."""
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
@@ -2614,48 +2681,47 @@ class Scheduler(
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
-            # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
+    def _should_skip_prefill(self) -> bool:
+        """Check if we should skip prefill (batch full, empty queue, etc.)."""
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
-            return None
+            return True
 
         running_bs = len(self.running_batch.reqs)
-
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked requests has just been released.
-        # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-        # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
             and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
-            return None
-
-        # Get priority queue
-        self.policy.calc_priority(self.waiting_queue, self.running_batch)
+            return True
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
-            # If we are testing retraction and the running batch size exceeds
-            # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
-            # in the waiting queue.
-            return None
+            return True
 
-        # Determine chunked_prefill_size for this batch
+        return False
+
+    def _get_chunked_prefill_size(self) -> Optional[int]:
+        """Determine chunked_prefill_size for this batch (with dynamic chunking)."""
         chunked_prefill_size = self.chunked_prefill_size
         if self.chunked_req is not None and self.enable_dynamic_chunking:
             history_len = len(self.chunked_req.prefix_indices)
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        return chunked_prefill_size
 
-        # Prefill policy
-        adder = PrefillAdder(
+    def _create_prefill_adder(
+        self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
+    ) -> PrefillAdder:
+        """Build PrefillAdder (resource manager for batch construction)."""
+        running_bs = len(self.running_batch.reqs)
+        chunked_prefill_size = self._get_chunked_prefill_size()
+
+        return PrefillAdder(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
@@ -2672,6 +2738,8 @@ class Scheduler(
             dllm_config=self.dllm_config,
         )
 
+    def _process_chunked_request(self, adder: PrefillAdder) -> None:
+        """Handle chunked prefill continuation if present."""
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
@@ -2681,46 +2749,47 @@ class Scheduler(
         else:
             self._chunked_req_scheduled_last_iter = False
 
+    def _add_requests_to_batch(
+        self, adder: PrefillAdder, queue_to_schedule: List[Req]
+    ) -> None:
+        """Walk queue and add requests to batch until resources exhausted."""
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
-
             if self.lora_drainer:
                 self.lora_drainer.update_draining_state(
-                    self.waiting_queue,
+                    queue_to_schedule,
                     self.running_batch.reqs,
                 )
+        else:
+            running_loras = None
 
-        # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req in queue_to_schedule:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
-            running_bs = len(self.running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
-                self.running_batch.batch_is_full = True
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                # In prefill mode, prealloc queue and transfer queue can also take memory,
-                # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-                    self.running_batch.batch_is_full = True
+            # Hook: check per-user admission limits (static partition, etc.)
+            uid = getattr(req, "uid", None)
+            needed_tokens = req.sampling_params.max_new_tokens + len(req.origin_input_ids)
+            if not self.tree_cache.cache_hooks_policy.can_admit_request(
+                uid, needed_tokens, cache=self.tree_cache
+            ):
+                # Request stays in waiting queue — don't count against batch
+                continue
 
-            if self.running_batch.batch_is_full:
+            # Check memory limits
+            if not self._check_can_add_request(adder):
                 if (
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     break
 
+            # Skip if HiCache prefetch not ready
             if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
+                if not self._check_hicache_ready(req):
                     continue
-                # Pop the number of tokens loaded from storage (L3 hits)
-                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
-                    req.rid
-                )
 
+            # Add request to batch
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
@@ -2732,60 +2801,83 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
-                        # Set batch_is_full after making sure there are requests that can be served
-                        self.running_batch.batch_is_full = len(
-                            adder.can_run_list
-                        ) > 0 or (not self.running_batch.is_empty())
-                    else:
-                        self.running_batch.batch_is_full = True
-                # revert matched mamba idx to avoid memory leak, if req is not added.
-                # Only free if the slot was freshly allocated in this batch (not
-                # pre-existing from a session). Session-held slots have their own
-                # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
-                if (
-                    not added
-                    and req.mamba_pool_idx is not None
-                    and not getattr(req, "session", None)
-                ):
-                    self.tree_cache.req_to_token_pool.mamba_pool.free(
-                        req.mamba_pool_idx.unsqueeze(-1)
-                    )
-                    req.mamba_pool_idx = None
+                self._handle_add_request_failure(adder, req, res)
                 break
 
-        # Update waiting queue
+    def _check_can_add_request(self, adder: PrefillAdder) -> bool:
+        """Check if we can add more requests (memory + batch size limits)."""
+        running_bs = len(self.running_batch.reqs)
+        if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            self.running_batch.batch_is_full = True
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                self.running_batch.batch_is_full = True
+
+        return not self.running_batch.batch_is_full
+
+    def _check_hicache_ready(self, req: Req) -> bool:
+        """Check if HiCache prefetch is complete for this request."""
+        prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+        if not prefetch_done:
+            return False
+        req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+        return True
+
+    def _handle_add_request_failure(
+        self, adder: PrefillAdder, req: Req, res: AddReqResult
+    ) -> None:
+        """Handle cases where add_one_req fails (OOM, etc.)."""
+        if res == AddReqResult.NO_TOKEN:
+            if self.enable_hierarchical_cache:
+                self.running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
+                    not self.running_batch.is_empty()
+                )
+            else:
+                self.running_batch.batch_is_full = True
+
+        # Revert mamba idx to avoid memory leak
+        added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+        if (
+            not added
+            and req.mamba_pool_idx is not None
+            and not getattr(req, "session", None)
+        ):
+            self.tree_cache.req_to_token_pool.mamba_pool.free(
+                req.mamba_pool_idx.unsqueeze(-1)
+            )
+            req.mamba_pool_idx = None
+
+    def _finalize_prefill_batch(self, adder: PrefillAdder) -> Optional[ScheduleBatch]:
+        """Finalize batch: update queues, create ScheduleBatch, prepare for GPU."""
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
 
+        # Update waiting queue
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
+        # Update chunked request state
         if adder.new_chunked_req is not None:
-            # Update chunked prefill
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
-            # new_chunked_req is added to can_run_list by add_one_req,
-            # so it will be scheduled this iter -> stash is needed next iter.
             self._chunked_req_scheduled_last_iter = True
 
         if self.chunked_req is not None:
             self.chunked_req.is_chunked += 1
 
-        # Record for logging prefill stats after forward
+        # Record for logging
         self.adder = adder
         self.can_run_list = can_run_list
         self.running_bs = len(self.running_batch.reqs)
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
-        # Create a new batch
+        # Create batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -2797,15 +2889,15 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
+
         if self.enable_hierarchical_cache:
-            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
 
         new_batch.prepare_for_extend()
 
-        # Record prefill stats for logging after forward.
+        # Prefill stats
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
             self.running_batch.reqs,
@@ -2824,10 +2916,8 @@ class Scheduler(
             self.is_mixed_chunk
             and not self.running_batch.is_empty()
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
-            # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
         ):
-            # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()

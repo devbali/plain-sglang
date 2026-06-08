@@ -1,10 +1,14 @@
 """Logging scheduling policy — logs every hook call for testing."""
 
+from __future__ import annotations
+
 import logging
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.scheduling_hooks.no_op_policy import NoOpSchedulingPolicy
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 logger = logging.getLogger(__name__)
 
