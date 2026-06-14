@@ -30,19 +30,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Verified C extension (optional — falls back to pure Python)
 # ---------------------------------------------------------------------------
+_C_VERIFIED = False
+_c_tier = _c_deadline = _c_headroom = _c_admit = None
+
 try:
     from sglang.srt.scheduling_hooks.verified import (
-        edf_fairshare_key as _c_edf_key,
-        edf_compare as _c_edf_compare,
-        on_new_request_init_deadline as _c_deadline,
-        prefill_vs_decode_decision as _c_prefill_decision,
+        edf_tier as _c_tier,
+        first_deadline as _c_deadline,
         update_headroom as _c_headroom,
-        compute_global_slack as _c_slack,
-        would_violate_decode_deadlines as _c_violate,
+        can_admit as _c_admit,
+        HAS_C_EXTENSION,
     )
-    _C_VERIFIED = True
+    _C_VERIFIED = HAS_C_EXTENSION
 except ImportError:
-    _C_VERIFIED = False
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -79,8 +80,13 @@ def _edf_key(deadline_us: int, total_kv: int, fair_share: int,
              tau_us: int, now_us: int) -> _EDFKey:
     if _C_VERIFIED:
         try:
-            key = _c_edf_key(deadline_us, total_kv, fair_share, tau_us, now_us)
-            return _EDFKey.__new__((key.tier, key.neg_shortfall, key.excess))
+            tier = _c_tier(deadline_us, total_kv, fair_share, tau_us, now_us)
+            # Construct key from verified tier computation
+            key = _EDFKey.__new__(_EDFKey)
+            key.tier = tier
+            key.neg_shortfall = -max(0, fair_share - total_kv)
+            key.excess = max(0, total_kv - fair_share)
+            return key
         except Exception:
             pass
     return _EDFKey(deadline_us, total_kv, fair_share, tau_us, now_us)
@@ -220,16 +226,7 @@ class FairInferenceSchedulingPolicy(NoOpSchedulingPolicy):
         ] if running_batch else []
         delta_decode_mt_us = 50_000  # rough estimate: 50ms per decode step
 
-        if _C_VERIFIED and running_deadlines:
-            try:
-                would_violate = _c_violate(
-                    prefill_cost_us, self._headroom_us, running_deadlines,
-                    len(running_deadlines), delta_decode_mt_us, now_us)
-            except Exception:
-                would_violate = self._py_would_violate(
-                    prefill_cost_us, running_deadlines, delta_decode_mt_us, now_us)
-        else:
-            would_violate = self._py_would_violate(
+        would_violate = self._py_would_violate(
                 prefill_cost_us, running_deadlines, delta_decode_mt_us, now_us)
 
         # Decision logic (matching paper Algorithm 2 step 2d.i)
