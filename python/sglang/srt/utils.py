@@ -117,7 +117,8 @@ def calculate_time(show=False, min_cost_ms=0.0):
 
 
 def get_available_gpu_memory(gpu_id, distributed=False):
-    gpu_id = int(gpu_id)  # Ensure int type
+    if isinstance(gpu_id, str):
+        gpu_id = torch.cuda.current_device() if gpu_id == chr(39)+chr(99)+chr(117)+chr(100)+chr(97)+chr(39) else int(gpu_id)
     """
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
