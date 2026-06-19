@@ -1262,7 +1262,7 @@ def select_experts(
 # Register fake implementations for torch.compile support
 if _is_cuda:
 
-    @torch.library.register_fake("sgl_kernel::moe_fused_gate")
+    @register_fake_if_exists("sgl_kernel::moe_fused_gate")
     def _moe_fused_gate(
         input_tensor,
         bias,

@@ -8,9 +8,8 @@ from contextlib import nullcontext
 import torch
 from torch.cuda.memory import (
     CUDAPluggableAllocator,
-    _cuda_beginAllocateCurrentThreadToPool,
-    _cuda_endAllocateToPool,
-    _cuda_releasePool,
+    _cuda_beginAllocateToPool,
+    _cuda_endAllocateCurrentStreamToPool,
 )
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -273,13 +272,13 @@ class SymmetricMemoryContext:
             ), "graph_pool_id is not set under graph capture"
             # Pause graph memory pool to use symmetric memory with cuda graph
             if after_2_8_0:
-                torch._C._cuda_endAllocateToPool(_cur_device, _graph_pool_id)
+                torch._C._cuda_endAllocateCurrentStreamToPool(_cur_device, _graph_pool_id)
             else:
                 torch._C._cuda_endAllocateCurrentStreamToPool(
                     _cur_device, _graph_pool_id
                 )
 
-        _cuda_beginAllocateCurrentThreadToPool(self._device_index, self._pool_id)
+        _cuda_beginAllocateToPool(self._device_index, self._pool_id)
 
         global _active_symmetric_memory_context
         _active_symmetric_memory_context = self
@@ -287,15 +286,15 @@ class SymmetricMemoryContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        _cuda_endAllocateToPool(self._device_index, self._pool_id)
-        _cuda_releasePool(self._device_index, self._pool_id)
+        _cuda_endAllocateCurrentStreamToPool(self._device_index, self._pool_id)
+        pass  # compat
         # Register all unregistered segments
         # with the current comm
         self._register_segments_for_comm()
 
         if self.is_graph_capture:
             if after_2_8_0:
-                torch._C._cuda_beginAllocateCurrentThreadToPool(
+                torch._C._cuda_beginAllocateToPool(
                     _cur_device, _graph_pool_id
                 )
             else:

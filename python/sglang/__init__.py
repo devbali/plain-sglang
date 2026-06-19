@@ -23,6 +23,16 @@ if _sys.platform == "darwin":
     except ImportError:
         pass
 del _sys
+# === AUTO-PATCHES ===
+import torch.cuda.memory as _tcm
+_tcm._cuda_beginAllocateCurrentThreadToPool = getattr(_tcm, "_cuda_beginAllocateToPool", lambda *a: None)
+_tcm._cuda_endAllocateToPool = getattr(_tcm, "_cuda_endAllocateCurrentStreamToPool", lambda *a: None)
+_tcm._cuda_releasePool = lambda *a: None
+import torch._C as _tc
+_tc._cuda_beginAllocateCurrentThreadToPool = getattr(_tc, "_cuda_beginAllocateToPool", lambda *a: None)
+_tc._cuda_endAllocateToPool = getattr(_tc, "_cuda_endAllocateCurrentStreamToPool", lambda *a: None)
+# === END AUTO-PATCHES ===
+
 
 from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
 
