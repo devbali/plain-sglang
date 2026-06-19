@@ -117,6 +117,7 @@ def calculate_time(show=False, min_cost_ms=0.0):
 
 
 def get_available_gpu_memory(gpu_id, distributed=False):
+    gpu_id = int(gpu_id)  # Ensure int type
     """
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
