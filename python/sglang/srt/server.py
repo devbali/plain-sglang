@@ -375,11 +375,14 @@ def launch_server(
     if server_args.api_key:
         add_api_key_middleware(app, server_args.api_key)
 
-    # Send a warmup request
-    t = threading.Thread(
-        target=_wait_and_warmup, args=(server_args, pipe_finish_writer, os.getpid())
-    )
-    t.start()
+    # Send a warmup request (skip if --skip-server-warmup)
+    if not server_args.skip_server_warmup:
+        t = threading.Thread(
+            target=_wait_and_warmup, args=(server_args, pipe_finish_writer, os.getpid())
+        )
+        t.start()
+    else:
+        logger.info("Skipping server warmup (--skip-server-warmup)")
 
     try:
         # Listen for requests
